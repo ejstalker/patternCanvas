@@ -1,135 +1,114 @@
 # patternCanvas
 
-Open-canvas pattern drafting + cloth draping studio (browser / WebGPU).
+Browser-first open-canvas studio for **drafting garment patterns in real units** and **draping them with WebGPU cloth simulation**.
 
-See **[docs/PRD.md](docs/PRD.md)** for product requirements and architecture (multi-sim canvas, one active runner, pattern↔sim assignments).
+Pattern frames, remesh previews, Transform 3D layouts, and sim viewports live on one pannable board—wired together like a node graph. Designed for indie makers, students, hobbyists, and researchers who want inspectable physics and remixable studies—not a Marvelous Designer / CLO clone.
+
+Product direction and architecture: **[docs/PRD.md](docs/PRD.md)**.
+
+---
+
+## Quick start
 
 ```bash
 npm install
 npm run dev
 ```
 
-- Studio app: `/` (`index.html`)
-- Legacy cloth demo: [`demo.html`](demo.html)
+Open the URL Vite prints (usually `http://localhost:5173`).
+
+| Entry | What it is |
+| --- | --- |
+| `/` (`index.html`) | **patternCanvas studio** |
+| [`demo.html`](demo.html) | Legacy cloth drop / wind playground |
+
+### Requirements
+
+- A WebGPU browser: **Chrome / Edge 113+**, Safari 18+ (WebGPU on), or a recent Firefox Nightly / supported build
+- Desktop recommended for editing; WebGPU also works on many phones
+
+If you see “WebGPU is not supported,” update the browser and confirm WebGPU is enabled.
 
 ---
 
-# Legacy: Cloth Simulation - WebGPU
+## What you can do
 
-![WebGPU](https://img.shields.io/badge/WebGPU-FF4B4B.svg?style=for-the-badge)
-![TypeScript](https://img.shields.io/badge/TypeScript-3178C6.svg?style=for-the-badge&logo=typescript&logoColor=white)
-![Netlify](https://img.shields.io/badge/Netlify-00C7B7.svg?style=for-the-badge&logo=netlify&logoColor=white)
+### Canvas project
+- Pan the board (Alt-drag empty space) · zoom with ⌘/Ctrl-wheel
+- Add **Pattern**, **Mesh**, **Transform 3D**, **Sim**, notes, and image refs
+- Wire **pattern → remesh → transform → drape**; wires show assignments
+- Save / load / import projects from the **Projects** modal · undo / redo (⌘Z / ⌘⇧Z)
+- Duplicate a node with **⌘D** or **⌥-drag**
+- Fullscreen a node (**⛶**); when wired, header **tabs** jump between Pattern / Remesh / Transform / Drape
 
+### Pattern editor
+- Move, Pen, Bend, Dart, Sew tools · lengths in **cm or inches**
+- Soft snap, multi-select scale, avatar reference overlay, X-ray fill
+- Seam bindings become sew constraints after remesh
 
-A browser-based, real-time WebGPU cloth simulation using adjustable triangle resolution, mass, gravity, springs, damping, wind, and camera controls.
+### Mesh
+- Remesh from the linked pattern (structured / Delaunay / centroidal settings in the inspector)
 
-### Cloth Drop Test
-<img src="/scenes/cloth_webgpu_demo.gif" alt="Cloth Drop Test WebGPU Demo" title="Cloth Drop Test WebGPU Demo" width="800"/>
+### Transform 3D
+- Arrange pieces in space **before** simulating · pose feeds connected sims
 
-### Cloth Wind Test
-*(Use the top-right controls to switch between simulation modes!)*
-<img src="/scenes/cloth_wind_demo.gif" alt="Cloth Wind Test WebGPU Demo" title="Cloth Wind Test WebGPU Demo" width="800"/>
+### Sim (drape)
+- **Play / Pause / Reset / Rebuild / Snapshot**
+- Engines: **CPU mass-spring** or **GPU XPBD**
+- Avatar body collision (load OBJ · optional SDF bake/cache under `refPpl/`)
+- **Strain** map toggle (blue compress · green rest · red stretch)
+- One active sim at a time; paused sims keep their pose
 
-# Try it yourself!
+---
 
-[![Click Me :)](https://img.shields.io/badge/Click%20Me%20%3A%29-blueviolet?style=for-the-badge)](https://jayhuggie-cloth.netlify.app/)
+## Controls (studio)
 
-## Requirements
+| Action | Input |
+| --- | --- |
+| Pan board | Alt-drag empty canvas |
+| Zoom board | ⌘/Ctrl + wheel |
+| Undo / Redo | ⌘/Ctrl+Z · ⌘/Ctrl+Shift+Z |
+| Duplicate node | ⌘/Ctrl+D · or ⌥/Alt-drag |
+| Orbit 3D (sim / transform) | Drag empty space in the viewport |
+| Move fabric | Drag the cloth (Play or paused) |
+| Exit fullscreen | Esc or ✕ |
 
-- A modern browser with WebGPU support:
-  - Chrome 113+ or Edge 113+
-  - Safari 18+ (with WebGPU enabled)
-  - Firefox also works too!
-- Most mobile phones will work as well :)
- 
-## Features
+Pattern viewport: ⌘/Ctrl-wheel zooms the pattern; Alt-drag pans inside the editor.
 
-- Real-time cloth physics simulation with particle-based system
-- Spring-damper connections for realistic cloth behavior
-- Aerodynamic forces (wind simulation)
-- Ground collision detection
-- Interactive camera controls
-- Real-time parameter adjustment via UI
+---
 
-## Controls
-
-### Mouse
-- **Right Click + Drag**: Rotate camera
-
-### Keyboard
-- **R**: Reset camera
-- **Z**: Zoom in
-- **X**: Zoom out
-- **ESC**: Exit
-
-### UI Controls
-
-The right panel provides controls for:
-- **Fixed Points**: Translate and rotate the fixed attachment points
-- **Cloth Coefficients**: Adjust mass, gravity, and ground level
-- **Spring-Damper**: Modify spring and damping constants
-- **Aerodynamics**: Control wind velocity, fluid density, and drag coefficient
-
-## Project Structure
+## Project layout
 
 ```
-web/
-├── src/
-│   ├── physics/          # Physics simulation classes
-│   │   ├── Particle.ts
-│   │   ├── SpringDamper.ts
-│   │   └── Triangle.ts
-│   ├── shaders/          # WGSL shaders
-│   │   ├── cloth.vert.wgsl
-│   │   └── cloth.frag.wgsl
-│   ├── utils/            # Utility functions
-│   │   ├── math.ts
-│   │   └── webgpu.ts
-│   ├── Camera.ts         # Camera controller
-│   ├── Cloth.ts          # Main cloth simulation
-│   ├── Ground.ts         # Ground plane
-│   ├── Renderer.ts      # WebGPU rendering
-│   └── main.ts           # Application entry point
-├── index.html            # HTML entry point
-├── package.json
-└── vite.config.ts
+src/
+  app/           Studio shell (canvas, inspector, projects, undo)
+  pattern/       2D pattern editor + geometry
+  mesh/          Triangulation, OBJ/avatar, SDF bake
+  sim/           Cloth engines (CPU + GPU XPBD), gizmos, viewports
+  project/       Document model, library, undo stack
+  shaders/       Cloth + floor WGSL
+  styles/        studio.css
+docs/PRD.md      Product requirements
+refPpl/          Default avatar / SDF cache assets
+demo.html        Legacy cloth demo
 ```
 
-## Technical Details
+---
 
-### Physics
-- Particle-based mass-spring system
-- Verlet integration with oversampling for stability
-- Spring-damper connections (structural, shear, and bend)
-- Aerodynamic forces based on triangle surface area
-- Ground collision with position correction
+## Scripts
 
-### Rendering
-- WebGPU rendering pipeline
-- Phong lighting model with two light sources
-- Real-time vertex buffer updates
-- Depth testing for proper occlusion
+```bash
+npm run dev       # Vite dev server
+npm run build     # tsc + production build
+npm run preview   # preview the build
+```
 
-## Differences from my previous C++ Version
-Previous version (from my UCSD CSE 169 class project) : https://github.com/jayHuggie/Cloth_Simulation  
-1. **Language**: TypeScript/JavaScript instead of C++
-2. **Graphics API**: WebGPU instead of OpenGL
-3. **Shaders**: WGSL instead of GLSL
-4. **UI**: HTML/CSS instead of ImGui
-5. **Math Library**: gl-matrix instead of GLM
+---
 
-## Browser Compatibility
+## Notes
 
-WebGPU is a relatively new API. If you encounter issues:
+- Canonical units are **centimeters**; the toolbar toggles display to inches.
+- Rebuild the mesh (and sim) after pattern or sew changes so topology stays in sync.
+- Avatar SDF baking can write into `refPpl/` via the Vite dev API so you don’t rebake every session.
 
-1. Make sure you're using a supported browser version
-2. Check that WebGPU is enabled (Chrome: `chrome://flags` → "Unsafe WebGPU")
-3. Some browsers may require HTTPS for WebGPU (use `npm run preview` with HTTPS)
-
-## Troubleshooting
-
-**"WebGPU is not supported" error:**
-- Update your browser to the latest version
-- Enable WebGPU in browser flags if needed
-- Check browser console for more details
-
+Legacy WebGPU cloth demos and GIFs from the earlier drop/wind playground remain available via [`demo.html`](demo.html).
