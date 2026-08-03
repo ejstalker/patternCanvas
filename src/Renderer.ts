@@ -2,8 +2,14 @@ import { mat4 } from 'gl-matrix';
 import { mat4ToArray } from './utils/math';
 import { Cloth } from './Cloth';
 import { SimpleCloth } from './SimpleCloth';
+import type { ClothSimulator } from './sim/ClothSimulator';
 import { Ground } from './Ground';
 import { Camera } from './Camera';
+import floorVertexShaderCode from './shaders/floor.vert.wgsl?raw';
+import floorFragmentShaderCode from './shaders/floor.frag.wgsl?raw';
+import { inchesToOrbitWorld } from './sim/cameraDefaults';
+
+export type RenderableCloth = Cloth | SimpleCloth | ClothSimulator;
 
 export class Renderer {
     private device: GPUDevice;
@@ -14,9 +20,27 @@ export class Renderer {
     private canvas: HTMLCanvasElement;
 
     private renderPipeline: GPURenderPipeline | null = null;
+    /** Cloth with optional per-vertex strain colors. */
+    private clothPipeline: GPURenderPipeline | null = null;
+    private floorPipeline: GPURenderPipeline | null = null;
     private wireframePipeline: GPURenderPipeline | null = null;
+    private linePipeline: GPURenderPipeline | null = null;
+    /** Cloth model + viewProj — do not overwrite mid-frame after cloth draw is encoded. */
     private uniformBuffer: GPUBuffer | null = null;
+    /** Sphere collider model matrix. */
+    private objectUniformBuffer: GPUBuffer | null = null;
+    /** Flat floor model matrix + gradient params. */
+    private floorUniformBuffer: GPUBuffer | null = null;
+    /** Seam / wireframe overlay model matrix. */
+    private overlayUniformBuffer: GPUBuffer | null = null;
+    /** Cloth lighting — written once per frame. */
     private lightingBuffer: GPUBuffer | null = null;
+    /** Sphere collider lighting. */
+    private objectLightingBuffer: GPUBuffer | null = null;
+    /** Flat floor lighting. */
+    private floorLightingBuffer: GPUBuffer | null = null;
+    /** Seam / wireframe overlay lighting (bright unlit colors). */
+    private overlayLightingBuffer: GPUBuffer | null = null;
 
     private vertexShader: GPUShaderModule | null = null;
     private fragmentShader: GPUShaderModule | null = null;
@@ -25,8 +49,8 @@ export class Renderer {
     private wireframeColor: [number, number, number] = [0.0, 1.0, 1.0]; // Bright cyan wireframe
 
     // inital lighting and color parameters
-    private light1Color: [number, number, number] = [1.0, 0.0, 0.0];
-    private light1Position: [number, number, number] = [1, -1.5, 2];
+    private light1Color: [number, number, number] = [0.96, 0.98, 1.0];
+    private light1Position: [number, number, number] = [1, -1.5 + inchesToOrbitWorld(24), 2];
     private light2Color: [number, number, number] = [0.4, 0.4, 0.4];
     private light2Position: [number, number, number] = [-1, 5, -2];
     private clothColor: [number, number, number] = [0.9, 0.01, 0.01];
@@ -55,13 +79,39 @@ export class Renderer {
 
         // Create uniform buffers
         // Uniforms: viewProj (16 floats) + model (16 floats) = 32 floats * 4 bytes = 128 bytes
+        // Separate buffers per draw group: queue.writeBuffer before submit would otherwise
+        // leave every draw seeing only the *last* written contents of a shared buffer.
         this.uniformBuffer = this.device.createBuffer({
+            size: 128,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.objectUniformBuffer = this.device.createBuffer({
+            size: 128,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.floorUniformBuffer = this.device.createBuffer({
+            size: 256,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.overlayUniformBuffer = this.device.createBuffer({
             size: 128,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
         // Lighting uniforms: 6 vec3s = 18 floats * 4 bytes = 72 bytes, but align to 256 for safety
         this.lightingBuffer = this.device.createBuffer({
+            size: 256,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.objectLightingBuffer = this.device.createBuffer({
+            size: 256,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.floorLightingBuffer = this.device.createBuffer({
+            size: 256,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.overlayLightingBuffer = this.device.createBuffer({
             size: 256,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
@@ -89,6 +139,82 @@ export class Renderer {
             },
             fragment: {
                 module: this.fragmentShader,
+                entryPoint: 'main',
+                targets: [{ format: this.format }],
+            },
+            primitive: {
+                topology: 'triangle-list',
+                cullMode: 'none',
+            },
+            depthStencil: {
+                depthWriteEnabled: true,
+                depthCompare: 'less-equal',
+                format: 'depth24plus',
+            },
+        });
+
+        this.clothPipeline = this.device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: this.vertexShader,
+                entryPoint: 'mainColored',
+                buffers: [
+                    {
+                        arrayStride: 12,
+                        attributes: [
+                            { shaderLocation: 0, offset: 0, format: 'float32x3' },
+                        ],
+                    },
+                    {
+                        arrayStride: 12,
+                        attributes: [
+                            { shaderLocation: 1, offset: 0, format: 'float32x3' },
+                        ],
+                    },
+                    {
+                        arrayStride: 12,
+                        attributes: [
+                            { shaderLocation: 2, offset: 0, format: 'float32x3' },
+                        ],
+                    },
+                ],
+            },
+            fragment: {
+                module: this.fragmentShader,
+                entryPoint: 'mainColored',
+                targets: [{ format: this.format }],
+            },
+            primitive: {
+                topology: 'triangle-list',
+                cullMode: 'none',
+            },
+            depthStencil: {
+                depthWriteEnabled: true,
+                depthCompare: 'less-equal',
+                format: 'depth24plus',
+            },
+        });
+
+        const floorVertexShader = this.device.createShaderModule({ code: floorVertexShaderCode });
+        const floorFragmentShader = this.device.createShaderModule({ code: floorFragmentShaderCode });
+        this.floorPipeline = this.device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: floorVertexShader,
+                entryPoint: 'main',
+                buffers: [
+                    {
+                        arrayStride: 12,
+                        attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }],
+                    },
+                    {
+                        arrayStride: 12,
+                        attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x3' }],
+                    },
+                ],
+            },
+            fragment: {
+                module: floorFragmentShader,
                 entryPoint: 'main',
                 targets: [{ format: this.format }],
             },
@@ -136,6 +262,43 @@ export class Renderer {
             depthStencil: {
                 depthWriteEnabled: false, // Don't write depth for wireframe
                 depthCompare: 'less', // Render wireframe when closer or equal (ensures it's visible)
+                format: 'depth24plus',
+            },
+        });
+
+        // Line-list pipeline for sewing bond overlays in the drape sim
+        this.linePipeline = this.device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: this.vertexShader,
+                entryPoint: 'main',
+                buffers: [
+                    {
+                        arrayStride: 12,
+                        attributes: [
+                            { shaderLocation: 0, offset: 0, format: 'float32x3' },
+                        ],
+                    },
+                    {
+                        arrayStride: 12,
+                        attributes: [
+                            { shaderLocation: 1, offset: 0, format: 'float32x3' },
+                        ],
+                    },
+                ],
+            },
+            fragment: {
+                module: this.fragmentShader,
+                entryPoint: 'main',
+                targets: [{ format: this.format }],
+            },
+            primitive: {
+                topology: 'line-list',
+                cullMode: 'none',
+            },
+            depthStencil: {
+                depthWriteEnabled: false,
+                depthCompare: 'less',
                 format: 'depth24plus',
             },
         });
@@ -187,7 +350,7 @@ export class Renderer {
         return this.wireframeMode;
     }
 
-    render(cloth: Cloth | SimpleCloth, camera: Camera): void {
+    render(cloth: RenderableCloth, camera: Camera): void {
         const viewProj = camera.getViewProjectMtx();
         const model = cloth.getModelMatrix();
 
@@ -245,11 +408,20 @@ export class Renderer {
         lightingData[17] = this.light2Color[1];
         lightingData[18] = this.light2Color[2];
         lightingData[19] = 0.0; // padding
-        // Diffuse color (cloth color)
+        // Diffuse color (cloth color); [23] = useVertexColor for strain map
         lightingData[20] = this.clothColor[0];
         lightingData[21] = this.clothColor[1];
         lightingData[22] = this.clothColor[2];
-        lightingData[23] = 0.0; // padding
+        const colorBuffer =
+            'getColorBuffer' in cloth && typeof (cloth as ClothSimulator).getColorBuffer === 'function'
+                ? (cloth as ClothSimulator).getColorBuffer?.() ?? null
+                : null;
+        const useVertexColor =
+            !!colorBuffer &&
+            'isStrainMapEnabled' in cloth &&
+            typeof (cloth as ClothSimulator).isStrainMapEnabled === 'function' &&
+            !!(cloth as ClothSimulator).isStrainMapEnabled?.();
+        lightingData[23] = useVertexColor ? 1.0 : 0.0;
 
         // Write the buffer - WebGPU queue operations are automatically ordered
         // However, to ensure the write completes before rendering, we'll write it and then
@@ -266,7 +438,13 @@ export class Renderer {
         
         // IMPORTANT: Create bind group AFTER buffer write to ensure it references updated buffer
         // Note: Bind groups just reference the buffer, they don't cache data
-        const clothBindGroup = this.createBindGroup(this.renderPipeline!);
+        const clothPipeline =
+            colorBuffer && this.clothPipeline ? this.clothPipeline : this.renderPipeline!;
+        const clothBindGroup = this.createBindGroup(
+            clothPipeline,
+            this.uniformBuffer!,
+            this.lightingBuffer!
+        );
         
         const pass = encoder.beginRenderPass({
             colorAttachments: [
@@ -300,10 +478,13 @@ export class Renderer {
         // Always render filled triangles first
         // (Cloth uses normal lighting regardless of wireframe mode)
         // Bind group was created AFTER buffer write to ensure it uses updated data
-        pass.setPipeline(this.renderPipeline!);
+        pass.setPipeline(clothPipeline);
         pass.setBindGroup(0, clothBindGroup);
         pass.setVertexBuffer(0, positionBuffer);
         pass.setVertexBuffer(1, normalBuffer);
+        if (colorBuffer && clothPipeline === this.clothPipeline) {
+            pass.setVertexBuffer(2, colorBuffer);
+        }
         pass.setIndexBuffer(indexBuffer, cloth.getIndexFormat());
         pass.drawIndexed(cloth.getIndexCount());
 
@@ -329,11 +510,20 @@ export class Renderer {
                 wireframeLightingData[16] = 0.0;
                 wireframeLightingData[17] = 0.0;
                 wireframeLightingData[18] = 0.0;
-                this.device.queue.writeBuffer(this.lightingBuffer!, 0, wireframeLightingData);
+                // Use overlay buffers so cloth lighting stays intact
+                this.device.queue.writeBuffer(this.overlayUniformBuffer!, 0, uniformData);
+                this.device.queue.writeBuffer(this.overlayLightingBuffer!, 0, wireframeLightingData);
                 
                 // Render wireframe quads (triangles) on top
                 pass.setPipeline(this.wireframePipeline);
-                pass.setBindGroup(0, this.createBindGroup(this.wireframePipeline));
+                pass.setBindGroup(
+                    0,
+                    this.createBindGroup(
+                        this.wireframePipeline,
+                        this.overlayUniformBuffer!,
+                        this.overlayLightingBuffer!
+                    )
+                );
                 pass.setVertexBuffer(0, wireframeBuffers.positionBuffer);
                 pass.setVertexBuffer(1, wireframeBuffers.normalBuffer);
                 pass.setIndexBuffer(wireframeBuffers.indexBuffer, wireframeBuffers.indexFormat);
@@ -347,45 +537,167 @@ export class Renderer {
             }
         }
 
-        // Render ground
+        // Render ground (sphere) — dedicated object buffers so cloth stays correctly lit
         const ground = cloth.getGround();
         const groundModel = ground.getModelMatrix();
         const groundUniformData = new Float32Array(32);
         groundUniformData.set(mat4ToArray(viewProj), 0);
         groundUniformData.set(mat4ToArray(groundModel), 16);
-        this.device.queue.writeBuffer(this.uniformBuffer!, 0, groundUniformData);
+        this.device.queue.writeBuffer(this.objectUniformBuffer!, 0, groundUniformData);
 
-        // Ground color
         const groundLightingData = new Float32Array(64);
         groundLightingData.set(lightingData);
         groundLightingData[20] = this.groundColor[0];
         groundLightingData[21] = this.groundColor[1];
         groundLightingData[22] = this.groundColor[2];
-        this.device.queue.writeBuffer(this.lightingBuffer!, 0, groundLightingData);
+        this.device.queue.writeBuffer(this.objectLightingBuffer!, 0, groundLightingData);
 
+        const objectBindGroup = this.createBindGroup(
+            this.renderPipeline!,
+            this.objectUniformBuffer!,
+            this.objectLightingBuffer!
+        );
+        pass.setPipeline(this.renderPipeline!);
+        pass.setBindGroup(0, objectBindGroup);
         pass.setVertexBuffer(0, ground.getPositionBuffer());
         pass.setVertexBuffer(1, ground.getNormalBuffer());
         pass.setIndexBuffer(ground.getIndexBuffer(), 'uint32');
         pass.drawIndexed(ground.getIndexCount());
 
+        // Optional flat floor under the avatar
+        const floor =
+          'getFloor' in cloth && typeof cloth.getFloor === 'function' ? cloth.getFloor?.() : null;
+        if (floor) {
+          const floorModel = floor.getModelMatrix();
+
+          if (floor.usesRadialGradient?.() && this.floorPipeline) {
+            const floorUniformData = new Float32Array(36);
+            floorUniformData.set(mat4ToArray(viewProj), 0);
+            floorUniformData.set(mat4ToArray(floorModel), 16);
+            floorUniformData[32] = floor.getGradientHalfExtent?.() ?? 1;
+            this.device.queue.writeBuffer(this.floorUniformBuffer!, 0, floorUniformData);
+
+            pass.setPipeline(this.floorPipeline);
+            pass.setBindGroup(0, this.createFloorBindGroup());
+            pass.setVertexBuffer(0, floor.getPositionBuffer());
+            pass.setVertexBuffer(1, floor.getNormalBuffer());
+            pass.setIndexBuffer(floor.getIndexBuffer(), 'uint32');
+            pass.drawIndexed(floor.getIndexCount());
+          } else {
+            const floorUniformData = new Float32Array(32);
+            floorUniformData.set(mat4ToArray(viewProj), 0);
+            floorUniformData.set(mat4ToArray(floorModel), 16);
+            this.device.queue.writeBuffer(this.floorUniformBuffer!, 0, floorUniformData);
+
+            const floorLightingData = new Float32Array(64);
+            floorLightingData.set(lightingData);
+            floorLightingData[20] = this.groundColor[0] * 0.75;
+            floorLightingData[21] = this.groundColor[1] * 0.78;
+            floorLightingData[22] = this.groundColor[2] * 0.85;
+            this.device.queue.writeBuffer(this.floorLightingBuffer!, 0, floorLightingData);
+
+            pass.setPipeline(this.renderPipeline!);
+            pass.setBindGroup(
+              0,
+              this.createBindGroup(
+                this.renderPipeline!,
+                this.floorUniformBuffer!,
+                this.floorLightingBuffer!
+              )
+            );
+            pass.setVertexBuffer(0, floor.getPositionBuffer());
+            pass.setVertexBuffer(1, floor.getNormalBuffer());
+            pass.setIndexBuffer(floor.getIndexBuffer(), 'uint32');
+            pass.drawIndexed(floor.getIndexCount());
+          }
+        }
+
+        // Sewing bond lines — overlay buffers only (never touch cloth lighting)
+        const seamCount =
+          'getSeamLineVertexCount' in cloth && typeof cloth.getSeamLineVertexCount === 'function'
+            ? (cloth.getSeamLineVertexCount?.() ?? 0)
+            : 0;
+        if (seamCount > 0 && this.linePipeline) {
+          const seamPos =
+            'getSeamLinePositionBuffer' in cloth
+              ? (cloth as ClothSimulator).getSeamLinePositionBuffer?.() ?? null
+              : null;
+          const seamNrm =
+            'getSeamLineNormalBuffer' in cloth
+              ? (cloth as ClothSimulator).getSeamLineNormalBuffer?.() ?? null
+              : null;
+          if (seamPos && seamNrm) {
+            const seamUniform = new Float32Array(32);
+            seamUniform.set(mat4ToArray(viewProj), 0);
+            seamUniform.set(mat4ToArray(model), 16);
+            this.device.queue.writeBuffer(this.overlayUniformBuffer!, 0, seamUniform);
+
+            const seamLighting = new Float32Array(64);
+            seamLighting.set(lightingData);
+            // Bright gold / amber — matches pattern-editor seam accent
+            seamLighting[0] = 1.4;
+            seamLighting[1] = 1.2;
+            seamLighting[2] = 0.4;
+            seamLighting[8] = 0;
+            seamLighting[9] = 0;
+            seamLighting[10] = 0;
+            seamLighting[16] = 0;
+            seamLighting[17] = 0;
+            seamLighting[18] = 0;
+            seamLighting[20] = 1.0;
+            seamLighting[21] = 0.78;
+            seamLighting[22] = 0.2;
+            this.device.queue.writeBuffer(this.overlayLightingBuffer!, 0, seamLighting);
+
+            pass.setPipeline(this.linePipeline);
+            pass.setBindGroup(
+              0,
+              this.createBindGroup(
+                this.linePipeline,
+                this.overlayUniformBuffer!,
+                this.overlayLightingBuffer!
+              )
+            );
+            pass.setVertexBuffer(0, seamPos);
+            pass.setVertexBuffer(1, seamNrm);
+            pass.draw(seamCount);
+          }
+        }
+
         pass.end();
         this.device.queue.submit([encoder.finish()]);
     }
 
-    private createBindGroup(pipeline: GPURenderPipeline): GPUBindGroup {
+    private createFloorBindGroup(): GPUBindGroup {
+        return this.device.createBindGroup({
+            layout: this.floorPipeline!.getBindGroupLayout(0),
+            entries: [
+                {
+                    binding: 0,
+                    resource: { buffer: this.floorUniformBuffer! },
+                },
+            ],
+        });
+    }
+
+    private createBindGroup(
+        pipeline: GPURenderPipeline,
+        uniformBuffer: GPUBuffer,
+        lightingBuffer: GPUBuffer
+    ): GPUBindGroup {
         return this.device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
             entries: [
                 {
                     binding: 0,
                     resource: {
-                        buffer: this.uniformBuffer!,
+                        buffer: uniformBuffer,
                     },
                 },
                 {
                     binding: 1,
                     resource: {
-                        buffer: this.lightingBuffer!,
+                        buffer: lightingBuffer,
                     },
                 },
             ],

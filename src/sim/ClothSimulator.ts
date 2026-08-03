@@ -1,0 +1,75 @@
+import type { mat4, vec3 } from 'gl-matrix';
+import type { SimParams, SimPose } from '../project/types';
+
+export type DrapeEngineKind = 'cpu-mass-spring' | 'gpu-xpbd';
+
+/** Collision body used for avatar / floor render + CPU resolve. */
+export interface ClothCollider {
+  getFootprintRadius(): number;
+  getModelMatrix(): mat4;
+  getPositionBuffer(): GPUBuffer;
+  getNormalBuffer(): GPUBuffer;
+  getIndexBuffer(): GPUBuffer;
+  getIndexCount(): number;
+}
+
+export interface ClothFloor {
+  getModelMatrix(): mat4;
+  getPositionBuffer(): GPUBuffer;
+  getNormalBuffer(): GPUBuffer;
+  getIndexBuffer(): GPUBuffer;
+  getIndexCount(): number;
+  usesRadialGradient?(): boolean;
+  getGradientHalfExtent?(): number;
+}
+
+export interface ClothRenderExtras {
+  getFloor?(): ClothFloor | null;
+  getSeamLineVertexCount?(): number;
+  getSeamLinePositionBuffer?(): GPUBuffer | null;
+  getSeamLineNormalBuffer?(): GPUBuffer | null;
+}
+
+export interface ClothSimulator extends ClothRenderExtras {
+  destroy(): void;
+  update(simulate?: boolean): void;
+  applyParams(params: SimParams): void;
+  exportPose(): SimPose;
+  applyPose(pose: SimPose): void;
+  resetToInitialState(): void;
+  setAvatar(avatar: ClothCollider): void;
+  getGround(): ClothCollider;
+
+  getVertexPieceIds(): readonly string[];
+  raycast(
+    origin: vec3,
+    dir: vec3
+  ): { t: number; point: vec3; pieceId: string } | null;
+  getCentroid(pieceId?: string): vec3;
+  getPieceCentroidTuple(pieceId: string): [number, number, number];
+  setPieceCentroid(pieceId: string, target: [number, number, number]): void;
+  applyPieceEulerDegrees(pieceId: string, eulerDeg: [number, number, number]): void;
+  applyPieceQuat(pieceId: string, quatXyZw: [number, number, number, number]): void;
+  translateBy(delta: vec3, pieceId?: string): void;
+  rotateBy(axis: vec3, radians: number, pieceId: string): void;
+  setDragging(dragging: boolean): void;
+
+  getModelMatrix(): mat4;
+  getPositionBuffer(): GPUBuffer;
+  getNormalBuffer(): GPUBuffer;
+  getIndexBuffer(): GPUBuffer;
+  getIndexFormat(): GPUIndexFormat;
+  getIndexCount(): number;
+  getWireframeBuffers(): {
+    positionBuffer: GPUBuffer;
+    normalBuffer: GPUBuffer;
+    indexBuffer: GPUBuffer;
+    indexFormat: GPUIndexFormat;
+    indexCount: number;
+  } | null;
+
+  /** Per-vertex RGB for strain visualization (same count as particles). */
+  getColorBuffer?(): GPUBuffer | null;
+  setStrainMapEnabled?(enabled: boolean): void;
+  isStrainMapEnabled?(): boolean;
+}

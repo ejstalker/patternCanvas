@@ -28,3 +28,13 @@ declare module '*.wgsl?raw' {
   export default content;
 }
 
+declare module '*.obj?url' {
+  const url: string;
+  export default url;
+}
+
+declare module '*.worker?worker' {
+  const WorkerFactory: new () => Worker;
+  export default WorkerFactory;
+}
+

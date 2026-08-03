@@ -1,7 +1,7 @@
 {
-  "name": "cloth-simulation-webgpu",
-  "version": "1.0.0",
-  "description": "Cloth Simulation using WebGPU",
+  "name": "patterncanvas",
+  "version": "0.1.0",
+  "description": "Open-canvas pattern drafting and cloth draping studio (WebGPU)",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,13 +9,15 @@
     "preview": "vite preview"
   },
   "devDependencies": {
+    "@types/delaunator": "^5.0.3",
     "@types/node": "^20.10.0",
     "@webgpu/types": "^0.1.38",
     "typescript": "^5.3.3",
     "vite": "^5.0.8"
   },
   "dependencies": {
-    "gl-matrix": "^3.4.3"
+    "delaunator": "^5.1.0",
+    "gl-matrix": "^3.4.3",
+    "numcodecs": "^0.3.2"
   }
 }
-

@@ -2,6 +2,9 @@ import { vec3 } from 'gl-matrix';
 
 const EPSILON = 1e-6;
 const BASE_COLLISION_MARGIN = 0.05; // Base margin for plane collision
+/** Default fraction of tangential velocity retained per contact (legacy). */
+const DEFAULT_CONTACT_FRICTION_RETAIN = 0.85;
+const FLOOR_NORMAL = vec3.fromValues(0, 1, 0);
 
 export class Particle {
     public position: vec3;
@@ -17,6 +20,8 @@ export class Particle {
     private sphereCenter: vec3 | null = null;
     private sphereRadius: number | null = null;
     private edgeLength: number = 0; // Distance to adjacent particles (for adaptive margin)
+    /** Tangential velocity retain on contact (1 = ice, 0 = full stick). */
+    private contactFrictionRetain = DEFAULT_CONTACT_FRICTION_RETAIN;
 
     constructor(
         position: vec3,
@@ -90,17 +95,25 @@ export class Particle {
                     // Update deltaP to the clamped movement
                     vec3.sub(deltaP, newPos, this.position);
                     
-                    // Strongly dampen velocity toward sphere
+                    // Remove velocity component pointing into the sphere (no extra push-away —
+                    // that would inject energy every time gravity re-presses the particle against
+                    // the surface, letting the cloth pick up speed indefinitely and slide away).
                     const normal = vec3.clone(toNewPos);
                     const velDotNormal = vec3.dot(this.velocity, normal);
                     if (velDotNormal < 0) {
-                        // Remove all velocity toward sphere and add a small push away
                         const correction = vec3.create();
                         vec3.scale(correction, normal, velDotNormal);
                         vec3.sub(this.velocity, this.velocity, correction);
-                        // Add small push-away velocity to prevent sticking
-                        vec3.scaleAndAdd(this.velocity, this.velocity, normal, 0.1);
                     }
+                }
+            }
+
+            // Floor plane (also when a sphere collider is present)
+            if (newPos[1] < this.groundPos + BASE_COLLISION_MARGIN) {
+                newPos[1] = this.groundPos + BASE_COLLISION_MARGIN;
+                vec3.sub(deltaP, newPos, this.position);
+                if (this.velocity[1] < 0) {
+                    this.velocity[1] = 0.0;
                 }
             }
             
@@ -109,8 +122,6 @@ export class Particle {
             vec3.copy(this.prevForce, this.force);
         }
         
-        // Final collision check and correction (safety net)
-        this.groundCollision();
         vec3.zero(this.force);
     }
 
@@ -180,28 +191,52 @@ export class Particle {
                 }
                 vec3.scaleAndAdd(this.position, this.sphereCenter, toParticle, this.sphereRadius + margin);
                 
-                // Strongly remove velocity component toward sphere center
+                // Remove velocity component toward sphere center (no push-away — see integrate()).
                 const normal = vec3.clone(toParticle);
                 const velDotNormal = vec3.dot(this.velocity, normal);
                 if (velDotNormal < 0) {
-                    // Remove all velocity toward sphere
                     const correction = vec3.create();
                     vec3.scale(correction, normal, velDotNormal);
                     vec3.sub(this.velocity, this.velocity, correction);
-                    // Add push-away velocity to prevent sticking
-                    vec3.scaleAndAdd(this.velocity, this.velocity, normal, 0.05);
                 }
-            }
-        } else {
-            // Plane collision (original behavior)
-            if (this.position[1] < this.groundPos + BASE_COLLISION_MARGIN) {
-                this.position[1] = this.groundPos + BASE_COLLISION_MARGIN;
-                // Dampen downward velocity
-                if (this.velocity[1] < 0) {
-                    this.velocity[1] = 0.0;
-                }
+                // Friction: bleed off in-surface sliding so cloth settles on the sphere
+                // instead of gliding off it forever.
+                this.applyContactFriction(normal);
             }
         }
+
+        // Floor plane — always applied (works together with the sphere)
+        if (this.position[1] < this.groundPos + BASE_COLLISION_MARGIN) {
+            this.position[1] = this.groundPos + BASE_COLLISION_MARGIN;
+            if (this.velocity[1] < 0) {
+                this.velocity[1] = 0.0;
+            }
+            this.applyContactFriction(FLOOR_NORMAL);
+        }
+    }
+
+    /** Damp the velocity component tangential to a contact surface (Coulomb-ish friction). */
+    private applyContactFriction(normal: vec3): void {
+        const vDotN = vec3.dot(this.velocity, normal);
+        const normalVel = vec3.create();
+        vec3.scale(normalVel, normal, vDotN);
+        const tangentVel = vec3.create();
+        vec3.sub(tangentVel, this.velocity, normalVel);
+        vec3.scale(tangentVel, tangentVel, this.contactFrictionRetain);
+        vec3.add(this.velocity, normalVel, tangentVel);
+    }
+
+    /**
+     * Set contact grip in [0,1] (higher = less sliding). Internally stored as
+     * tangential velocity retain ≈ 1 − grip.
+     */
+    setContactFriction(friction: number): void {
+        const g = Math.min(1, Math.max(0, friction));
+        this.contactFrictionRetain = 1 - g * 0.95;
+    }
+
+    getContactFrictionRetain(): number {
+        return this.contactFrictionRetain;
     }
     
     setSphereCollision(center: vec3, radius: number): void {
@@ -250,6 +285,23 @@ export class Particle {
 
     setMass(mass: number): void {
         this.mass = mass;
+    }
+
+    getInvMass(): number {
+        return this.mass > EPSILON ? 1 / this.mass : 0;
+    }
+
+    clampSpeed(maxSpeed: number): void {
+        if (!(maxSpeed > 0) || this.isFixed) return;
+        const sp = vec3.length(this.velocity);
+        if (sp > maxSpeed) {
+            vec3.scale(this.velocity, this.velocity, maxSpeed / sp);
+        }
+    }
+
+    scaleVelocity(factor: number): void {
+        if (this.isFixed) return;
+        vec3.scale(this.velocity, this.velocity, factor);
     }
 
     setGravityAcce(gravity: number): void {

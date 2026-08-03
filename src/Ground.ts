@@ -9,6 +9,8 @@ export class Ground {
     private indices: number[] = [];
     private model: mat4 = identity();
     private groundLevel: number = 0.0;
+    private planeSize: number;
+    private radialGradient: boolean;
 
     // WebGPU resources
     private positionBuffer: GPUBuffer | null = null;
@@ -16,7 +18,14 @@ export class Ground {
     private indexBuffer: GPUBuffer | null = null;
     private indexCount: number = 0;
 
-    constructor(topleft: vec3, size: number, device: GPUDevice) {
+    constructor(
+        topleft: vec3,
+        size: number,
+        device: GPUDevice,
+        options?: { radialGradient?: boolean }
+    ) {
+        this.planeSize = size;
+        this.radialGradient = options?.radialGradient ?? false;
         this.groundLevel = topleft[1];
         this.model = translate([0.0, topleft[1] - EPSILON, 0.0]);
 
@@ -100,6 +109,15 @@ export class Ground {
 
     getIndexCount(): number {
         return this.indexCount;
+    }
+
+    usesRadialGradient(): boolean {
+        return this.radialGradient;
+    }
+
+    /** Half-width of the square floor — used for radial gradient falloff. */
+    getGradientHalfExtent(): number {
+        return this.planeSize * 0.5;
     }
 
     destroy(): void {

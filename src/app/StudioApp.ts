@@ -1,0 +1,3575 @@
+import {
+  createDefaultProject,
+  uid,
+  DEFAULT_SIM_PARAMS,
+  rectPiece,
+  createMeshDocument,
+  createTransform3dDocument,
+  remeshDocument,
+  normalizeProject,
+  DEFAULT_MESH_FRAME_WIDTH,
+  DEFAULT_MESH_FRAME_HEIGHT,
+} from '../project/createDefault';
+import {
+  getDefaultSimCamera,
+  migrateLegacySimCamera,
+  setDefaultSimCamera,
+  syncDefaultCameraFromDrapeA,
+} from '../sim/cameraDefaults';
+import type {
+  CanvasNode,
+  ImageNode,
+  MeshDocument,
+  MeshFrameNode,
+  PatternDocument,
+  PieceTransform3d,
+  ProjectDocument,
+  SimInstance,
+  SimViewportNode,
+  TextAnnotationNode,
+  Transform3dNode,
+  MeshAlgorithm,
+} from '../project/types';
+import { PatternEditor } from '../pattern/PatternEditor';
+import { MeshPreview } from '../mesh/MeshPreview';
+import { createSharedGpu, SimViewportRuntime } from '../sim/SimViewportRuntime';
+import { Transform3dRuntime } from '../sim/Transform3dRuntime';
+import {
+  DEFAULT_AUTOSAVE_MINUTES,
+  deleteProjectFromLibrary,
+  exportProjectJson,
+  formatProjectDate,
+  getActiveProjectId,
+  getAutosaveIntervalMinutes,
+  getSavedProject,
+  importProjectJson,
+  listSavedProjects,
+  migrateLegacyProjectStorage,
+  saveProjectToLibrary,
+  setActiveProjectId,
+  setAutosaveIntervalMinutes,
+} from '../project/projectLibrary';
+import { UndoStack, cloneProject } from '../project/undoStack';
+import {
+  AVATAR_UNIT_TO_WORLD,
+  avatarStatusLabel,
+  getAvatarPrefs,
+  importAvatarModel,
+  type AvatarCollisionMode,
+} from '../sim/avatarAsset';
+import { resetAvatarOverlayCache } from '../pattern/avatarPatternOverlay';
+import { DEFAULT_SDF_RESOLUTION } from '../mesh/sdfBake';
+
+const WORLD_TO_CM = 10;
+
+type WireSource = {
+  kind: 'pattern' | 'mesh' | 'transform';
+  id: string;
+  nodeId: string;
+};
+
+type WireDrag = WireSource & {
+  pointerId: number;
+  x: number;
+  y: number;
+};
+
+function ensureVisibleConnections(project: ProjectDocument): ProjectDocument {
+  const p = normalizeProject(project);
+  const fallbackMesh = p.meshes[0];
+  if (!fallbackMesh) return p;
+
+  for (const transform of p.transforms) {
+    if (!transform.meshId) transform.meshId = fallbackMesh.id;
+    if (!p.meshTransformAssignments.some((assignment) => assignment.transformId === transform.id)) {
+      p.meshTransformAssignments.push({
+        id: uid('assign'),
+        meshId: transform.meshId,
+        transformId: transform.id,
+      });
+    }
+  }
+
+  for (const sim of p.sims) {
+    if (p.transformSimAssignments.some((assignment) => assignment.simId === sim.id)) continue;
+    if (!p.assignments.some((assignment) => assignment.simId === sim.id)) {
+      p.assignments.push({
+        id: uid('assign'),
+        meshId: fallbackMesh.id,
+        simId: sim.id,
+      });
+    }
+  }
+  return p;
+}
+
+export class StudioApp {
+  private project: ProjectDocument;
+  private board: HTMLElement;
+  private wiresSvg: SVGSVGElement;
+  private toolbar: HTMLElement;
+  private inspector: HTMLElement;
+  private editors = new Map<string, PatternEditor>();
+  private meshPreviews = new Map<string, MeshPreview>();
+  private simRuntimes = new Map<string, SimViewportRuntime>();
+  private transformRuntimes = new Map<string, Transform3dRuntime>();
+  private transformInspectorPieceId: string | null = null;
+  private device: GPUDevice | null = null;
+  private selectedNodeId: string | null = null;
+  /** Fixed-position tip host (escapes inspector overflow clipping). */
+  private inspectorTipEl: HTMLDivElement | null = null;
+  private panning = false;
+  private panLast = { x: 0, y: 0 };
+  private draggingNode: { id: string; ox: number; oy: number } | null = null;
+  private wireDrag: WireDrag | null = null;
+  private resizingNode: {
+    id: string;
+    corner: 'nw' | 'ne' | 'sw' | 'se';
+    startBoardX: number;
+    startBoardY: number;
+    origX: number;
+    origY: number;
+    origW: number;
+    origH: number;
+  } | null = null;
+  private raf = 0;
+  private modalRoot: HTMLElement;
+  private importFileInput: HTMLInputElement;
+  private avatarLoadAbort: AbortController | null = null;
+  private undoStack = new UndoStack();
+  private autosaveTimer: ReturnType<typeof setInterval> | null = null;
+  private restoringUndo = false;
+  private expandedNodeId: string | null = null;
+  private expandPlaceholder: HTMLElement | null = null;
+  private expandOverlay: HTMLElement | null = null;
+  private expandEscHandler: ((e: KeyboardEvent) => void) | null = null;
+  private imageFileInput: HTMLInputElement;
+  private resizeShiftKey = false;
+
+  constructor(root: HTMLElement) {
+    this.project = this.loadOrDefault();
+    root.innerHTML = `
+      <div class="studio">
+        <header class="studio-toolbar" id="toolbar"></header>
+        <div class="studio-body">
+          <div class="studio-board-wrap" id="boardWrap">
+            <svg class="studio-wires" id="wires"></svg>
+            <div class="studio-board" id="board"></div>
+          </div>
+          <aside class="studio-inspector" id="inspector"></aside>
+        </div>
+        <div class="studio-status" id="status"></div>
+        <div class="studio-modal-root" id="modalRoot" hidden></div>
+        <input type="file" id="importFile" accept="application/json,.json" hidden />
+        <input type="file" id="imageFile" accept="image/*" multiple hidden />
+      </div>
+    `;
+    this.toolbar = root.querySelector('#toolbar')!;
+    this.board = root.querySelector('#board')!;
+    this.wiresSvg = root.querySelector('#wires')!;
+    this.inspector = root.querySelector('#inspector')!;
+    this.modalRoot = root.querySelector('#modalRoot')!;
+    this.importFileInput = root.querySelector('#importFile')!;
+    this.imageFileInput = root.querySelector('#imageFile')!;
+    this.buildToolbar();
+    this.bindImportFile();
+    this.bindImageImport();
+    this.bindBoardPan();
+    this.bindUndoHotkey();
+    this.bindImagePasteAndDrop();
+    this.restartAutosave();
+    this.renderAll();
+    void this.initGpuAndSims();
+    window.addEventListener('resize', () => this.drawWires());
+  }
+
+  private loadOrDefault(): ProjectDocument {
+    migrateLegacyProjectStorage();
+    try {
+      const activeId = getActiveProjectId();
+      if (activeId) {
+        const project = getSavedProject(activeId);
+        if (project) return this.prepareLoadedProject(project);
+      }
+      const saved = listSavedProjects();
+      if (saved[0]) {
+        setActiveProjectId(saved[0].id);
+        return this.prepareLoadedProject(saved[0].data);
+      }
+    } catch {
+      /* ignore */
+    }
+    const project = ensureVisibleConnections(createDefaultProject());
+    saveProjectToLibrary(project);
+    return project;
+  }
+
+  private prepareLoadedProject(project: ProjectDocument): ProjectDocument {
+    syncDefaultCameraFromDrapeA(project);
+    const defaults = getDefaultSimCamera(project);
+    for (const sim of project.sims) {
+      if (sim.name === 'Drape A') continue;
+      migrateLegacySimCamera(sim.camera, defaults);
+    }
+    return ensureVisibleConnections(project);
+  }
+
+  private persistLocal(quiet = false): void {
+    this.persistSimStates();
+    saveProjectToLibrary(this.project);
+    if (!quiet) this.setStatus(`Saved “${this.project.name}”`);
+  }
+
+  /** Snapshot current project before a user edit (max 15 levels). */
+  private pushUndo(): void {
+    if (this.restoringUndo) return;
+    this.persistSimStates();
+    this.undoStack.push(cloneProject(this.project));
+    this.updateHistoryButtons();
+  }
+
+  private performUndo(): void {
+    if (!this.undoStack.canUndo) return;
+    this.persistSimStates();
+    const prev = this.undoStack.undo(cloneProject(this.project));
+    this.updateHistoryButtons();
+    if (!prev) return;
+    this.restoreHistoryProject(prev, `Undo (${this.undoStack.size} left)`);
+  }
+
+  private performRedo(): void {
+    if (!this.undoStack.canRedo) return;
+    this.persistSimStates();
+    const next = this.undoStack.redo(cloneProject(this.project));
+    this.updateHistoryButtons();
+    if (!next) return;
+    this.restoreHistoryProject(next, `Redo (${this.undoStack.redoSize} left)`);
+  }
+
+  private restoreHistoryProject(project: ProjectDocument, status: string): void {
+    const expandedId = this.expandedNodeId;
+    this.restoringUndo = true;
+    try {
+      this.project = this.prepareLoadedProject(project);
+      setActiveProjectId(this.project.id);
+      this.selectedNodeId = null;
+      this.transformInspectorPieceId = null;
+      this.teardownSims();
+      this.syncProjectNameInput();
+      this.renderAll();
+      // Undo remounts the board (which collapses fullscreen). Re-open if still valid,
+      // and never dismiss an open studio modal (modalRoot is outside the board).
+      if (
+        expandedId &&
+        this.project.canvas.nodes.some((n) => n.id === expandedId)
+      ) {
+        this.openNodeFullscreen(expandedId);
+      }
+      void this.initGpuAndSims();
+      this.setStatus(status);
+    } finally {
+      this.restoringUndo = false;
+    }
+  }
+
+  private updateHistoryButtons(): void {
+    const undoBtn = this.toolbar.querySelector('[data-act="undo"]') as HTMLButtonElement | null;
+    if (undoBtn) {
+      undoBtn.disabled = !this.undoStack.canUndo;
+      undoBtn.title = this.undoStack.canUndo
+        ? `Undo last change (${this.undoStack.size} in history) · ⌘/Ctrl+Z`
+        : 'Nothing to undo';
+    }
+    const redoBtn = this.toolbar.querySelector('[data-act="redo"]') as HTMLButtonElement | null;
+    if (redoBtn) {
+      redoBtn.disabled = !this.undoStack.canRedo;
+      redoBtn.title = this.undoStack.canRedo
+        ? `Redo (${this.undoStack.redoSize} in history) · ⌘/Ctrl+Shift+Z`
+        : 'Nothing to redo';
+    }
+  }
+
+  private bindUndoHotkey(): void {
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Shift') this.resizeShiftKey = true;
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const key = e.key.toLowerCase();
+      const isZ = key === 'z';
+      const isY = key === 'y';
+      const isD = key === 'd';
+      if (!isZ && !isY && !isD) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      // Duplicate selected node: ⌘/Ctrl+D
+      if (isD && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        this.duplicateSelectedNode();
+        return;
+      }
+      // Redo: ⌘/Ctrl+Shift+Z, or Ctrl+Y (Windows/Linux)
+      if ((isZ && e.shiftKey) || (isY && !e.shiftKey && e.ctrlKey && !e.metaKey)) {
+        e.preventDefault();
+        this.performRedo();
+        return;
+      }
+      if (isZ && !e.shiftKey) {
+        e.preventDefault();
+        this.performUndo();
+      }
+    });
+    window.addEventListener('keyup', (e) => {
+      if (e.key === 'Shift') this.resizeShiftKey = false;
+    });
+  }
+
+  private bindImageImport(): void {
+    this.imageFileInput.addEventListener('change', () => {
+      const files = Array.from(this.imageFileInput.files ?? []);
+      this.imageFileInput.value = '';
+      if (files.length === 0) return;
+      void this.addImagesFromFiles(files);
+    });
+  }
+
+  private bindImagePasteAndDrop(): void {
+    window.addEventListener('paste', (e) => {
+      if (this.isTextEditingTarget(e.target)) return;
+      const files = this.imageFilesFromClipboard(e.clipboardData);
+      if (files.length === 0) return;
+      e.preventDefault();
+      void this.addImagesFromFiles(files);
+    });
+
+    const wrap = document.getElementById('boardWrap');
+    if (!wrap) return;
+    wrap.addEventListener('dragover', (e) => {
+      if (!this.dataTransferHasImage(e.dataTransfer)) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      wrap.classList.add('is-image-drop');
+    });
+    wrap.addEventListener('dragleave', (e) => {
+      if (e.target === wrap) wrap.classList.remove('is-image-drop');
+    });
+    wrap.addEventListener('drop', (e) => {
+      wrap.classList.remove('is-image-drop');
+      if (!this.dataTransferHasImage(e.dataTransfer)) return;
+      e.preventDefault();
+      const files = Array.from(e.dataTransfer?.files ?? []).filter((f) => f.type.startsWith('image/'));
+      if (files.length === 0) return;
+      void this.addImagesFromFiles(files, {
+        clientX: e.clientX,
+        clientY: e.clientY,
+      });
+    });
+  }
+
+  private isTextEditingTarget(target: EventTarget | null): boolean {
+    const t = target as HTMLElement | null;
+    if (!t) return false;
+    if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable) return true;
+    return Boolean(t.closest('input, textarea, [contenteditable="true"]'));
+  }
+
+  private dataTransferHasImage(dt: DataTransfer | null): boolean {
+    if (!dt) return false;
+    return Array.from(dt.items).some((item) => item.kind === 'file' && item.type.startsWith('image/'));
+  }
+
+  private imageFilesFromClipboard(dt: DataTransfer | null): File[] {
+    if (!dt) return [];
+    const files: File[] = [];
+    for (const item of Array.from(dt.items)) {
+      if (item.kind !== 'file' || !item.type.startsWith('image/')) continue;
+      const file = item.getAsFile();
+      if (file) files.push(file);
+    }
+    return files;
+  }
+
+  private readFileAsDataUrl(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result ?? ''));
+      reader.onerror = () => reject(reader.error ?? new Error('Failed to read image'));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  private loadImageNaturalSize(src: string): Promise<{ w: number; h: number }> {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () =>
+        resolve({
+          w: Math.max(1, img.naturalWidth || img.width),
+          h: Math.max(1, img.naturalHeight || img.height),
+        });
+      img.onerror = () => reject(new Error('Failed to decode image'));
+      img.src = src;
+    });
+  }
+
+  /** Board coords under a screen point (or viewport center when omitted). */
+  private boardPointFromClient(clientX?: number, clientY?: number): { x: number; y: number } {
+    const wrap = document.getElementById('boardWrap');
+    const rect = wrap?.getBoundingClientRect();
+    const { panX, panY, zoom } = this.project.canvas;
+    const mx = clientX != null && rect ? clientX - rect.left : (rect?.width ?? 800) * 0.5;
+    const my = clientY != null && rect ? clientY - rect.top : (rect?.height ?? 600) * 0.5;
+    return {
+      x: (mx - panX) / zoom,
+      y: (my - panY) / zoom,
+    };
+  }
+
+  private async addImagesFromFiles(
+    files: File[],
+    at?: { clientX?: number; clientY?: number }
+  ): Promise<void> {
+    const images = files.filter((f) => f.type.startsWith('image/'));
+    if (images.length === 0) return;
+    this.pushUndo();
+    const anchor = this.boardPointFromClient(at?.clientX, at?.clientY);
+    let offset = 0;
+    for (const file of images) {
+      try {
+        const src = await this.readFileAsDataUrl(file);
+        if (!src) continue;
+        const { w: nw, h: nh } = await this.loadImageNaturalSize(src);
+        const maxEdge = 420;
+        const scale = Math.min(1, maxEdge / Math.max(nw, nh));
+        const width = Math.max(120, Math.round(nw * scale));
+        const height = Math.max(90, Math.round(nh * scale));
+        const label = file.name?.replace(/\.[^.]+$/, '') || 'Reference';
+        const node: ImageNode = {
+          type: 'image',
+          id: uid('node'),
+          x: anchor.x - width / 2 + offset,
+          y: anchor.y - height / 2 + offset,
+          width,
+          height,
+          zIndex: 40 + this.project.canvas.nodes.length,
+          src,
+          label,
+          naturalAspect: nw / nh,
+        };
+        this.project.canvas.nodes.push(node);
+        this.mountNode(node);
+        this.selectedNodeId = node.id;
+        offset += 24;
+      } catch {
+        this.setStatus(`Could not load image “${file.name}”`);
+      }
+    }
+    this.layoutNodes();
+    this.drawWires();
+    this.renderInspector();
+    this.persistLocal();
+    this.setStatus(
+      images.length === 1 ? 'Image reference placed on canvas' : `${images.length} image references placed`
+    );
+  }
+
+  private restartAutosave(): void {
+    if (this.autosaveTimer) {
+      clearInterval(this.autosaveTimer);
+      this.autosaveTimer = null;
+    }
+    const minutes = getAutosaveIntervalMinutes();
+    if (minutes <= 0) return;
+    this.autosaveTimer = setInterval(
+      () => {
+        this.persistLocal(true);
+        this.setStatus(`Auto-saved “${this.project.name}”`);
+      },
+      minutes * 60 * 1000
+    );
+  }
+
+  private switchToProject(project: ProjectDocument, opts: { resetUndo?: boolean } = {}): void {
+    this.project = this.prepareLoadedProject(project);
+    setActiveProjectId(project.id);
+    this.selectedNodeId = null;
+    this.transformInspectorPieceId = null;
+    if (opts.resetUndo !== false) {
+      this.undoStack.clear();
+      this.updateHistoryButtons();
+    }
+    this.teardownSims();
+    this.syncProjectNameInput();
+    this.renderAll();
+    void this.initGpuAndSims();
+  }
+
+  private syncProjectNameInput(): void {
+    const input = this.toolbar.querySelector('#projectName') as HTMLInputElement | null;
+    if (input) input.value = this.project.name;
+  }
+
+  private bindImportFile(): void {
+    this.importFileInput.addEventListener('change', (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const project = importProjectJson(String(reader.result));
+          saveProjectToLibrary(project);
+          this.switchToProject(project);
+          this.setStatus(`Imported “${project.name}”`);
+          this.closeModal();
+        } catch (err) {
+          alert(`Import failed: ${err}`);
+        }
+      };
+      reader.readAsText(file);
+      (e.target as HTMLInputElement).value = '';
+    });
+  }
+
+  private closeModal(): void {
+    // Undo/redo remounts the canvas; don't dismiss an open dialog as a side effect.
+    if (this.restoringUndo) return;
+    this.avatarLoadAbort?.abort();
+    this.avatarLoadAbort = null;
+    this.modalRoot.hidden = true;
+    this.modalRoot.innerHTML = '';
+  }
+
+  private openNewProjectPrompt(): void {
+    this.modalRoot.hidden = false;
+    this.modalRoot.innerHTML = `
+      <div class="studio-modal-backdrop" data-modal-dismiss>
+        <div class="studio-modal studio-modal-sm" role="dialog" aria-labelledby="newProjectTitle">
+          <h2 id="newProjectTitle">Start new project?</h2>
+          <p class="muted">Save “${this.escapeHtml(this.project.name)}” before discarding it?</p>
+          <div class="studio-modal-actions">
+            <button type="button" class="primary" data-new-act="save">Save &amp; start new</button>
+            <button type="button" data-new-act="discard">Discard</button>
+            <button type="button" data-new-act="cancel">Cancel</button>
+          </div>
+        </div>
+      </div>
+    `;
+    this.modalRoot.querySelector('[data-modal-dismiss]')?.addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) this.closeModal();
+    });
+    this.modalRoot.querySelector('[data-new-act="save"]')?.addEventListener('click', () => {
+      this.persistLocal();
+      this.startNewProject();
+      this.closeModal();
+    });
+    this.modalRoot.querySelector('[data-new-act="discard"]')?.addEventListener('click', () => {
+      this.startNewProject();
+      this.closeModal();
+    });
+    this.modalRoot.querySelector('[data-new-act="cancel"]')?.addEventListener('click', () => {
+      this.closeModal();
+    });
+  }
+
+  private startNewProject(): void {
+    const project = ensureVisibleConnections(createDefaultProject());
+    saveProjectToLibrary(project);
+    this.switchToProject(project);
+    this.setStatus('New project started');
+  }
+
+  private openProjectsModal(): void {
+    this.modalRoot.hidden = false;
+    this.renderProjectsModal();
+  }
+
+  private openAvatarModal(): void {
+    const prefs = getAvatarPrefs();
+    const collisionMode: AvatarCollisionMode = prefs.useSdf
+      ? prefs.sdfFileName
+        ? 'load-sdf'
+        : 'bake-sdf'
+      : 'triangle';
+    this.modalRoot.hidden = false;
+    this.modalRoot.innerHTML = `
+      <div class="studio-modal-backdrop" data-modal-dismiss>
+        <div class="studio-modal studio-modal-sm" role="dialog" aria-labelledby="avatarTitle">
+          <div class="studio-modal-header">
+            <h2 id="avatarTitle">Load avatar model</h2>
+            <button type="button" class="studio-modal-close" data-modal-close aria-label="Close">×</button>
+          </div>
+          <p class="muted avatar-modal-current">Current: ${this.escapeHtml(avatarStatusLabel())}</p>
+          <div class="avatar-modal-form">
+            <label class="avatar-field">
+              <span>Viewport mesh (OBJ)</span>
+              <input type="file" accept=".obj" id="avatarFile" />
+              <small class="muted">Leave empty to keep the current mesh (${this.escapeHtml(prefs.objFileName)}).</small>
+            </label>
+            <label class="avatar-field">
+              <span>Import scale</span>
+              <input type="number" id="avatarScale" min="0.001" step="0.1" value="${prefs.unitToWorld}" />
+              <small class="muted">World units per OBJ unit (default 10 for meter OBJs). Does not rescale an imported SDF.</small>
+            </label>
+            <label class="avatar-field">
+              <span>Collision</span>
+              <select id="avatarCollisionMode">
+                <option value="triangle" ${collisionMode === 'triangle' ? 'selected' : ''}>Triangle mesh</option>
+                <option value="load-sdf" ${collisionMode === 'load-sdf' ? 'selected' : ''}>Load SDF / OpenVDB from disk</option>
+                <option value="bake-sdf" ${collisionMode === 'bake-sdf' ? 'selected' : ''}>Bake SDF from viewport mesh</option>
+              </select>
+            </label>
+            <label class="avatar-field" id="avatarSdfFileWrap" hidden>
+              <span>Collision SDF (.sdf / .vdb)</span>
+              <input type="file" accept=".sdf,.vdb,application/octet-stream" id="avatarSdfFile" />
+              <small class="muted">PCSD .sdf loads instantly. OpenVDB .vdb is densified on import (uses resolution below) and cached as .sdf in refPpl/.</small>
+            </label>
+            <label class="avatar-field" id="avatarSdfResWrap" hidden>
+              <span>SDF resolution</span>
+              <input type="number" id="avatarSdfRes" min="32" max="128" step="8" value="${prefs.sdfResolution || DEFAULT_SDF_RESOLUTION}" />
+              <small class="muted">Used for bake and OpenVDB densify. 48 = fast · 64 = balanced · 96 = high quality.</small>
+            </label>
+            <div class="avatar-progress" id="avatarProgress" hidden>
+              <div class="avatar-progress-bar"><div class="avatar-progress-fill" id="avatarProgressFill"></div></div>
+              <span class="muted" id="avatarProgressText"></span>
+            </div>
+          </div>
+          <div class="studio-modal-actions">
+            <button type="button" data-avatar-act="cancel" id="avatarCancelBtn">Cancel</button>
+            <button type="button" class="primary" data-avatar-act="load" disabled id="avatarLoadBtn">Load</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    const fileInput = this.modalRoot.querySelector('#avatarFile') as HTMLInputElement;
+    const sdfFileInput = this.modalRoot.querySelector('#avatarSdfFile') as HTMLInputElement;
+    const loadBtn = this.modalRoot.querySelector('#avatarLoadBtn') as HTMLButtonElement;
+    const cancelBtn = this.modalRoot.querySelector('#avatarCancelBtn') as HTMLButtonElement;
+    const modeSelect = this.modalRoot.querySelector('#avatarCollisionMode') as HTMLSelectElement;
+    const sdfFileWrap = this.modalRoot.querySelector('#avatarSdfFileWrap') as HTMLElement;
+    const sdfResWrap = this.modalRoot.querySelector('#avatarSdfResWrap') as HTMLElement;
+
+    const syncModeUi = () => {
+      const mode = modeSelect.value as AvatarCollisionMode;
+      sdfFileWrap.hidden = mode !== 'load-sdf';
+      // Resolution applies to bake and OpenVDB densify.
+      sdfResWrap.hidden = mode === 'triangle';
+      updateLoadEnabled();
+    };
+
+    const updateLoadEnabled = () => {
+      const mode = modeSelect.value as AvatarCollisionMode;
+      const hasSdf = !!sdfFileInput.files?.length;
+      if (mode === 'load-sdf') {
+        loadBtn.disabled = !hasSdf;
+      } else {
+        // Bake / triangle can use the current mesh if no new OBJ is chosen.
+        loadBtn.disabled = false;
+      }
+    };
+
+    modeSelect.addEventListener('change', syncModeUi);
+    fileInput.addEventListener('change', updateLoadEnabled);
+    sdfFileInput.addEventListener('change', updateLoadEnabled);
+    syncModeUi();
+
+    this.modalRoot.querySelector('[data-modal-dismiss]')?.addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) {
+        if (this.avatarLoadAbort) this.avatarLoadAbort.abort();
+        else this.closeModal();
+      }
+    });
+    this.modalRoot.querySelector('[data-modal-close]')?.addEventListener('click', () => {
+      if (this.avatarLoadAbort) this.avatarLoadAbort.abort();
+      else this.closeModal();
+    });
+    cancelBtn.addEventListener('click', () => {
+      if (this.avatarLoadAbort) {
+        this.avatarLoadAbort.abort();
+        return;
+      }
+      this.closeModal();
+    });
+    this.modalRoot.querySelector('[data-avatar-act="load"]')?.addEventListener('click', () => {
+      void this.handleAvatarLoad();
+    });
+  }
+
+  private async handleAvatarLoad(): Promise<void> {
+    const fileInput = this.modalRoot.querySelector('#avatarFile') as HTMLInputElement;
+    const sdfFileInput = this.modalRoot.querySelector('#avatarSdfFile') as HTMLInputElement;
+    const scaleInput = this.modalRoot.querySelector('#avatarScale') as HTMLInputElement;
+    const modeSelect = this.modalRoot.querySelector('#avatarCollisionMode') as HTMLSelectElement;
+    const sdfResInput = this.modalRoot.querySelector('#avatarSdfRes') as HTMLInputElement;
+    const progressWrap = this.modalRoot.querySelector('#avatarProgress') as HTMLElement;
+    const progressFill = this.modalRoot.querySelector('#avatarProgressFill') as HTMLElement;
+    const progressText = this.modalRoot.querySelector('#avatarProgressText') as HTMLElement;
+    const loadBtn = this.modalRoot.querySelector('#avatarLoadBtn') as HTMLButtonElement;
+    const cancelBtn = this.modalRoot.querySelector('#avatarCancelBtn') as HTMLButtonElement;
+
+    const meshFile = fileInput.files?.[0] ?? null;
+    const sdfFile = sdfFileInput.files?.[0] ?? null;
+    const collisionMode = modeSelect.value as AvatarCollisionMode;
+
+    if (collisionMode === 'load-sdf' && !sdfFile) {
+      this.setStatus('Choose a collision SDF file');
+      return;
+    }
+
+    if (!this.device) {
+      try {
+        const gpu = await createSharedGpu();
+        this.device = gpu.device;
+      } catch (err) {
+        this.setStatus(`WebGPU unavailable: ${err}`);
+        return;
+      }
+    }
+
+    const unitToWorld = parseFloat(scaleInput.value) || AVATAR_UNIT_TO_WORLD;
+    const sdfResolution = parseInt(sdfResInput.value, 10) || DEFAULT_SDF_RESOLUTION;
+
+    this.avatarLoadAbort?.abort();
+    const abort = new AbortController();
+    this.avatarLoadAbort = abort;
+
+    loadBtn.disabled = true;
+    fileInput.disabled = true;
+    sdfFileInput.disabled = true;
+    scaleInput.disabled = true;
+    modeSelect.disabled = true;
+    sdfResInput.disabled = true;
+    cancelBtn.textContent =
+      collisionMode === 'bake-sdf' || collisionMode === 'load-sdf' ? 'Cancel import' : 'Cancel';
+    progressWrap.hidden = false;
+    progressFill.style.width = '0%';
+    progressText.textContent = 'Starting…';
+
+    const resetForm = () => {
+      this.avatarLoadAbort = null;
+      loadBtn.disabled = false;
+      fileInput.disabled = false;
+      sdfFileInput.disabled = false;
+      scaleInput.disabled = false;
+      modeSelect.disabled = false;
+      sdfResInput.disabled = false;
+      cancelBtn.textContent = 'Cancel';
+    };
+
+    try {
+      const body = await importAvatarModel({
+        meshFile,
+        sdfFile,
+        unitToWorld,
+        collisionMode,
+        sdfResolution,
+        device: this.device,
+        signal: abort.signal,
+        onProgress: (message, progress) => {
+          progressText.textContent = message;
+          if (progress !== undefined) {
+            progressFill.style.width = `${Math.round(progress * 100)}%`;
+          }
+        },
+      });
+
+      for (const rt of this.simRuntimes.values()) {
+        rt.setAvatarBody(body);
+      }
+      for (const rt of this.transformRuntimes.values()) {
+        rt.setAvatarBody(body);
+      }
+      resetAvatarOverlayCache();
+      for (const ed of this.editors.values()) {
+        ed.reloadAvatarOverlay();
+      }
+
+      this.avatarLoadAbort = null;
+      this.closeModal();
+      const modeLabel =
+        collisionMode === 'load-sdf'
+          ? 'SDF from disk'
+          : collisionMode === 'bake-sdf'
+            ? 'baked SDF'
+            : 'triangle collision';
+      this.setStatus(`Avatar loaded (${modeLabel}) — ${avatarStatusLabel()}`);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        progressText.textContent = 'Cancelled — previous avatar unchanged.';
+        progressFill.style.width = '0%';
+        this.setStatus('Avatar import cancelled');
+        resetForm();
+        return;
+      }
+      progressText.textContent = err instanceof Error ? err.message : String(err);
+      this.setStatus(`Avatar import failed: ${err}`);
+      resetForm();
+    }
+  }
+
+  private renderProjectsModal(): void {
+    const projects = listSavedProjects();
+    const rows =
+      projects.length === 0
+        ? `<p class="muted studio-modal-empty">No saved projects yet.</p>`
+        : projects
+            .map((record) => {
+              const isActive = record.id === this.project.id;
+              return `
+                <li class="project-row ${isActive ? 'is-active' : ''}" data-project-id="${record.id}">
+                  <div class="project-row-main">
+                    <strong>${this.escapeHtml(record.name)}</strong>
+                    <span class="muted">${formatProjectDate(record.updatedAt)}${isActive ? ' · current' : ''}</span>
+                  </div>
+                  <div class="project-row-actions">
+                    <button type="button" data-project-act="load" ${isActive ? 'disabled' : ''}>Load</button>
+                    <button type="button" data-project-act="export">Export</button>
+                    <button type="button" class="danger" data-project-act="delete">Delete</button>
+                  </div>
+                </li>
+              `;
+            })
+            .join('');
+
+    this.modalRoot.innerHTML = `
+      <div class="studio-modal-backdrop" data-modal-dismiss>
+        <div class="studio-modal studio-modal-lg" role="dialog" aria-labelledby="projectsTitle">
+          <div class="studio-modal-header">
+            <h2 id="projectsTitle">Projects</h2>
+            <button type="button" class="studio-modal-close" data-modal-close aria-label="Close">×</button>
+          </div>
+          <p class="muted">Current: <strong>${this.escapeHtml(this.project.name)}</strong></p>
+          <div class="studio-modal-toolbar">
+            <button type="button" class="primary" data-projects-act="save">Save current</button>
+            <button type="button" data-projects-act="import">Import JSON</button>
+            <label class="autosave-field">
+              Auto-save every
+              <input type="number" id="autosaveMinutes" min="0" max="120" step="1" value="${getAutosaveIntervalMinutes()}" />
+              min
+            </label>
+            <span class="muted autosave-hint">0 disables · default ${DEFAULT_AUTOSAVE_MINUTES}</span>
+          </div>
+          <ul class="project-list">${rows}</ul>
+        </div>
+      </div>
+    `;
+
+    this.modalRoot.querySelector('[data-modal-dismiss]')?.addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) this.closeModal();
+    });
+    this.modalRoot.querySelector('[data-modal-close]')?.addEventListener('click', () => {
+      this.closeModal();
+    });
+    this.modalRoot.querySelector('[data-projects-act="save"]')?.addEventListener('click', () => {
+      this.persistLocal();
+      this.renderProjectsModal();
+    });
+    this.modalRoot.querySelector('[data-projects-act="import"]')?.addEventListener('click', () => {
+      this.importFileInput.click();
+    });
+    this.modalRoot.querySelector('#autosaveMinutes')?.addEventListener('change', (e) => {
+      const input = e.target as HTMLInputElement;
+      const minutes = parseFloat(input.value);
+      const next = Number.isFinite(minutes) ? minutes : DEFAULT_AUTOSAVE_MINUTES;
+      setAutosaveIntervalMinutes(next);
+      input.value = String(getAutosaveIntervalMinutes());
+      this.restartAutosave();
+      const m = getAutosaveIntervalMinutes();
+      this.setStatus(
+        m <= 0 ? 'Auto-save disabled' : `Auto-save every ${m} min`
+      );
+    });
+
+    this.modalRoot.querySelectorAll('.project-row').forEach((row) => {
+      row.addEventListener('click', (e) => {
+        const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-project-act]');
+        if (!btn || btn.disabled) return;
+        e.stopPropagation();
+        const id = (row as HTMLElement).dataset.projectId!;
+        const act = btn.dataset.projectAct!;
+        if (act === 'load') {
+          const project = getSavedProject(id);
+          if (project) {
+            this.switchToProject(project);
+            this.setStatus(`Loaded “${project.name}”`);
+            this.closeModal();
+          }
+        } else if (act === 'export') {
+          const record = projects.find((p) => p.id === id);
+          if (!record) return;
+          if (id === this.project.id) this.persistSimStates();
+          const data =
+            id === this.project.id ? exportProjectJson(this.project) : exportProjectJson(record.data);
+          this.downloadJson(data, `${record.name.replace(/\s+/g, '_') || 'project'}.patterncanvas.json`);
+        } else if (act === 'delete') {
+          const record = projects.find((p) => p.id === id);
+          if (!record) return;
+          if (!confirm(`Delete “${record.name}”? This cannot be undone.`)) return;
+          const wasActive = id === this.project.id;
+          deleteProjectFromLibrary(id);
+          if (wasActive) {
+            const nextId = getActiveProjectId();
+            const next =
+              (nextId ? getSavedProject(nextId) : null) ??
+              ensureVisibleConnections(createDefaultProject());
+            if (!getSavedProject(next.id)) saveProjectToLibrary(next);
+            this.switchToProject(next);
+            this.setStatus(`Deleted “${record.name}”`);
+            this.closeModal();
+          } else {
+            this.renderProjectsModal();
+            this.setStatus(`Deleted “${record.name}”`);
+          }
+        }
+      });
+    });
+  }
+
+  private downloadJson(json: string, filename: string): void {
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  private escapeHtml(text: string): string {
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  /**
+   * Label row: name + ⓘ on the left, numeric readout flush right.
+   * Pass `valueId` so sliders can update `#${valueId}` live.
+   */
+  private paramTip(name: string, tip: string, value = '', valueId?: string): string {
+    const valueAttr = valueId ? ` id="${valueId}"` : '';
+    return `<span class="inspector-label-row"><span class="inspector-label-left">${this.escapeHtml(name)}<button type="button" class="inspector-tip" aria-label="About ${this.escapeHtml(name)}" data-tip="${this.escapeHtml(tip)}">i</button></span><span class="inspector-param-value"${valueAttr}>${this.escapeHtml(value)}</span></span>`;
+  }
+
+  private ensureInspectorTipEl(): HTMLDivElement {
+    if (!this.inspectorTipEl) {
+      const el = document.createElement('div');
+      el.className = 'inspector-floating-tip';
+      el.hidden = true;
+      el.setAttribute('role', 'tooltip');
+      document.body.appendChild(el);
+      this.inspectorTipEl = el;
+      this.inspector.addEventListener('scroll', () => this.hideInspectorTip(), { passive: true });
+    }
+    return this.inspectorTipEl;
+  }
+
+  private hideInspectorTip(): void {
+    if (this.inspectorTipEl) this.inspectorTipEl.hidden = true;
+  }
+
+  private showInspectorTip(anchor: HTMLElement): void {
+    const text = anchor.dataset.tip ?? '';
+    if (!text) return;
+    const tip = this.ensureInspectorTipEl();
+    tip.textContent = text;
+    tip.hidden = false;
+    tip.style.visibility = 'hidden';
+    tip.style.left = '0px';
+    tip.style.top = '0px';
+    const tw = tip.offsetWidth;
+    const th = tip.offsetHeight;
+    const r = anchor.getBoundingClientRect();
+    const pad = 8;
+    // Prefer left of the icon (inspector is on the right); flip if needed.
+    let left = r.left - tw - pad;
+    if (left < pad) left = Math.min(r.right + pad, window.innerWidth - tw - pad);
+    let top = r.top + r.height / 2 - th / 2;
+    top = Math.max(pad, Math.min(top, window.innerHeight - th - pad));
+    tip.style.left = `${left}px`;
+    tip.style.top = `${top}px`;
+    tip.style.visibility = 'visible';
+  }
+
+  /** Wire ⓘ buttons to a body-level floating tip (not clipped by overflow). */
+  private bindInspectorTips(): void {
+    this.hideInspectorTip();
+    this.inspector.querySelectorAll('.inspector-tip').forEach((btn) => {
+      const el = btn as HTMLElement;
+      el.addEventListener('click', (e) => e.preventDefault());
+      el.addEventListener('mouseenter', () => this.showInspectorTip(el));
+      el.addEventListener('mouseleave', () => this.hideInspectorTip());
+      el.addEventListener('focus', () => this.showInspectorTip(el));
+      el.addEventListener('blur', () => this.hideInspectorTip());
+    });
+  }
+
+  private setStatus(msg: string): void {
+    const el = document.getElementById('status');
+    if (el) el.textContent = msg;
+  }
+
+  private buildToolbar(): void {
+    this.toolbar.innerHTML = `
+      <div class="brand">patternCanvas</div>
+      <input class="project-name" id="projectName" value="" />
+      <div class="toolbar-sep"></div>
+      <button type="button" data-act="undo" disabled title="Nothing to undo">Undo</button>
+      <button type="button" data-act="redo" disabled title="Nothing to redo">Redo</button>
+      <div class="toolbar-sep"></div>
+      <button type="button" data-act="new">New</button>
+      <button type="button" data-act="projects">Projects</button>
+      <button type="button" data-act="loadAvatar">Load avatar model</button>
+      <div class="toolbar-sep"></div>
+      <button type="button" data-act="unit">Units: cm</button>
+      <div class="toolbar-sep"></div>
+      <button type="button" data-act="addPattern">+ Pattern</button>
+      <button type="button" data-act="addMesh">+ Mesh</button>
+      <button type="button" data-act="addTransform">+ Transform 3D</button>
+      <button type="button" data-act="addSim">+ Sim</button>
+      <button type="button" data-act="addText">+ Note</button>
+      <button type="button" data-act="addImage" title="Add image reference (or paste / drop on canvas)">+ Image</button>
+      <button type="button" data-act="assign">Assign mesh→sim</button>
+    `;
+    this.syncProjectNameInput();
+    this.updateHistoryButtons();
+    this.toolbar.querySelector('#projectName')!.addEventListener('change', (e) => {
+      this.pushUndo();
+      this.project.name = (e.target as HTMLInputElement).value;
+    });
+    this.toolbar.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest('button[data-act]') as HTMLButtonElement | null;
+      if (!btn || btn.disabled) return;
+      void this.onToolbar(btn.dataset.act!);
+    });
+    this.updateUnitButton();
+  }
+
+  private updateUnitButton(): void {
+    const btn = this.toolbar.querySelector('[data-act="unit"]') as HTMLButtonElement;
+    if (btn) btn.textContent = `Units: ${this.project.displayUnit}`;
+  }
+
+  private async onToolbar(act: string): Promise<void> {
+    switch (act) {
+      case 'undo':
+        this.performUndo();
+        break;
+      case 'redo':
+        this.performRedo();
+        break;
+      case 'new':
+        this.openNewProjectPrompt();
+        break;
+      case 'projects':
+        this.openProjectsModal();
+        break;
+      case 'loadAvatar':
+        this.openAvatarModal();
+        break;
+      case 'unit':
+        this.pushUndo();
+        this.project.displayUnit = this.project.displayUnit === 'cm' ? 'in' : 'cm';
+        this.updateUnitButton();
+        this.editors.forEach((ed) => ed.setUnit(this.project.displayUnit));
+        this.meshPreviews.forEach((p) => p.setUnit(this.project.displayUnit));
+        break;
+      case 'addPattern':
+        this.pushUndo();
+        this.addPatternFrame();
+        break;
+      case 'addMesh':
+        this.pushUndo();
+        this.addMeshFrame();
+        break;
+      case 'addTransform':
+        this.pushUndo();
+        this.addTransform3dViewport();
+        break;
+      case 'addSim':
+        this.pushUndo();
+        this.addSimViewport();
+        break;
+      case 'addText':
+        this.pushUndo();
+        this.addTextNote();
+        break;
+      case 'addImage':
+        this.imageFileInput.click();
+        break;
+      case 'assign':
+        this.pushUndo();
+        this.assignSelected();
+        break;
+    }
+  }
+
+  private bindBoardPan(): void {
+    const wrap = document.getElementById('boardWrap')!;
+    wrap.addEventListener('pointerdown', (e) => {
+      if ((e.target as HTMLElement).closest('.canvas-node')) return;
+      if (e.button === 1 || e.button === 0 && e.altKey) {
+        this.panning = true;
+        this.panLast = { x: e.clientX, y: e.clientY };
+        wrap.setPointerCapture(e.pointerId);
+      }
+    });
+    wrap.addEventListener('pointermove', (e) => {
+      if (this.wireDrag) {
+        const rect = wrap.getBoundingClientRect();
+        this.wireDrag.x = e.clientX - rect.left;
+        this.wireDrag.y = e.clientY - rect.top;
+        this.drawWires();
+        this.highlightWireTarget(e.clientX, e.clientY);
+        return;
+      }
+      if (this.panning) {
+        const dx = e.clientX - this.panLast.x;
+        const dy = e.clientY - this.panLast.y;
+        this.panLast = { x: e.clientX, y: e.clientY };
+        this.project.canvas.panX += dx;
+        this.project.canvas.panY += dy;
+        this.applyBoardTransform();
+        this.drawWires();
+        return;
+      }
+      if (this.resizingNode) {
+        this.resizeShiftKey = e.shiftKey;
+        this.applyNodeResize(e.clientX, e.clientY);
+        return;
+      }
+      if (this.draggingNode) {
+        const zoom = this.project.canvas.zoom;
+        const node = this.project.canvas.nodes.find((n) => n.id === this.draggingNode!.id);
+        if (node) {
+          node.x = (e.clientX - this.project.canvas.panX) / zoom - this.draggingNode.ox;
+          node.y = (e.clientY - this.project.canvas.panY) / zoom - this.draggingNode.oy;
+          this.layoutNodes();
+          this.drawWires();
+        }
+      }
+    });
+    wrap.addEventListener('pointerup', (e) => {
+      if (this.wireDrag) {
+        this.finishWireDrag(e.clientX, e.clientY);
+        try {
+          wrap.releasePointerCapture(e.pointerId);
+        } catch {
+          /* capture may already be released */
+        }
+      }
+      this.panning = false;
+      this.draggingNode = null;
+      this.resizingNode = null;
+    });
+    wrap.addEventListener('pointercancel', () => {
+      this.cancelWireDrag();
+      this.panning = false;
+      this.draggingNode = null;
+      this.resizingNode = null;
+    });
+    wrap.addEventListener(
+      'wheel',
+      (e) => {
+        if (!(e.metaKey || e.ctrlKey)) return;
+        e.preventDefault();
+        const factor = e.deltaY > 0 ? 0.9 : 1.1;
+        const oldZoom = this.project.canvas.zoom;
+        const newZoom = Math.min(2.5, Math.max(0.35, oldZoom * factor));
+        if (newZoom === oldZoom) return;
+        // Zoom toward cursor: keep the board point under the pointer fixed on screen.
+        const rect = wrap.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        const { panX, panY } = this.project.canvas;
+        const boardX = (mx - panX) / oldZoom;
+        const boardY = (my - panY) / oldZoom;
+        this.project.canvas.zoom = newZoom;
+        this.project.canvas.panX = mx - boardX * newZoom;
+        this.project.canvas.panY = my - boardY * newZoom;
+        this.applyBoardTransform();
+        this.drawWires();
+      },
+      { passive: false }
+    );
+  }
+
+  private applyBoardTransform(): void {
+    const { panX, panY, zoom } = this.project.canvas;
+    this.board.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+  }
+
+  private renderAll(): void {
+    this.closeNodeFullscreen();
+    this.teardownSims();
+    this.board.innerHTML = '';
+    this.editors.clear();
+    this.meshPreviews.clear();
+    this.applyBoardTransform();
+    const nodes = [...this.project.canvas.nodes].sort((a, b) => a.zIndex - b.zIndex);
+    for (const node of nodes) {
+      this.mountNode(node);
+    }
+    this.drawWires();
+    this.renderInspector();
+  }
+
+  private findNodeEl(nodeId: string): HTMLElement | null {
+    return (
+      (this.board.querySelector(`[data-node-id="${nodeId}"]`) as HTMLElement | null) ||
+      (this.expandOverlay?.querySelector(`[data-node-id="${nodeId}"]`) as HTMLElement | null)
+    );
+  }
+
+  private layoutNodes(): void {
+    for (const node of this.project.canvas.nodes) {
+      const expanded = this.expandedNodeId === node.id;
+      if (this.expandPlaceholder && expanded) {
+        this.expandPlaceholder.style.left = `${node.x}px`;
+        this.expandPlaceholder.style.top = `${node.y}px`;
+        this.expandPlaceholder.style.width = `${node.width}px`;
+        this.expandPlaceholder.style.height = `${node.height}px`;
+      }
+      const el = this.findNodeEl(node.id);
+      if (!el || expanded) continue;
+      el.style.left = `${node.x}px`;
+      el.style.top = `${node.y}px`;
+      el.style.width = `${node.width}px`;
+      el.style.height = `${node.height}px`;
+      el.classList.toggle('selected', node.id === this.selectedNodeId);
+      el.classList.toggle(
+        'sim-active',
+        node.type === 'simViewport' && (node as SimViewportNode).simId === this.project.activeSimId
+      );
+    }
+  }
+
+  private openNodeFullscreen(nodeId: string): void {
+    if (this.expandedNodeId === nodeId) {
+      this.closeNodeFullscreen();
+      return;
+    }
+    if (this.expandedNodeId) {
+      // Already fullscreen — switch to another node in the pipeline
+      if (this.pipelineNodesFor(this.expandedNodeId).some((n) => n.id === nodeId)) {
+        this.switchFullscreenNode(nodeId);
+        return;
+      }
+      this.closeNodeFullscreen();
+    }
+    const el = this.board.querySelector(`[data-node-id="${nodeId}"]`) as HTMLElement | null;
+    const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
+    if (!el || !node) return;
+
+    const placeholder = document.createElement('div');
+    placeholder.className = 'canvas-node-placeholder';
+    placeholder.dataset.nodeId = nodeId;
+    placeholder.style.left = `${node.x}px`;
+    placeholder.style.top = `${node.y}px`;
+    placeholder.style.width = `${node.width}px`;
+    placeholder.style.height = `${node.height}px`;
+    placeholder.style.zIndex = String(node.zIndex);
+    placeholder.title = 'Expanded on screen';
+    el.parentElement?.insertBefore(placeholder, el);
+
+    const overlay = document.createElement('div');
+    overlay.className = 'node-fullscreen-overlay';
+    overlay.addEventListener('pointerdown', (e) => {
+      if (e.target === overlay) this.closeNodeFullscreen();
+    });
+
+    el.classList.add('is-expanded');
+    el.style.left = '';
+    el.style.top = '';
+    el.style.width = '';
+    el.style.height = '';
+    el.style.zIndex = '';
+    overlay.appendChild(el);
+    document.body.appendChild(overlay);
+
+    this.setExpandButtonMode(el, true);
+
+    this.expandedNodeId = nodeId;
+    this.expandPlaceholder = placeholder;
+    this.expandOverlay = overlay;
+    this.selectedNodeId = nodeId;
+    this.syncFullscreenTabs(el, nodeId);
+    this.layoutNodes();
+    this.renderInspector();
+    this.drawWires();
+
+    this.expandEscHandler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        this.closeNodeFullscreen();
+      }
+    };
+    window.addEventListener('keydown', this.expandEscHandler);
+
+    requestAnimationFrame(() => {
+      this.notifyNodeViewportResize(nodeId);
+      this.setStatus('Full screen — Esc or ✕ to close · tabs switch connected views');
+    });
+  }
+
+  private closeNodeFullscreen(): void {
+    if (!this.expandedNodeId || !this.expandPlaceholder || !this.expandOverlay) return;
+    const nodeId = this.expandedNodeId;
+    const el = this.expandOverlay.querySelector(
+      `[data-node-id="${nodeId}"]`
+    ) as HTMLElement | null;
+    const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
+
+    if (el && node) {
+      el.classList.remove('is-expanded');
+      el.style.left = `${node.x}px`;
+      el.style.top = `${node.y}px`;
+      el.style.width = `${node.width}px`;
+      el.style.height = `${node.height}px`;
+      el.style.zIndex = String(node.zIndex);
+      this.setExpandButtonMode(el, false);
+      this.clearFullscreenTabs(el);
+      this.expandPlaceholder.replaceWith(el);
+    } else {
+      this.expandPlaceholder.remove();
+    }
+
+    this.expandOverlay.remove();
+    if (this.expandEscHandler) {
+      window.removeEventListener('keydown', this.expandEscHandler);
+      this.expandEscHandler = null;
+    }
+    this.expandedNodeId = null;
+    this.expandPlaceholder = null;
+    this.expandOverlay = null;
+    this.layoutNodes();
+    this.drawWires();
+    requestAnimationFrame(() => this.notifyNodeViewportResize(nodeId));
+  }
+
+  private switchFullscreenNode(nextId: string): void {
+    if (!this.expandOverlay || !this.expandPlaceholder || !this.expandedNodeId) return;
+    if (nextId === this.expandedNodeId) return;
+
+    const prevId = this.expandedNodeId;
+    const prevEl = this.expandOverlay.querySelector(
+      `[data-node-id="${prevId}"]`
+    ) as HTMLElement | null;
+    const nextEl = this.board.querySelector(`[data-node-id="${nextId}"]`) as HTMLElement | null;
+    const prevNode = this.project.canvas.nodes.find((n) => n.id === prevId);
+    const nextNode = this.project.canvas.nodes.find((n) => n.id === nextId);
+    if (!prevEl || !nextEl || !prevNode || !nextNode) return;
+
+    // Restore previous node onto the board where the placeholder was
+    prevEl.classList.remove('is-expanded');
+    prevEl.style.left = `${prevNode.x}px`;
+    prevEl.style.top = `${prevNode.y}px`;
+    prevEl.style.width = `${prevNode.width}px`;
+    prevEl.style.height = `${prevNode.height}px`;
+    prevEl.style.zIndex = String(prevNode.zIndex);
+    this.setExpandButtonMode(prevEl, false);
+    this.clearFullscreenTabs(prevEl);
+    this.expandPlaceholder.replaceWith(prevEl);
+
+    // Placeholder for the node we're about to expand
+    const placeholder = document.createElement('div');
+    placeholder.className = 'canvas-node-placeholder';
+    placeholder.dataset.nodeId = nextId;
+    placeholder.style.left = `${nextNode.x}px`;
+    placeholder.style.top = `${nextNode.y}px`;
+    placeholder.style.width = `${nextNode.width}px`;
+    placeholder.style.height = `${nextNode.height}px`;
+    placeholder.style.zIndex = String(nextNode.zIndex);
+    placeholder.title = 'Expanded on screen';
+    nextEl.parentElement?.insertBefore(placeholder, nextEl);
+    this.expandPlaceholder = placeholder;
+
+    nextEl.classList.add('is-expanded');
+    nextEl.style.left = '';
+    nextEl.style.top = '';
+    nextEl.style.width = '';
+    nextEl.style.height = '';
+    nextEl.style.zIndex = '';
+    this.setExpandButtonMode(nextEl, true);
+    this.expandOverlay.appendChild(nextEl);
+
+    this.expandedNodeId = nextId;
+    this.selectedNodeId = nextId;
+    this.syncFullscreenTabs(nextEl, nextId);
+    this.layoutNodes();
+    this.renderInspector();
+    this.drawWires();
+    requestAnimationFrame(() => {
+      this.notifyNodeViewportResize(prevId);
+      this.notifyNodeViewportResize(nextId);
+    });
+  }
+
+  private setExpandButtonMode(el: HTMLElement, fullscreen: boolean): void {
+    const expandBtn = el.querySelector('.node-expand-btn') as HTMLButtonElement | null;
+    if (!expandBtn) return;
+    if (fullscreen) {
+      expandBtn.textContent = '✕';
+      expandBtn.title = 'Exit full screen · Esc';
+      expandBtn.setAttribute('aria-label', 'Exit full screen');
+    } else {
+      expandBtn.textContent = '⛶';
+      expandBtn.title = 'Open full screen';
+      expandBtn.setAttribute('aria-label', 'Open full screen');
+    }
+  }
+
+  /** Pattern → mesh → transform → sim chain containing this node (wired connections only). */
+  private pipelineNodesFor(nodeId: string): CanvasNode[] {
+    const adj = new Map<string, Set<string>>();
+    const link = (aId: string | undefined, bId: string | undefined) => {
+      if (!aId || !bId || aId === bId) return;
+      if (!adj.has(aId)) adj.set(aId, new Set());
+      if (!adj.has(bId)) adj.set(bId, new Set());
+      adj.get(aId)!.add(bId);
+      adj.get(bId)!.add(aId);
+    };
+
+    for (const mesh of this.project.meshes) {
+      const patNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'patternFrame' && n.patternId === mesh.patternId
+      );
+      const meshNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'meshFrame' && n.meshId === mesh.id
+      );
+      link(patNode?.id, meshNode?.id);
+    }
+    for (const a of this.project.assignments) {
+      const meshNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'meshFrame' && n.meshId === a.meshId
+      );
+      const simNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'simViewport' && n.simId === a.simId
+      );
+      link(meshNode?.id, simNode?.id);
+    }
+    for (const a of this.project.meshTransformAssignments) {
+      const meshNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'meshFrame' && n.meshId === a.meshId
+      );
+      const transformNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'transform3d' && n.transformId === a.transformId
+      );
+      link(meshNode?.id, transformNode?.id);
+    }
+    for (const a of this.project.transformSimAssignments) {
+      const transformNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'transform3d' && n.transformId === a.transformId
+      );
+      const simNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'simViewport' && n.simId === a.simId
+      );
+      link(transformNode?.id, simNode?.id);
+    }
+
+    if (!adj.has(nodeId)) {
+      const alone = this.project.canvas.nodes.find((n) => n.id === nodeId);
+      return alone ? [alone] : [];
+    }
+
+    const seen = new Set<string>();
+    const queue = [nodeId];
+    seen.add(nodeId);
+    while (queue.length > 0) {
+      const id = queue.shift()!;
+      for (const n of adj.get(id) ?? []) {
+        if (seen.has(n)) continue;
+        seen.add(n);
+        queue.push(n);
+      }
+    }
+
+    const order: Record<string, number> = {
+      patternFrame: 0,
+      meshFrame: 1,
+      transform3d: 2,
+      simViewport: 3,
+    };
+    return [...seen]
+      .map((id) => this.project.canvas.nodes.find((n) => n.id === id))
+      .filter((n): n is CanvasNode => !!n && n.type in order)
+      .sort((a, b) => (order[a.type] ?? 9) - (order[b.type] ?? 9));
+  }
+
+  private pipelineTabLabel(node: CanvasNode): string {
+    switch (node.type) {
+      case 'patternFrame':
+        return `Pattern · ${this.nodeLabel(node)}`;
+      case 'meshFrame':
+        return `Remesh · ${this.nodeLabel(node)}`;
+      case 'transform3d':
+        return `Transform · ${this.nodeLabel(node)}`;
+      case 'simViewport':
+        return `Drape · ${this.nodeLabel(node)}`;
+      default:
+        return this.nodeLabel(node);
+    }
+  }
+
+  private syncFullscreenTabs(el: HTMLElement, activeId: string): void {
+    const chrome = el.querySelector('.node-chrome');
+    const title = el.querySelector('.node-title') as HTMLElement | null;
+    const tabs = el.querySelector('.node-fullscreen-tabs') as HTMLElement | null;
+    if (!chrome || !tabs) return;
+
+    const pipeline = this.pipelineNodesFor(activeId);
+    if (pipeline.length < 2) {
+      tabs.hidden = true;
+      tabs.innerHTML = '';
+      if (title) title.hidden = false;
+      return;
+    }
+
+    if (title) title.hidden = true;
+    tabs.hidden = false;
+    tabs.innerHTML = pipeline
+      .map(
+        (n) =>
+          `<button type="button" role="tab" class="node-fullscreen-tab${
+            n.id === activeId ? ' is-active' : ''
+          }" data-fs-node="${n.id}" aria-selected="${n.id === activeId}">${this.escapeHtml(
+            this.pipelineTabLabel(n)
+          )}</button>`
+      )
+      .join('');
+
+    tabs.querySelectorAll('button[data-fs-node]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const id = (btn as HTMLButtonElement).dataset.fsNode;
+        if (id) this.switchFullscreenNode(id);
+      });
+    });
+  }
+
+  private clearFullscreenTabs(el: HTMLElement): void {
+    const title = el.querySelector('.node-title') as HTMLElement | null;
+    const tabs = el.querySelector('.node-fullscreen-tabs') as HTMLElement | null;
+    if (title) title.hidden = false;
+    if (tabs) {
+      tabs.hidden = true;
+      tabs.innerHTML = '';
+    }
+  }
+
+  private notifyNodeViewportResize(nodeId: string): void {
+    const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
+    if (!node) return;
+    if (node.type === 'simViewport') {
+      this.simRuntimes.get(node.simId)?.resize();
+    } else if (node.type === 'transform3d') {
+      this.transformRuntimes.get(node.transformId)?.resize();
+    }
+  }
+
+  private beginNodeDrag(node: CanvasNode, e: PointerEvent): void {
+    if (this.expandedNodeId === node.id) return;
+    this.pushUndo();
+
+    let dragTarget = node;
+    // Option/Alt-drag: leave the original in place and drag a duplicate
+    if (e.altKey) {
+      const dup = this.duplicateNode(node.id, {
+        offsetX: 0,
+        offsetY: 0,
+        recordUndo: false,
+        select: true,
+      });
+      if (dup) dragTarget = dup;
+    } else {
+      this.selectedNodeId = node.id;
+      this.renderInspector();
+    }
+
+    const zoom = this.project.canvas.zoom;
+    this.draggingNode = {
+      id: dragTarget.id,
+      ox: (e.clientX - this.project.canvas.panX) / zoom - dragTarget.x,
+      oy: (e.clientY - this.project.canvas.panY) / zoom - dragTarget.y,
+    };
+    this.layoutNodes();
+    e.preventDefault();
+  }
+
+  private mountNode(node: CanvasNode): void {
+    const el = document.createElement('div');
+    el.className = `canvas-node node-${node.type}`;
+    el.dataset.nodeId = node.id;
+    el.style.left = `${node.x}px`;
+    el.style.top = `${node.y}px`;
+    el.style.width = `${node.width}px`;
+    el.style.height = `${node.height}px`;
+    el.style.zIndex = String(node.zIndex);
+
+    const body = document.createElement('div');
+    body.className = 'node-body';
+    let chrome: HTMLElement | null = null;
+
+    // Image refs are chrome-less: drag the image itself (no title / fullscreen).
+    if (node.type !== 'image') {
+      chrome = document.createElement('div');
+      chrome.className = 'node-chrome';
+      chrome.innerHTML = `
+        <span class="node-title"></span>
+        <div class="node-fullscreen-tabs" hidden role="tablist"></div>
+        <div class="node-chrome-right">
+          <div class="node-actions"></div>
+          <button type="button" class="node-expand-btn" title="Open full screen" aria-label="Open full screen">⛶</button>
+        </div>
+      `;
+      el.appendChild(chrome);
+      chrome.querySelector('.node-expand-btn')?.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.openNodeFullscreen(node.id);
+      });
+      chrome.addEventListener('pointerdown', (e) => {
+        if ((e.target as HTMLElement).closest('button')) return;
+        this.beginNodeDrag(node, e);
+      });
+    } else {
+      body.addEventListener('pointerdown', (e) => {
+        if ((e.target as HTMLElement).closest('.resize-handle')) return;
+        this.beginNodeDrag(node, e);
+      });
+    }
+
+    el.appendChild(body);
+
+    for (const corner of ['nw', 'ne', 'sw', 'se'] as const) {
+      const handle = document.createElement('div');
+      handle.className = `resize-handle resize-${corner}`;
+      handle.dataset.corner = corner;
+      handle.title = 'Drag to resize';
+      handle.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.selectedNodeId = node.id;
+        this.pushUndo();
+        this.draggingNode = null;
+        const zoom = this.project.canvas.zoom;
+        this.resizingNode = {
+          id: node.id,
+          corner,
+          startBoardX: (e.clientX - this.project.canvas.panX) / zoom,
+          startBoardY: (e.clientY - this.project.canvas.panY) / zoom,
+          origX: node.x,
+          origY: node.y,
+          origW: node.width,
+          origH: node.height,
+        };
+        this.layoutNodes();
+        this.renderInspector();
+        const wrap = document.getElementById('boardWrap');
+        wrap?.setPointerCapture(e.pointerId);
+      });
+      el.appendChild(handle);
+    }
+
+    if (node.type === 'patternFrame') {
+      const pattern = this.project.patterns.find((p) => p.id === node.patternId)!;
+      chrome!.querySelector('.node-title')!.textContent = `Pattern · ${pattern.name}`;
+      const editorHost = document.createElement('div');
+      editorHost.className = 'pattern-host';
+      body.appendChild(editorHost);
+      const editor = new PatternEditor(editorHost, pattern, this.project.displayUnit, {
+        onBeforeChange: () => this.pushUndo(),
+        onChange: () => {
+          this.setStatus('Pattern edited — remesh to update');
+          this.invalidateMeshesForPattern(pattern.id);
+        },
+      });
+      this.editors.set(node.id, editor);
+    } else if (node.type === 'meshFrame') {
+      const mesh = this.project.meshes.find((m) => m.id === node.meshId)!;
+      chrome!.querySelector('.node-title')!.textContent = `Mesh · ${mesh.name}`;
+      const actions = chrome!.querySelector('.node-actions')!;
+      actions.innerHTML = `<button type="button" data-mesh="remesh">Remesh</button>`;
+      actions.addEventListener('click', () => this.remesh(mesh.id));
+      const previewHost = document.createElement('div');
+      previewHost.className = 'mesh-host';
+      body.appendChild(previewHost);
+      if (!mesh.geometry) {
+        const pattern = this.project.patterns.find((p) => p.id === mesh.patternId);
+        remeshDocument(mesh, pattern);
+      }
+      const preview = new MeshPreview(previewHost, mesh, this.project.displayUnit);
+      this.meshPreviews.set(node.id, preview);
+    } else if (node.type === 'simViewport') {
+      const sim = this.project.sims.find((s) => s.id === node.simId)!;
+      chrome!.querySelector('.node-title')!.textContent = `Sim · ${sim.name}`;
+      const actions = chrome!.querySelector('.node-actions')!;
+      const strainOn = this.simRuntimes.get(sim.id)?.isStrainMapEnabled() ?? false;
+      actions.innerHTML = `
+        <button type="button" data-sim="activate">Play</button>
+        <button type="button" data-sim="pause">Pause</button>
+        <button type="button" data-sim="reset">Reset</button>
+        <button type="button" data-sim="rebuild">Rebuild</button>
+        <button type="button" data-sim="snap">Snapshot</button>
+        <button type="button" data-sim="strain" class="sim-strain-btn${strainOn ? ' is-on' : ''}" title="Toggle fabric strain map (blue=compress, green=rest, red=stretch)" aria-pressed="${strainOn}">Strain</button>
+      `;
+      actions.addEventListener('click', (e) => {
+        const b = (e.target as HTMLElement).closest('button[data-sim]') as HTMLButtonElement | null;
+        if (!b) return;
+        void this.onSimAction(node.simId, b.dataset.sim!);
+      });
+      const canvas = document.createElement('canvas');
+      canvas.className = 'sim-canvas';
+      body.classList.add('sim-body');
+      body.appendChild(canvas);
+      // runtime attached after GPU init
+      (el as HTMLElement & { _simCanvas?: HTMLCanvasElement; _simHost?: HTMLElement })._simCanvas =
+        canvas;
+      (el as HTMLElement & { _simHost?: HTMLElement })._simHost = body;
+    } else if (node.type === 'transform3d') {
+      const transform = this.project.transforms.find((t) => t.id === node.transformId)!;
+      chrome!.querySelector('.node-title')!.textContent = `Transform 3D · ${transform.name}`;
+      const actions = chrome!.querySelector('.node-actions')!;
+      actions.innerHTML = `
+        <button type="button" data-transform="reset">Reset layout</button>
+        <button type="button" data-transform="rebuild">Rebuild</button>
+      `;
+      actions.addEventListener('click', (e) => {
+        const b = (e.target as HTMLElement).closest('button[data-transform]') as HTMLButtonElement | null;
+        if (!b) return;
+        void this.onTransformAction(node.transformId, b.dataset.transform!);
+      });
+      const canvas = document.createElement('canvas');
+      canvas.className = 'sim-canvas';
+      body.classList.add('sim-body');
+      body.appendChild(canvas);
+      (el as HTMLElement & { _transformCanvas?: HTMLCanvasElement; _transformHost?: HTMLElement })._transformCanvas =
+        canvas;
+      (el as HTMLElement & { _transformHost?: HTMLElement })._transformHost = body;
+    } else if (node.type === 'image') {
+      const img = document.createElement('img');
+      img.src = node.src;
+      img.alt = node.label || 'image reference';
+      img.draggable = false;
+      body.appendChild(img);
+      // Fill in aspect from the decoded image when missing (older snapshots).
+      if (node.naturalAspect == null || !(node.naturalAspect > 0)) {
+        img.addEventListener(
+          'load',
+          () => {
+            const nw = img.naturalWidth;
+            const nh = img.naturalHeight;
+            if (nw > 0 && nh > 0) node.naturalAspect = nw / nh;
+          },
+          { once: true }
+        );
+      }
+    } else if (node.type === 'text') {
+      chrome!.querySelector('.node-title')!.textContent = 'Note';
+      const ta = document.createElement('textarea');
+      ta.value = node.text;
+      ta.addEventListener('input', () => {
+        node.text = ta.value;
+      });
+      body.appendChild(ta);
+    }
+
+    this.mountNodePorts(el, node);
+    this.board.appendChild(el);
+  }
+
+  private mountNodePorts(el: HTMLElement, node: CanvasNode): void {
+    const addPort = (
+      direction: 'in' | 'out',
+      kind: 'pattern' | 'mesh' | 'transform' | 'sim',
+      entityId: string
+    ) => {
+      const port = document.createElement('button');
+      port.type = 'button';
+      port.className = `node-port node-port-${direction}`;
+      port.dataset.portDirection = direction;
+      port.dataset.portKind = kind;
+      port.dataset.entityId = entityId;
+      port.dataset.nodeId = node.id;
+      port.title =
+        direction === 'out'
+          ? `Drag ${kind} output to a compatible input`
+          : `Drop a compatible connection on this ${kind} input`;
+      port.setAttribute('aria-label', `${kind} ${direction === 'out' ? 'output' : 'input'} port`);
+
+      if (direction === 'out' && kind !== 'sim') {
+        port.addEventListener('pointerdown', (e) => {
+          if (e.button !== 0) return;
+          e.preventDefault();
+          e.stopPropagation();
+          this.beginWireDrag(
+            { kind, id: entityId, nodeId: node.id },
+            e.pointerId
+          );
+        });
+      }
+      el.appendChild(port);
+    };
+
+    if (node.type === 'patternFrame') {
+      addPort('out', 'pattern', node.patternId);
+    } else if (node.type === 'meshFrame') {
+      addPort('in', 'mesh', node.meshId);
+      addPort('out', 'mesh', node.meshId);
+    } else if (node.type === 'transform3d') {
+      addPort('in', 'mesh', node.transformId);
+      addPort('out', 'transform', node.transformId);
+    } else if (node.type === 'simViewport') {
+      addPort('in', 'sim', node.simId);
+    }
+  }
+
+  private async initGpuAndSims(): Promise<void> {
+    try {
+      if (!this.device) {
+        const gpu = await createSharedGpu();
+        this.device = gpu.device;
+      }
+    } catch (err) {
+      this.setStatus(`WebGPU unavailable: ${err}`);
+      return;
+    }
+
+    for (const node of this.project.canvas.nodes) {
+      if (node.type !== 'simViewport') continue;
+      const el = this.findNodeEl(node.id) as (HTMLElement & {
+        _simCanvas?: HTMLCanvasElement;
+        _simHost?: HTMLElement;
+      }) | null;
+      const canvas = el?._simCanvas;
+      const host = el?._simHost ?? el ?? null;
+      const sim = this.project.sims.find((s) => s.id === node.simId);
+      if (!el || !canvas || !host || !sim || this.simRuntimes.has(sim.id)) continue;
+
+      const runtime = new SimViewportRuntime(
+        sim.id,
+        canvas,
+        host,
+        this.device,
+        sim,
+        getDefaultSimCamera(this.project)
+      );
+      await runtime.initRenderer();
+      runtime.rebuildCloth(
+        this.meshGeometryForSim(sim.id),
+        sim.params,
+        this.poseForSim(sim.id),
+        this.patternForSim(sim.id)
+      );
+      this.simRuntimes.set(sim.id, runtime);
+    }
+
+    for (const node of this.project.canvas.nodes) {
+      if (node.type !== 'transform3d') continue;
+      const el = this.findNodeEl(node.id) as (HTMLElement & {
+        _transformCanvas?: HTMLCanvasElement;
+        _transformHost?: HTMLElement;
+      }) | null;
+      const canvas = el?._transformCanvas;
+      const host = el?._transformHost ?? el ?? null;
+      const transform = this.project.transforms.find((t) => t.id === node.transformId);
+      if (!el || !canvas || !host || !transform || this.transformRuntimes.has(transform.id)) continue;
+
+      const runtime = new Transform3dRuntime(
+        transform.id,
+        canvas,
+        host,
+        this.device,
+        transform,
+        getDefaultSimCamera(this.project),
+        {
+          onBeforePoseChange: () => this.pushUndo(),
+          onPoseChange: () => {
+            this.rebuildSimsFromTransform(transform.id);
+            if (this.selectedNodeId === node.id) this.renderInspector();
+          },
+          onSelectionChange: (pieceId) => {
+            this.transformInspectorPieceId = pieceId;
+            if (this.selectedNodeId === node.id) this.renderInspector();
+          },
+        }
+      );
+      await runtime.initRenderer();
+      runtime.rebuildCloth(
+        this.meshGeometryForTransform(transform.id),
+        transform.pose,
+        transform.pieceTransforms,
+        this.patternForTransform(transform.id)
+      );
+      this.transformRuntimes.set(transform.id, runtime);
+    }
+
+    cancelAnimationFrame(this.raf);
+    const loop = () => {
+      this.tick();
+      this.raf = requestAnimationFrame(loop);
+    };
+    this.raf = requestAnimationFrame(loop);
+    this.layoutNodes();
+    this.setStatus('Ready — Pattern → Mesh → Transform 3D → Sim');
+  }
+
+  private teardownSims(): void {
+    cancelAnimationFrame(this.raf);
+    for (const rt of this.simRuntimes.values()) {
+      rt.cloth?.destroy();
+    }
+    for (const rt of this.transformRuntimes.values()) {
+      rt.cloth?.destroy();
+    }
+    this.simRuntimes.clear();
+    this.transformRuntimes.clear();
+  }
+
+  private transformForSim(simId: string) {
+    const link = this.project.transformSimAssignments.find((a) => a.simId === simId);
+    if (!link) return undefined;
+    return this.project.transforms.find((t) => t.id === link.transformId);
+  }
+
+  private meshForTransform(transformId: string): MeshDocument | undefined {
+    const transform = this.project.transforms.find((t) => t.id === transformId);
+    if (!transform) return undefined;
+    const link = this.project.meshTransformAssignments.find((a) => a.transformId === transformId);
+    const meshId = link?.meshId ?? transform.meshId;
+    return this.project.meshes.find((m) => m.id === meshId);
+  }
+
+  private patternForTransform(transformId: string): PatternDocument | undefined {
+    const mesh = this.meshForTransform(transformId);
+    if (!mesh) return this.project.patterns[0];
+    return this.project.patterns.find((p) => p.id === mesh.patternId);
+  }
+
+  private meshGeometryForTransform(transformId: string) {
+    const mesh = this.meshForTransform(transformId);
+    if (!mesh) return null;
+    const pattern = this.project.patterns.find((p) => p.id === mesh.patternId);
+    if (
+      !mesh.geometry ||
+      mesh.geometry.vertexPieceIds?.length !== mesh.geometry.vertices.length
+    ) {
+      remeshDocument(mesh, pattern);
+    }
+    return mesh.geometry;
+  }
+
+  private poseForSim(simId: string) {
+    const transform = this.transformForSim(simId);
+    if (transform?.pose) return transform.pose;
+    const sim = this.project.sims.find((s) => s.id === simId);
+    return sim?.pose ?? null;
+  }
+
+  private rebuildSimsFromTransform(transformId: string): void {
+    for (const link of this.project.transformSimAssignments.filter(
+      (a) => a.transformId === transformId
+    )) {
+      this.rebuildConnectedSim(link.simId, false);
+    }
+  }
+
+  private onTransformAction(transformId: string, action: string): void {
+    const transform = this.project.transforms.find((t) => t.id === transformId);
+    const rt = this.transformRuntimes.get(transformId);
+    if (!transform || !rt) return;
+
+    switch (action) {
+      case 'reset':
+        // resetLayout snapshots undo via onBeforePoseChange
+        rt.resetLayout();
+        this.rebuildSimsFromTransform(transformId);
+        this.setStatus('Transform layout reset to default flat arrangement');
+        break;
+      case 'rebuild':
+        this.pushUndo();
+        rt.rebuildCloth(
+          this.meshGeometryForTransform(transformId),
+          transform.pose,
+          transform.pieceTransforms,
+          this.patternForTransform(transformId)
+        );
+        this.rebuildSimsFromTransform(transformId);
+        this.setStatus('Transform viewport rebuilt from mesh');
+        break;
+    }
+    this.renderInspector();
+  }
+
+  private rebuildConnectedTransform(transformId: string): void {
+    const transform = this.project.transforms.find((t) => t.id === transformId);
+    if (!transform) return;
+    if (!transform.pieceTransforms) transform.pieceTransforms = {};
+    const runtime = this.transformRuntimes.get(transformId);
+    // Vertex pose cannot transfer across remesh; pieceTransforms can.
+    // Snapshot before rebuild so a second linked rebuild can't persist a
+    // already-reset layout (duplicate mesh→transform assignments).
+    if (runtime) {
+      runtime.persistArrangement();
+    }
+    const savedPieceTransforms = structuredClone(transform.pieceTransforms);
+    transform.pose = null;
+    if (!runtime) {
+      transform.pieceTransforms = savedPieceTransforms;
+      return;
+    }
+    runtime.rebuildCloth(
+      this.meshGeometryForTransform(transformId),
+      null,
+      savedPieceTransforms,
+      this.patternForTransform(transformId)
+    );
+    this.rebuildSimsFromTransform(transformId);
+  }
+
+  private meshForSim(simId: string): MeshDocument | undefined {
+    const transform = this.transformForSim(simId);
+    if (transform) {
+      return this.meshForTransform(transform.id);
+    }
+    const a = this.project.assignments.find((x) => x.simId === simId);
+    if (!a) return this.project.meshes[0];
+    return this.project.meshes.find((m) => m.id === a.meshId);
+  }
+
+  private patternForSim(simId: string): PatternDocument | undefined {
+    const mesh = this.meshForSim(simId);
+    if (!mesh) return this.project.patterns[0];
+    return this.project.patterns.find((p) => p.id === mesh.patternId);
+  }
+
+  private meshGeometryForSim(simId: string) {
+    const mesh = this.meshForSim(simId);
+    if (!mesh) return null;
+    const pattern = this.project.patterns.find((p) => p.id === mesh.patternId);
+    // Older saved/generated meshes predate per-vertex piece ownership. Rebuild
+    // them automatically so individual panel picking works immediately.
+    if (
+      !mesh.geometry ||
+      mesh.geometry.vertexPieceIds?.length !== mesh.geometry.vertices.length
+    ) {
+      remeshDocument(mesh, pattern);
+    }
+    return mesh.geometry;
+  }
+
+  private remesh(meshId: string, opts: { recordUndo?: boolean } = {}): void {
+    const mesh = this.project.meshes.find((m) => m.id === meshId);
+    if (!mesh) return;
+    if (opts.recordUndo !== false) this.pushUndo();
+    const pattern = this.project.patterns.find((p) => p.id === mesh.patternId);
+    remeshDocument(mesh, pattern);
+    for (const [nodeId, preview] of this.meshPreviews) {
+      const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
+      if (node?.type === 'meshFrame' && node.meshId === meshId) {
+        preview.setMesh(mesh);
+      }
+    }
+    this.setStatus(`Remeshed ${mesh.name}`);
+    // Dedupe: duplicate mesh→transform links used to rebuild twice and lock in a reset.
+    const transformIds = new Set<string>();
+    for (const link of this.project.meshTransformAssignments) {
+      if (link.meshId === meshId) transformIds.add(link.transformId);
+    }
+    for (const transform of this.project.transforms) {
+      if (transform.meshId === meshId) transformIds.add(transform.id);
+    }
+    for (const transformId of transformIds) {
+      this.rebuildConnectedTransform(transformId);
+    }
+    for (const a of this.project.assignments.filter((x) => x.meshId === meshId)) {
+      this.rebuildConnectedSim(a.simId, true);
+    }
+    this.renderInspector();
+  }
+
+  private invalidateMeshesForPattern(patternId: string): void {
+    for (const mesh of this.project.meshes) {
+      if (mesh.patternId === patternId) mesh.geometry = null;
+    }
+  }
+
+  private tick(): void {
+    const active = this.project.activeSimId;
+    for (const [simId, rt] of this.simRuntimes) {
+      rt.frame(simId === active);
+    }
+    for (const rt of this.transformRuntimes.values()) {
+      rt.frame();
+    }
+  }
+
+  private persistTransformStates(): void {
+    for (const transform of this.project.transforms) {
+      const rt = this.transformRuntimes.get(transform.id);
+      if (!rt?.cloth) continue;
+      rt.captureCamera(transform);
+      rt.persistArrangement();
+    }
+  }
+
+  private persistSimStates(): void {
+    this.persistTransformStates();
+    for (const sim of this.project.sims) {
+      const rt = this.simRuntimes.get(sim.id);
+      if (!rt?.cloth) continue;
+      rt.captureCamera(sim);
+      sim.pose = rt.cloth.exportPose();
+      sim.dropped = true;
+    }
+    syncDefaultCameraFromDrapeA(this.project);
+    const defaults = getDefaultSimCamera(this.project);
+    for (const rt of this.simRuntimes.values()) {
+      rt.setDefaultCamera(defaults);
+    }
+  }
+
+  private async onSimAction(simId: string, action: string): Promise<void> {
+    const sim = this.project.sims.find((s) => s.id === simId);
+    const rt = this.simRuntimes.get(simId);
+    if (!sim || !rt) return;
+
+    switch (action) {
+      case 'activate':
+        if (this.project.activeSimId && this.project.activeSimId !== simId) {
+          this.pauseSim(this.project.activeSimId);
+        }
+        this.project.activeSimId = simId;
+        sim.dropped = true;
+        this.setStatus(`Active: ${sim.name} — drag fabric to move · empty drag to orbit`);
+        break;
+      case 'pause':
+        this.pauseSim(simId);
+        if (this.project.activeSimId === simId) this.project.activeSimId = null;
+        this.setStatus(`Paused: ${sim.name}`);
+        break;
+      case 'reset':
+        rt.cloth?.resetToInitialState();
+        sim.pose = null;
+        this.setStatus(`Reset: ${sim.name}`);
+        break;
+      case 'rebuild':
+        this.persistSimStates();
+        const initialPose = this.poseForSim(simId);
+        sim.pose = initialPose;
+        sim.dropped = true;
+        rt.rebuildCloth(
+          this.meshGeometryForSim(simId),
+          sim.params,
+          initialPose,
+          this.patternForSim(simId)
+        );
+        this.setStatus(
+          initialPose ? 'Drape rebuilt from Transform 3D layout' : 'Drape rebuilt from mesh node'
+        );
+        break;
+      case 'snap':
+        await this.snapshotSim(simId);
+        break;
+      case 'strain': {
+        const next = !rt.isStrainMapEnabled();
+        rt.setStrainMapEnabled(next);
+        const node = this.project.canvas.nodes.find(
+          (n) => n.type === 'simViewport' && n.simId === simId
+        );
+        if (node) {
+          const strainBtn = this.findNodeEl(node.id)?.querySelector(
+            'button[data-sim="strain"]'
+          ) as HTMLButtonElement | null;
+          if (strainBtn) {
+            strainBtn.classList.toggle('is-on', next);
+            strainBtn.setAttribute('aria-pressed', String(next));
+          }
+        }
+        this.setStatus(
+          next
+            ? 'Strain map on — blue compress · green rest · red stretch'
+            : 'Strain map off'
+        );
+        break;
+      }
+    }
+    this.layoutNodes();
+    this.renderInspector();
+  }
+
+  private pauseSim(simId: string): void {
+    const sim = this.project.sims.find((s) => s.id === simId);
+    const rt = this.simRuntimes.get(simId);
+    if (!sim || !rt?.cloth) return;
+    rt.captureCamera(sim);
+    sim.pose = rt.cloth.exportPose();
+    sim.dropped = true;
+  }
+
+  private async snapshotSim(simId: string): Promise<void> {
+    const rt = this.simRuntimes.get(simId);
+    const sim = this.project.sims.find((s) => s.id === simId);
+    if (!rt || !sim) return;
+    const src = await rt.snapshotDataUrl();
+    const node: ImageNode = {
+      type: 'image',
+      id: uid('node'),
+      x: 980,
+      y: 80 + this.project.canvas.nodes.filter((n) => n.type === 'image').length * 40,
+      width: 280,
+      height: 200,
+      zIndex: 50 + this.project.canvas.nodes.length,
+      src,
+      label: `Snapshot · ${sim.name}`,
+      naturalAspect: 280 / 200,
+    };
+    void this.loadImageNaturalSize(src)
+      .then(({ w, h }) => {
+        node.naturalAspect = w / h;
+      })
+      .catch(() => {
+        /* keep fallback aspect */
+      });
+    this.project.canvas.nodes.push(node);
+    this.mountNode(node);
+    this.drawWires();
+    this.setStatus('Snapshot placed on canvas');
+  }
+
+  private nodePortPoint(
+    node: { x: number; y: number; width: number; height: number },
+    direction: 'in' | 'out'
+  ): { x: number; y: number } {
+    const { panX, panY, zoom } = this.project.canvas;
+    return {
+      x: panX + (node.x + (direction === 'out' ? node.width : 0)) * zoom,
+      y: panY + (node.y + node.height / 2) * zoom,
+    };
+  }
+
+  private appendWirePath(
+    from: { x: number; y: number },
+    to: { x: number; y: number },
+    className: string
+  ): void {
+    const pull = Math.max(48, Math.abs(to.x - from.x) * 0.5);
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute(
+      'd',
+      `M ${from.x} ${from.y} C ${from.x + pull} ${from.y}, ${to.x - pull} ${to.y}, ${to.x} ${to.y}`
+    );
+    path.setAttribute('class', className);
+    this.wiresSvg.appendChild(path);
+  }
+
+  private beginWireDrag(source: WireSource, pointerId: number): void {
+    const node = this.project.canvas.nodes.find((candidate) => candidate.id === source.nodeId);
+    if (!node) return;
+    const start = this.nodePortPoint(node, 'out');
+    this.wireDrag = { ...source, pointerId, x: start.x, y: start.y };
+    const wrap = document.getElementById('boardWrap');
+    wrap?.setPointerCapture(pointerId);
+    wrap?.classList.add('is-wiring');
+    this.drawWires();
+  }
+
+  private isMeshFrameInput(target: HTMLElement): boolean {
+    const node = this.project.canvas.nodes.find((n) => n.id === target.dataset.nodeId);
+    return node?.type === 'meshFrame';
+  }
+
+  private isTransformInput(target: HTMLElement): boolean {
+    const node = this.project.canvas.nodes.find((n) => n.id === target.dataset.nodeId);
+    return node?.type === 'transform3d';
+  }
+
+  private isValidWireTarget(target: HTMLElement | null): boolean {
+    if (!target || !this.wireDrag) return false;
+    const kind = target.dataset.portKind;
+    return (
+      target.dataset.portDirection === 'in' &&
+      ((this.wireDrag.kind === 'pattern' && kind === 'mesh' && this.isMeshFrameInput(target)) ||
+        (this.wireDrag.kind === 'mesh' &&
+          ((kind === 'mesh' && this.isTransformInput(target)) || kind === 'sim')) ||
+        (this.wireDrag.kind === 'transform' && kind === 'sim'))
+    );
+  }
+
+  private highlightWireTarget(clientX: number, clientY: number): void {
+    this.board.querySelectorAll('.node-port.is-drop-target').forEach((port) => {
+      port.classList.remove('is-drop-target');
+    });
+    const target = document
+      .elementFromPoint(clientX, clientY)
+      ?.closest<HTMLElement>('.node-port-in');
+    if (this.isValidWireTarget(target ?? null)) target?.classList.add('is-drop-target');
+  }
+
+  private finishWireDrag(clientX: number, clientY: number): void {
+    const source = this.wireDrag;
+    const target = document
+      .elementFromPoint(clientX, clientY)
+      ?.closest<HTMLElement>('.node-port-in');
+
+    if (source && this.isValidWireTarget(target ?? null)) {
+      this.pushUndo();
+      const targetId = target!.dataset.entityId!;
+      if (source.kind === 'pattern') {
+        const mesh = this.project.meshes.find((candidate) => candidate.id === targetId);
+        const pattern = this.project.patterns.find((candidate) => candidate.id === source.id);
+        if (mesh && pattern) {
+          mesh.patternId = pattern.id;
+          remeshDocument(mesh, pattern);
+          for (const [nodeId, preview] of this.meshPreviews) {
+            const node = this.project.canvas.nodes.find((candidate) => candidate.id === nodeId);
+            if (node?.type === 'meshFrame' && node.meshId === mesh.id) preview.setMesh(mesh);
+          }
+          for (const assignment of this.project.assignments) {
+            if (assignment.meshId === mesh.id) this.rebuildConnectedSim(assignment.simId, true);
+          }
+          for (const link of this.project.meshTransformAssignments.filter(
+            (assignment) => assignment.meshId === mesh.id
+          )) {
+            this.rebuildConnectedTransform(link.transformId);
+          }
+          this.setStatus(`Connected ${pattern.name} → ${mesh.name}`);
+        }
+      } else if (source.kind === 'transform') {
+        const transform = this.project.transforms.find((candidate) => candidate.id === source.id);
+        const sim = this.project.sims.find((candidate) => candidate.id === target!.dataset.entityId);
+        if (transform && sim) {
+          this.project.transformSimAssignments = this.project.transformSimAssignments.filter(
+            (assignment) => assignment.simId !== sim.id
+          );
+          this.project.transformSimAssignments.push({
+            id: uid('assign'),
+            transformId: transform.id,
+            simId: sim.id,
+          });
+          this.project.assignments = this.project.assignments.filter(
+            (assignment) => assignment.simId !== sim.id
+          );
+          this.rebuildConnectedSim(sim.id, false);
+          this.setStatus(`Connected ${transform.name} → ${sim.name}`);
+        }
+      } else {
+        const mesh = this.project.meshes.find((candidate) => candidate.id === source.id);
+        const targetKind = target!.dataset.portKind;
+        const targetId = target!.dataset.entityId!;
+        if (targetKind === 'mesh') {
+          const transform = this.project.transforms.find((candidate) => candidate.id === targetId);
+          if (mesh && transform) {
+            transform.meshId = mesh.id;
+            this.project.meshTransformAssignments = this.project.meshTransformAssignments.filter(
+              (assignment) => assignment.transformId !== transform.id
+            );
+            this.project.meshTransformAssignments.push({
+              id: uid('assign'),
+              meshId: mesh.id,
+              transformId: transform.id,
+            });
+            this.rebuildConnectedTransform(transform.id);
+            this.setStatus(`Connected ${mesh.name} → ${transform.name}`);
+          }
+        } else if (targetKind === 'sim') {
+          const sim = this.project.sims.find((candidate) => candidate.id === targetId);
+          if (mesh && sim) {
+            this.project.assignments = this.project.assignments.filter(
+              (assignment) => assignment.simId !== sim.id
+            );
+            this.project.assignments.push({
+              id: uid('assign'),
+              meshId: mesh.id,
+              simId: sim.id,
+            });
+            this.project.transformSimAssignments = this.project.transformSimAssignments.filter(
+              (assignment) => assignment.simId !== sim.id
+            );
+            this.rebuildConnectedSim(sim.id, true);
+            this.setStatus(`Connected ${mesh.name} → ${sim.name}`);
+          }
+        }
+      }
+      this.renderInspector();
+    }
+    this.cancelWireDrag();
+  }
+
+  private rebuildConnectedSim(simId: string, clearPose = true): void {
+    const runtime = this.simRuntimes.get(simId);
+    const sim = this.project.sims.find((candidate) => candidate.id === simId);
+    if (!runtime || !sim) return;
+    const viaTransform = this.transformForSim(simId);
+    const pose = viaTransform ? this.poseForSim(simId) : clearPose ? null : sim.pose;
+    if (!viaTransform && clearPose) sim.pose = null;
+    runtime.rebuildCloth(
+      this.meshGeometryForSim(simId),
+      sim.params,
+      pose,
+      this.patternForSim(simId)
+    );
+  }
+
+  private cancelWireDrag(): void {
+    this.wireDrag = null;
+    document.getElementById('boardWrap')?.classList.remove('is-wiring');
+    this.board.querySelectorAll('.node-port.is-drop-target').forEach((port) => {
+      port.classList.remove('is-drop-target');
+    });
+    this.drawWires();
+  }
+
+  private drawWires(): void {
+    const wrap = document.getElementById('boardWrap')!;
+    const rect = wrap.getBoundingClientRect();
+    this.wiresSvg.setAttribute('width', String(rect.width));
+    this.wiresSvg.setAttribute('height', String(rect.height));
+    this.wiresSvg.innerHTML = '';
+    this.board.querySelectorAll('.node-port.is-connected').forEach((port) => {
+      port.classList.remove('is-connected');
+    });
+
+    const wire = (
+      a: CanvasNode,
+      b: CanvasNode,
+      cls: string
+    ) => {
+      this.appendWirePath(this.nodePortPoint(a, 'out'), this.nodePortPoint(b, 'in'), cls);
+      this.board
+        .querySelector(`[data-node-id="${a.id}"] > .node-port-out`)
+        ?.classList.add('is-connected');
+      this.board
+        .querySelector(`[data-node-id="${b.id}"] > .node-port-in`)
+        ?.classList.add('is-connected');
+    };
+
+    // Pattern → Mesh (via mesh.patternId)
+    for (const mesh of this.project.meshes) {
+      const patNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'patternFrame' && n.patternId === mesh.patternId
+      );
+      const meshNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'meshFrame' && n.meshId === mesh.id
+      );
+      if (patNode && meshNode) wire(patNode, meshNode, 'assign-wire wire-pattern-mesh');
+    }
+
+    // Mesh → Sim (direct)
+    for (const a of this.project.assignments) {
+      const meshNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'meshFrame' && n.meshId === a.meshId
+      );
+      const simNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'simViewport' && n.simId === a.simId
+      );
+      if (meshNode && simNode) wire(meshNode, simNode, 'assign-wire wire-mesh-sim');
+    }
+
+    // Mesh → Transform 3D
+    for (const a of this.project.meshTransformAssignments) {
+      const meshNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'meshFrame' && n.meshId === a.meshId
+      );
+      const transformNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'transform3d' && n.transformId === a.transformId
+      );
+      if (meshNode && transformNode) {
+        wire(meshNode, transformNode, 'assign-wire wire-mesh-transform');
+      }
+    }
+
+    // Transform 3D → Sim
+    for (const a of this.project.transformSimAssignments) {
+      const transformNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'transform3d' && n.transformId === a.transformId
+      );
+      const simNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'simViewport' && n.simId === a.simId
+      );
+      if (transformNode && simNode) {
+        wire(transformNode, simNode, 'assign-wire wire-transform-sim');
+      }
+    }
+
+    if (this.wireDrag) {
+      const sourceNode = this.project.canvas.nodes.find(
+        (candidate) => candidate.id === this.wireDrag!.nodeId
+      );
+      if (sourceNode) {
+        const previewClass =
+          this.wireDrag.kind === 'pattern'
+            ? 'pattern-mesh'
+            : this.wireDrag.kind === 'transform'
+              ? 'transform-sim'
+              : 'mesh-transform';
+        this.appendWirePath(
+          this.nodePortPoint(sourceNode, 'out'),
+          { x: this.wireDrag.x, y: this.wireDrag.y },
+          `assign-wire wire-preview wire-${previewClass}`
+        );
+      }
+    }
+  }
+
+  private renderInspector(): void {
+    this.hideInspectorTip();
+    const node = this.project.canvas.nodes.find((n) => n.id === this.selectedNodeId);
+    if (!node) {
+      this.inspector.innerHTML = `<h3>Inspector</h3><p class="muted">Drag an output port to a compatible input to reconnect nodes. Alt-drag board to pan.<br/>Transform 3D: arrange pieces before draping — no simulation. Drag fabric to move · empty drag to orbit · Shift-drag to raise/lower orbit · Move/Rotate toggle · wheel zoom.<br/>Sim: drag fabric to move · Play to simulate drape.</p>`;
+      return;
+    }
+
+    if (node.type === 'transform3d') {
+      const transform = this.project.transforms.find((t) => t.id === node.transformId)!;
+      const rt = this.transformRuntimes.get(transform.id);
+      const mesh = this.meshForTransform(transform.id);
+      const pattern = this.patternForTransform(transform.id);
+      const pieceIds = rt?.getPieceIds() ?? [];
+      const selectedPiece =
+        this.transformInspectorPieceId ??
+        rt?.getSelectedPieceId() ??
+        pieceIds[0] ??
+        null;
+      const pieceOptions = pieceIds
+        .map((pieceId) => {
+          const piece = pattern?.pieces.find((p) => p.id === pieceId);
+          const label = piece?.name ?? pieceId.slice(0, 8);
+          return `<option value="${pieceId}" ${pieceId === selectedPiece ? 'selected' : ''}>${label}</option>`;
+        })
+        .join('');
+      const stored: PieceTransform3d = selectedPiece
+        ? (transform.pieceTransforms[selectedPiece] ??
+          (rt?.cloth
+            ? {
+                position: rt.cloth.getPieceCentroidTuple(selectedPiece),
+                rotationDeg: [0, 0, 0] as [number, number, number],
+              }
+            : { position: [0, 0, 0], rotationDeg: [0, 0, 0] }))
+        : { position: [0, 0, 0], rotationDeg: [0, 0, 0] };
+      const posCm = stored.position.map((v) => (v * WORLD_TO_CM).toFixed(2));
+      const rot = stored.rotationDeg.map((v) => v.toFixed(1));
+      this.inspector.innerHTML = `
+        <h3>${transform.name}</h3>
+        <label>Name <input id="transformName" value="${transform.name}" /></label>
+        <p class="muted">Mesh source: <strong>${mesh?.name ?? 'none'}</strong> · arrangement only (no simulation)</p>
+        <label>Piece
+          <select id="transformPiece">${pieceOptions || '<option value="">—</option>'}</select>
+        </label>
+        <fieldset class="inspector-fieldset">
+          <legend>Initial position (cm)</legend>
+          <label>X <input id="transformPosX" type="number" step="0.1" value="${posCm[0]}" /></label>
+          <label>Y <input id="transformPosY" type="number" step="0.1" value="${posCm[1]}" /></label>
+          <label>Z <input id="transformPosZ" type="number" step="0.1" value="${posCm[2]}" /></label>
+        </fieldset>
+        <fieldset class="inspector-fieldset">
+          <legend>Initial rotation (deg)</legend>
+          <label>X <input id="transformRotX" type="number" step="1" value="${rot[0]}" /></label>
+          <label>Y <input id="transformRotY" type="number" step="1" value="${rot[1]}" /></label>
+          <label>Z <input id="transformRotZ" type="number" step="1" value="${rot[2]}" /></label>
+        </fieldset>
+        <p class="muted">Pose ${transform.pose ? 'saved' : 'default flat layout'} · edits apply to selected piece</p>
+        ${this.deleteButtonHtml()}
+      `;
+      this.inspector.querySelector('#transformName')?.addEventListener('change', (e) => {
+        transform.name = (e.target as HTMLInputElement).value;
+        this.renderAll();
+        void this.initGpuAndSims();
+      });
+      this.inspector.querySelector('#transformPiece')?.addEventListener('change', (e) => {
+        this.transformInspectorPieceId = (e.target as HTMLSelectElement).value || null;
+        rt?.setSelectedPieceId(this.transformInspectorPieceId);
+        this.renderInspector();
+      });
+      const applyPieceTransform = () => {
+        if (!selectedPiece || !rt) return;
+        const position: [number, number, number] = [
+          parseFloat((this.inspector.querySelector('#transformPosX') as HTMLInputElement).value) /
+            WORLD_TO_CM,
+          parseFloat((this.inspector.querySelector('#transformPosY') as HTMLInputElement).value) /
+            WORLD_TO_CM,
+          parseFloat((this.inspector.querySelector('#transformPosZ') as HTMLInputElement).value) /
+            WORLD_TO_CM,
+        ];
+        const rotationDeg: [number, number, number] = [
+          parseFloat((this.inspector.querySelector('#transformRotX') as HTMLInputElement).value),
+          parseFloat((this.inspector.querySelector('#transformRotY') as HTMLInputElement).value),
+          parseFloat((this.inspector.querySelector('#transformRotZ') as HTMLInputElement).value),
+        ];
+        rt.applyPieceTransform(selectedPiece, position, rotationDeg);
+      };
+      for (const id of [
+        'transformPosX',
+        'transformPosY',
+        'transformPosZ',
+        'transformRotX',
+        'transformRotY',
+        'transformRotZ',
+      ]) {
+        this.inspector.querySelector(`#${id}`)?.addEventListener('change', applyPieceTransform);
+      }
+      this.bindDeleteButton(node.id);
+      return;
+    }
+
+    if (node.type === 'simViewport') {
+      const sim = this.project.sims.find((s) => s.id === node.simId)!;
+      const p = sim.params;
+      const mesh = this.meshForSim(sim.id);
+      const engine = p.engine ?? 'cpu-mass-spring';
+      const isGpu = engine === 'gpu-xpbd';
+      const tip = (name: string, text: string, value: string, valueId: string) =>
+        this.paramTip(name, text, value, valueId);
+      const stretchPct = (((p.maxStretch ?? 1.12) * 100) - 100).toFixed(0);
+      const bendPct = (((p.bendSpringScale ?? 0.2) * 100)).toFixed(0);
+      this.inspector.innerHTML = `
+        <h3>${sim.name}</h3>
+        <label>Name <input id="simName" value="${sim.name}" /></label>
+        <p class="muted">Mesh source: <strong>${mesh?.name ?? 'none'}</strong>${this.transformForSim(sim.id) ? ' · via Transform 3D' : ''} — density is set on the Mesh node.</p>
+        <label>Engine
+          <select id="pEngine">
+            <option value="cpu-mass-spring" ${!isGpu ? 'selected' : ''}>CPU (mass-spring)</option>
+            <option value="gpu-xpbd" ${isGpu ? 'selected' : ''}>GPU (XPBD)</option>
+          </select>
+        </label>
+        <div id="cpuParams" style="${isGpu ? 'display:none' : ''}">
+          <div class="inspector-section">
+            <h4 class="inspector-section-title">Fabric</h4>
+            <p class="muted inspector-section-hint">How the cloth feels — stretch, weight, folds, grip.</p>
+            <label>${tip('Spring', 'Edge stretch stiffness. Lower = stretchier / silkier; higher = firmer woven cloth. Recommended: 800–1500 (default 1000).', String(Math.round(p.springConst)), 'vSpring')}
+              <input id="pSpring" type="range" min="100" max="5000" value="${p.springConst}" /></label>
+            <label>${tip('Damping', 'Spring energy loss. Higher settles faster with less jitter; too high feels sluggish. Recommended: 2–6 (default 3.5).', p.dampingConst.toFixed(1), 'vDamp')}
+              <input id="pDamp" type="range" min="0" max="20" step="0.1" value="${p.dampingConst}" /></label>
+            <label>${tip('Mass', 'Total garment mass (split across particles). Heavier = more inertia and drape; lighter reacts faster. Recommended: 50–150 (default 100).', String(Math.round(p.mass)), 'vMass')}
+              <input id="pMass" type="range" min="10" max="300" value="${p.mass}" /></label>
+            <label>${tip('Max stretch', 'Hard cap on how far fabric edges may elongate (Provot). Higher % = stretchier knit; lower = stable woven. Recommended: 5–15% (default 12%). Set near 0% only if you need almost inextensible cloth.', `${stretchPct}%`, 'vMaxStretch')}
+              <input id="pMaxStretch" type="range" min="1" max="1.5" step="0.01" value="${p.maxStretch ?? 1.12}" /></label>
+            <label>${tip('Bend springs', 'Resistance to folding, as a fraction of Spring. Low = soft drapey folds; high locks panels flat and fights seams. Recommended: 10–40% (default 20%). Avoid 100% for garments.', `${bendPct}%`, 'vBendScale')}
+              <input id="pBendScale" type="range" min="0" max="1" step="0.05" value="${p.bendSpringScale ?? 0.2}" /></label>
+            <label>${tip('Contact grip', 'Friction against the avatar / ground. Higher sticks and resists sliding; lower lets cloth glide. Recommended: 0.3–0.6 (default 0.45).', (p.contactFriction ?? 0.45).toFixed(2), 'vFriction')}
+              <input id="pFriction" type="range" min="0" max="1" step="0.05" value="${p.contactFriction ?? 0.45}" /></label>
+            <label>${tip('Gravity', 'Downward acceleration scale for drape. Higher hangs heavier; lower floats. Recommended: 0.6–1.2 (default 0.8).', p.gravity.toFixed(2), 'vGrav')}
+              <input id="pGrav" type="range" min="0" max="5" step="0.05" value="${p.gravity}" /></label>
+          </div>
+          <div class="inspector-section">
+            <h4 class="inspector-section-title">Simulation</h4>
+            <p class="muted inspector-section-hint">Stability &amp; cost — more steps usually beat cranking Spring alone.</p>
+            <label>${tip('Substeps', 'Physics steps per frame (Macklin “small steps”). More = less stretch/jitter, higher CPU. Recommended: 16–32 (default 24). Raise before raising Spring if things explode.', String(p.substeps ?? 24), 'vCpuSubsteps')}
+              <input id="pCpuSubsteps" type="range" min="4" max="64" value="${p.substeps ?? 24}" /></label>
+            <label>${tip('Strain-limit iters', 'Provot stretch-limit passes per substep. Cuts rubber-band stretch after springs. Recommended: 4–10 (default 6). 0 disables limiting (uses Max stretch only via springs).', String(p.constraintIterations ?? 6), 'vStrainIters')}
+              <input id="pStrainIters" type="range" min="0" max="20" value="${p.constraintIterations ?? 6}" /></label>
+            <label>${tip('Velocity retain', 'Multiply velocity each substep (1 = none). Slightly below 1 damps high-frequency ringing without heavy Damping. Recommended: 0.995–0.999 (default 0.998).', (p.velocityDamping ?? 0.998).toFixed(3), 'vVelDamp')}
+              <input id="pVelDamp" type="range" min="0.95" max="1" step="0.001" value="${p.velocityDamping ?? 0.998}" /></label>
+            <label>${tip('Max speed', 'Clamp particle speed (world units/s) to stop explosions from bad steps. Recommended: 20–40 (default 30). Lower if the cloth still rockets; raise if motion feels capped.', String(Math.round(p.maxSpeed ?? 30)), 'vMaxSpeed')}
+              <input id="pMaxSpeed" type="range" min="5" max="80" step="1" value="${p.maxSpeed ?? 30}" /></label>
+          </div>
+        </div>
+        <div id="gpuParams" style="${isGpu ? '' : 'display:none'}">
+          <div class="inspector-section">
+            <h4 class="inspector-section-title">Fabric</h4>
+            <p class="muted inspector-section-hint">How the cloth feels under XPBD constraints.</p>
+            <label>${tip('LRA stretchiness', 'Long-range attachment / sew slack multiplier. Higher = looser seams and attachments; lower pulls tighter. Recommended: 1.1–1.4 (default 1.2).', (p.longRangeStretchiness ?? 1.2).toFixed(2), 'vLra')}
+              <input id="pLra" type="range" min="1" max="2" step="0.05" value="${p.longRangeStretchiness ?? 1.2}" /></label>
+            <label>${tip('Gravity', 'Downward acceleration scale for drape. Higher hangs heavier; lower floats. Recommended: 0.6–1.2 (default 0.8).', p.gravity.toFixed(2), 'vGravGpu')}
+              <input id="pGravGpu" type="range" min="0" max="5" step="0.05" value="${p.gravity}" /></label>
+          </div>
+          <div class="inspector-section">
+            <h4 class="inspector-section-title">Simulation</h4>
+            <p class="muted inspector-section-hint">Solver quality vs GPU cost.</p>
+            <label>${tip('Substeps', 'XPBD steps per frame. More = stabler stretch and collisions, more GPU time. Recommended: 4–12 (default 8).', String(p.substeps ?? 8), 'vSubsteps')}
+              <input id="pSubsteps" type="range" min="2" max="32" value="${p.substeps ?? 8}" /></label>
+            <label>${tip('Iterations', 'Constraint solver passes per substep. More = harder stretch/seams, costlier. Recommended: 2–8 (default 4).', String(p.constraintIterations ?? 4), 'vIters')}
+              <input id="pIters" type="range" min="1" max="16" value="${p.constraintIterations ?? 4}" /></label>
+            <label class="inspector-check">${tip('Self-collision', 'Cloth–cloth contact via spatial hash. Prevents self-intersection; expensive. Leave off for simple drapes; on for layered or bunched garments.', p.enableSelfCollision ? 'On' : 'Off', 'vSelfCol')}
+              <input id="pSelfCol" type="checkbox" ${p.enableSelfCollision ? 'checked' : ''} /></label>
+          </div>
+        </div>
+        <p class="muted">${this.project.activeSimId === sim.id ? '● Active' : 'Paused'} · pose ${sim.pose ? 'saved' : 'none'}</p>
+        ${this.deleteButtonHtml()}
+      `;
+      const setValue = (id: string, text: string) => {
+        const el = this.inspector.querySelector(`#${id}`);
+        if (el) el.textContent = text;
+      };
+      const syncParamValues = () => {
+        setValue('vSpring', String(Math.round(p.springConst)));
+        setValue('vDamp', p.dampingConst.toFixed(1));
+        setValue('vMass', String(Math.round(p.mass)));
+        setValue('vMaxStretch', `${(((p.maxStretch ?? 1.12) * 100) - 100).toFixed(0)}%`);
+        setValue('vBendScale', `${(((p.bendSpringScale ?? 0.2) * 100)).toFixed(0)}%`);
+        setValue('vFriction', (p.contactFriction ?? 0.45).toFixed(2));
+        setValue('vGrav', p.gravity.toFixed(2));
+        setValue('vGravGpu', p.gravity.toFixed(2));
+        setValue('vCpuSubsteps', String(p.substeps ?? 24));
+        setValue('vStrainIters', String(p.constraintIterations ?? 6));
+        setValue('vVelDamp', (p.velocityDamping ?? 0.998).toFixed(3));
+        setValue('vMaxSpeed', String(Math.round(p.maxSpeed ?? 30)));
+        setValue('vLra', (p.longRangeStretchiness ?? 1.2).toFixed(2));
+        setValue('vSubsteps', String(p.substeps ?? 8));
+        setValue('vIters', String(p.constraintIterations ?? 4));
+        setValue('vSelfCol', p.enableSelfCollision ? 'On' : 'Off');
+      };
+      const bind = (id: string, fn: (v: number) => void) => {
+        const el = this.inspector.querySelector(`#${id}`) as HTMLInputElement | null;
+        if (!el) return;
+        let armed = false;
+        el.addEventListener('pointerdown', () => {
+          if (armed) return;
+          armed = true;
+          this.pushUndo();
+        });
+        el.addEventListener('change', () => {
+          armed = false;
+        });
+        el.addEventListener('input', (e) => {
+          fn(parseFloat((e.target as HTMLInputElement).value));
+          syncParamValues();
+          const rt = this.simRuntimes.get(sim.id);
+          rt?.cloth?.applyParams(sim.params);
+        });
+      };
+      this.inspector.querySelector('#simName')?.addEventListener('change', (e) => {
+        this.pushUndo();
+        sim.name = (e.target as HTMLInputElement).value;
+        this.renderAll();
+        void this.initGpuAndSims();
+      });
+      this.inspector.querySelector('#pEngine')?.addEventListener('change', (e) => {
+        this.pushUndo();
+        const next = (e.target as HTMLSelectElement).value as 'cpu-mass-spring' | 'gpu-xpbd';
+        const rt = this.simRuntimes.get(sim.id);
+        if (rt?.cloth) sim.pose = rt.cloth.exportPose();
+        p.engine = next;
+        const geom = this.meshGeometryForSim(sim.id);
+        const pattern = this.patternForSim(sim.id);
+        rt?.rebuildCloth(geom, sim.params, sim.pose, pattern);
+        this.renderInspector();
+        this.persistLocal();
+      });
+      bind('pSpring', (v) => {
+        p.springConst = v;
+      });
+      bind('pDamp', (v) => {
+        p.dampingConst = v;
+      });
+      bind('pGrav', (v) => {
+        p.gravity = v;
+      });
+      bind('pGravGpu', (v) => {
+        p.gravity = v;
+      });
+      bind('pMass', (v) => {
+        p.mass = v;
+      });
+      bind('pCpuSubsteps', (v) => {
+        p.substeps = Math.round(v);
+      });
+      bind('pStrainIters', (v) => {
+        p.constraintIterations = Math.round(v);
+      });
+      bind('pMaxStretch', (v) => {
+        p.maxStretch = v;
+      });
+      bind('pBendScale', (v) => {
+        p.bendSpringScale = v;
+      });
+      bind('pVelDamp', (v) => {
+        p.velocityDamping = v;
+      });
+      bind('pMaxSpeed', (v) => {
+        p.maxSpeed = v;
+      });
+      bind('pFriction', (v) => {
+        p.contactFriction = v;
+      });
+      bind('pSubsteps', (v) => {
+        p.substeps = Math.round(v);
+      });
+      bind('pIters', (v) => {
+        p.constraintIterations = Math.round(v);
+      });
+      bind('pLra', (v) => {
+        p.longRangeStretchiness = v;
+      });
+      this.inspector.querySelector('#pSelfCol')?.addEventListener('change', (e) => {
+        p.enableSelfCollision = (e.target as HTMLInputElement).checked;
+        syncParamValues();
+        const rt = this.simRuntimes.get(sim.id);
+        rt?.cloth?.applyParams(sim.params);
+      });
+      this.bindInspectorTips();
+      this.bindDeleteButton(node.id);
+      return;
+    }
+
+    if (node.type === 'meshFrame') {
+      const mesh = this.project.meshes.find((m) => m.id === node.meshId)!;
+      const s = mesh.settings;
+      const patterns = this.project.patterns
+        .map((p) => `<option value="${p.id}" ${p.id === mesh.patternId ? 'selected' : ''}>${p.name}</option>`)
+        .join('');
+      this.inspector.innerHTML = `
+        <h3>${mesh.name}</h3>
+        <label>Name <input id="meshName" value="${mesh.name}" /></label>
+        <label>Source pattern
+          <select id="meshPattern">${patterns}</select>
+        </label>
+        <label>Algorithm
+          <select id="meshAlgo">
+            <option value="delaunay" ${s.algorithm === 'delaunay' ? 'selected' : ''}>Delaunay (boundary + interior)</option>
+            <option value="centroidal" ${s.algorithm === 'centroidal' ? 'selected' : ''}>Centroidal (Lloyd-smoothed)</option>
+            <option value="structuredGrid" ${s.algorithm === 'structuredGrid' ? 'selected' : ''}>Structured grid</option>
+          </select>
+        </label>
+        <label>Target edge (${this.project.displayUnit})
+          <input id="meshEdge" type="range" min="1" max="12" step="0.25" value="${s.targetEdgeCm}" />
+          <span id="meshEdgeVal">${s.targetEdgeCm.toFixed(2)} cm</span>
+        </label>
+        <label>Boundary spacing (cm)
+          <input id="meshBound" type="range" min="0.5" max="8" step="0.25" value="${s.boundarySpacingCm}" />
+          <span id="meshBoundVal">${s.boundarySpacingCm.toFixed(2)}</span>
+        </label>
+        <label>Lloyd iterations
+          <input id="meshLloyd" type="range" min="0" max="8" step="1" value="${s.lloydIterations}" ${s.algorithm !== 'centroidal' ? 'disabled' : ''} />
+          <span id="meshLloydVal">${s.lloydIterations}</span>
+        </label>
+        <button type="button" id="meshRemesh">Remesh</button>
+        <p class="muted">Top-down preview. Remesh after changing settings, then Rebuild on the sim.</p>
+        ${this.deleteButtonHtml()}
+      `;
+      const syncLabels = () => {
+        (this.inspector.querySelector('#meshEdgeVal') as HTMLElement).textContent =
+          `${s.targetEdgeCm.toFixed(2)} cm`;
+        (this.inspector.querySelector('#meshBoundVal') as HTMLElement).textContent =
+          s.boundarySpacingCm.toFixed(2);
+        (this.inspector.querySelector('#meshLloydVal') as HTMLElement).textContent = String(
+          s.lloydIterations
+        );
+      };
+      this.inspector.querySelector('#meshName')?.addEventListener('change', (e) => {
+        this.pushUndo();
+        mesh.name = (e.target as HTMLInputElement).value;
+        this.renderAll();
+        void this.initGpuAndSims();
+      });
+      this.inspector.querySelector('#meshPattern')?.addEventListener('change', (e) => {
+        this.pushUndo();
+        mesh.patternId = (e.target as HTMLSelectElement).value;
+        this.remesh(mesh.id, { recordUndo: false });
+        this.drawWires();
+      });
+      this.inspector.querySelector('#meshAlgo')?.addEventListener('change', (e) => {
+        this.pushUndo();
+        s.algorithm = (e.target as HTMLSelectElement).value as MeshAlgorithm;
+        const lloyd = this.inspector.querySelector('#meshLloyd') as HTMLInputElement;
+        lloyd.disabled = s.algorithm !== 'centroidal';
+        this.remesh(mesh.id, { recordUndo: false });
+      });
+      for (const id of ['meshEdge', 'meshBound', 'meshLloyd']) {
+        this.inspector.querySelector(`#${id}`)?.addEventListener('pointerdown', () => {
+          this.pushUndo();
+        });
+      }
+      this.inspector.querySelector('#meshEdge')?.addEventListener('input', (e) => {
+        s.targetEdgeCm = parseFloat((e.target as HTMLInputElement).value);
+        syncLabels();
+      });
+      this.inspector.querySelector('#meshEdge')?.addEventListener('change', () =>
+        this.remesh(mesh.id, { recordUndo: false })
+      );
+      this.inspector.querySelector('#meshBound')?.addEventListener('input', (e) => {
+        s.boundarySpacingCm = parseFloat((e.target as HTMLInputElement).value);
+        syncLabels();
+      });
+      this.inspector.querySelector('#meshBound')?.addEventListener('change', () =>
+        this.remesh(mesh.id, { recordUndo: false })
+      );
+      this.inspector.querySelector('#meshLloyd')?.addEventListener('input', (e) => {
+        s.lloydIterations = Math.round(parseFloat((e.target as HTMLInputElement).value));
+        syncLabels();
+      });
+      this.inspector.querySelector('#meshLloyd')?.addEventListener('change', () =>
+        this.remesh(mesh.id, { recordUndo: false })
+      );
+      this.inspector.querySelector('#meshRemesh')?.addEventListener('click', () => this.remesh(mesh.id));
+      this.bindDeleteButton(node.id);
+      return;
+    }
+
+    if (node.type === 'patternFrame') {
+      const pattern = this.project.patterns.find((p) => p.id === node.patternId)!;
+      this.inspector.innerHTML = `
+        <h3>${pattern.name}</h3>
+        <label>Name <input id="patName" value="${pattern.name}" /></label>
+        <button type="button" id="addPt">Add point</button>
+        <p class="muted">Tools: Move · Pen · Dart (click edge → 4 cm inward V) · Bend. ⌘/Ctrl-wheel zoom, Alt-drag pan.</p>
+        ${this.deleteButtonHtml()}
+      `;
+      this.inspector.querySelector('#patName')?.addEventListener('change', (e) => {
+        pattern.name = (e.target as HTMLInputElement).value;
+        this.renderAll();
+        void this.initGpuAndSims();
+      });
+      this.inspector.querySelector('#addPt')?.addEventListener('click', () => {
+        this.editors.get(node.id)?.addPointOnEdge();
+      });
+      this.bindDeleteButton(node.id);
+      return;
+    }
+
+    if (node.type === 'text') {
+      this.inspector.innerHTML = `
+        <h3>Note</h3>
+        <p class="muted">Edit text directly on the canvas.</p>
+        ${this.deleteButtonHtml()}
+      `;
+      this.bindDeleteButton(node.id);
+      return;
+    }
+
+    if (node.type === 'image') {
+      this.inspector.innerHTML = `
+        <h3>${this.escapeHtml(node.label || 'Image')}</h3>
+        <p class="muted">Reference image — drag to move, corner handles to resize. Hold Shift to lock aspect.</p>
+        <label>Label <input id="imgLabel" value="${this.escapeHtml(node.label || '')}" /></label>
+        <label>Width
+          <input id="imgW" type="number" min="80" step="1" value="${Math.round(node.width)}" />
+        </label>
+        <label>Height
+          <input id="imgH" type="number" min="60" step="1" value="${Math.round(node.height)}" />
+        </label>
+        <button type="button" id="imgReplace">Replace image…</button>
+        ${this.deleteButtonHtml()}
+      `;
+      this.inspector.querySelector('#imgLabel')?.addEventListener('change', (e) => {
+        this.pushUndo();
+        node.label = (e.target as HTMLInputElement).value.trim() || 'Image';
+        const imgEl = this.board.querySelector(
+          `[data-node-id="${node.id}"] img`
+        ) as HTMLImageElement | null;
+        if (imgEl) imgEl.alt = node.label;
+        this.renderInspector();
+      });
+      const bindDim = (id: string, apply: (v: number) => void) => {
+        this.inspector.querySelector(`#${id}`)?.addEventListener('change', (e) => {
+          const v = parseFloat((e.target as HTMLInputElement).value);
+          if (!Number.isFinite(v)) return;
+          this.pushUndo();
+          apply(v);
+          this.layoutNodes();
+          this.drawWires();
+          this.renderInspector();
+        });
+      };
+      bindDim('imgW', (v) => {
+        node.width = Math.max(80, v);
+      });
+      bindDim('imgH', (v) => {
+        node.height = Math.max(60, v);
+      });
+      this.inspector.querySelector('#imgReplace')?.addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'image/*';
+        input.addEventListener('change', () => {
+          const file = input.files?.[0];
+          if (!file) return;
+          void (async () => {
+            try {
+              this.pushUndo();
+              const src = await this.readFileAsDataUrl(file);
+              const { w, h } = await this.loadImageNaturalSize(src);
+              node.src = src;
+              node.naturalAspect = w / h;
+              node.label = file.name.replace(/\.[^.]+$/, '') || node.label || 'Image';
+              const imgEl = this.board.querySelector(
+                `[data-node-id="${node.id}"] img`
+              ) as HTMLImageElement | null;
+              if (imgEl) {
+                imgEl.src = src;
+                imgEl.alt = node.label;
+              }
+              this.renderInspector();
+              this.persistLocal();
+              this.setStatus('Image replaced');
+            } catch {
+              this.setStatus('Could not replace image');
+            }
+          })();
+        });
+        input.click();
+      });
+      this.bindDeleteButton(node.id);
+    }
+  }
+
+  private deleteButtonHtml(): string {
+    return `<button type="button" id="deleteNode" class="danger">Delete node</button>`;
+  }
+
+  private bindDeleteButton(nodeId: string): void {
+    this.inspector.querySelector('#deleteNode')?.addEventListener('click', () => {
+      this.deleteNode(nodeId);
+    });
+  }
+
+  private deleteNode(nodeId: string): void {
+    const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
+    if (!node) return;
+    if (!confirm('Delete this node?')) return;
+    this.pushUndo();
+
+    this.project.canvas.nodes = this.project.canvas.nodes.filter((n) => n.id !== nodeId);
+
+    if (node.type === 'simViewport') {
+      const simId = node.simId;
+      const stillUsed = this.project.canvas.nodes.some(
+        (n) => n.type === 'simViewport' && n.simId === simId
+      );
+      if (!stillUsed) {
+        const rt = this.simRuntimes.get(simId);
+        rt?.cloth?.destroy();
+        this.simRuntimes.delete(simId);
+        this.project.sims = this.project.sims.filter((s) => s.id !== simId);
+        this.project.assignments = this.project.assignments.filter((a) => a.simId !== simId);
+        if (this.project.activeSimId === simId) this.project.activeSimId = null;
+      }
+    } else if (node.type === 'meshFrame') {
+      const meshId = node.meshId;
+      const stillUsed = this.project.canvas.nodes.some(
+        (n) => n.type === 'meshFrame' && n.meshId === meshId
+      );
+      if (!stillUsed) {
+        this.project.meshes = this.project.meshes.filter((m) => m.id !== meshId);
+        this.project.assignments = this.project.assignments.filter((a) => a.meshId !== meshId);
+        this.project.meshTransformAssignments = this.project.meshTransformAssignments.filter(
+          (a) => a.meshId !== meshId
+        );
+      }
+    } else if (node.type === 'transform3d') {
+      const transformId = node.transformId;
+      const stillUsed = this.project.canvas.nodes.some(
+        (n) => n.type === 'transform3d' && n.transformId === transformId
+      );
+      if (!stillUsed) {
+        const rt = this.transformRuntimes.get(transformId);
+        rt?.cloth?.destroy();
+        this.transformRuntimes.delete(transformId);
+        this.project.transforms = this.project.transforms.filter((t) => t.id !== transformId);
+        this.project.meshTransformAssignments = this.project.meshTransformAssignments.filter(
+          (a) => a.transformId !== transformId
+        );
+        this.project.transformSimAssignments = this.project.transformSimAssignments.filter(
+          (a) => a.transformId !== transformId
+        );
+      }
+    } else if (node.type === 'patternFrame') {
+      const patternId = node.patternId;
+      const stillUsed = this.project.canvas.nodes.some(
+        (n) => n.type === 'patternFrame' && n.patternId === patternId
+      );
+      if (!stillUsed) {
+        this.project.patterns = this.project.patterns.filter((p) => p.id !== patternId);
+        // Orphan meshes that pointed at this pattern keep the id until user reassigns;
+        // clear geometry so remesh fails loudly until a new pattern is chosen.
+        for (const mesh of this.project.meshes) {
+          if (mesh.patternId === patternId) mesh.geometry = null;
+        }
+      }
+    }
+
+    this.selectedNodeId = null;
+    this.renderAll();
+    void this.initGpuAndSims();
+    this.setStatus('Node deleted');
+  }
+
+  private applyNodeResize(clientX: number, clientY: number): void {
+    const r = this.resizingNode;
+    if (!r) return;
+    const node = this.project.canvas.nodes.find((n) => n.id === r.id);
+    if (!node) return;
+
+    const zoom = this.project.canvas.zoom;
+    const boardX = (clientX - this.project.canvas.panX) / zoom;
+    const boardY = (clientY - this.project.canvas.panY) / zoom;
+    const dx = boardX - r.startBoardX;
+    const dy = boardY - r.startBoardY;
+
+    const minW = node.type === 'text' ? 120 : node.type === 'image' ? 80 : 200;
+    const minH = node.type === 'text' ? 40 : node.type === 'image' ? 60 : 160;
+
+    let x = r.origX;
+    let y = r.origY;
+    let w = r.origW;
+    let h = r.origH;
+
+    if (r.corner.includes('e')) w = r.origW + dx;
+    if (r.corner.includes('s')) h = r.origH + dy;
+    if (r.corner.includes('w')) {
+      w = r.origW - dx;
+      x = r.origX + dx;
+    }
+    if (r.corner.includes('n')) {
+      h = r.origH - dy;
+      y = r.origY + dy;
+    }
+
+    if (w < minW) {
+      if (r.corner.includes('w')) x = r.origX + r.origW - minW;
+      w = minW;
+    }
+    if (h < minH) {
+      if (r.corner.includes('n')) y = r.origY + r.origH - minH;
+      h = minH;
+    }
+
+    // Image refs: hold Shift to lock natural (or current) aspect ratio.
+    if (node.type === 'image' && this.resizeShiftKey) {
+      const aspect =
+        node.naturalAspect && node.naturalAspect > 0 ? node.naturalAspect : r.origW / Math.max(1, r.origH);
+      const fromWidth = Math.abs(dx) >= Math.abs(dy);
+      if (fromWidth) {
+        h = Math.max(minH, w / aspect);
+        if (r.corner.includes('n')) y = r.origY + r.origH - h;
+        if (r.corner.includes('w')) x = r.origX + r.origW - w;
+      } else {
+        w = Math.max(minW, h * aspect);
+        if (r.corner.includes('w')) x = r.origX + r.origW - w;
+        if (r.corner.includes('n')) y = r.origY + r.origH - h;
+      }
+    }
+
+    node.x = x;
+    node.y = y;
+    node.width = w;
+    node.height = h;
+    this.layoutNodes();
+    this.drawWires();
+  }
+
+  private duplicateSelectedNode(): void {
+    if (!this.selectedNodeId) {
+      this.setStatus('Select a node to duplicate');
+      return;
+    }
+    if (this.isStudioModalOpen()) return;
+    const dup = this.duplicateNode(this.selectedNodeId, {
+      offsetX: 32,
+      offsetY: 32,
+      recordUndo: true,
+      select: true,
+    });
+    if (dup) this.setStatus(`Duplicated · ${this.nodeLabel(dup)}`);
+  }
+
+  private isStudioModalOpen(): boolean {
+    return !this.modalRoot.hidden;
+  }
+
+  private nodeLabel(node: CanvasNode): string {
+    switch (node.type) {
+      case 'patternFrame': {
+        const p = this.project.patterns.find((x) => x.id === node.patternId);
+        return p?.name ?? 'Pattern';
+      }
+      case 'meshFrame': {
+        const m = this.project.meshes.find((x) => x.id === node.meshId);
+        return m?.name ?? 'Mesh';
+      }
+      case 'transform3d': {
+        const t = this.project.transforms.find((x) => x.id === node.transformId);
+        return t?.name ?? 'Transform 3D';
+      }
+      case 'simViewport': {
+        const s = this.project.sims.find((x) => x.id === node.simId);
+        return s?.name ?? 'Sim';
+      }
+      case 'image':
+        return node.label ?? 'Image';
+      case 'text':
+        return 'Note';
+    }
+  }
+
+  /**
+   * Clone a canvas node and its backing document (pattern/mesh/transform/sim),
+   * preserving settings, geometry, pose, camera, and graph connections where applicable.
+   */
+  private duplicateNode(
+    nodeId: string,
+    opts: {
+      offsetX?: number;
+      offsetY?: number;
+      recordUndo?: boolean;
+      select?: boolean;
+    } = {}
+  ): CanvasNode | null {
+    const src = this.project.canvas.nodes.find((n) => n.id === nodeId);
+    if (!src) return null;
+
+    if (opts.recordUndo !== false) this.pushUndo();
+
+    const ox = opts.offsetX ?? 32;
+    const oy = opts.offsetY ?? 32;
+    const zIndex = this.project.canvas.nodes.length + 1;
+    let needsGpu = false;
+    let node: CanvasNode;
+
+    switch (src.type) {
+      case 'patternFrame': {
+        const pattern = this.project.patterns.find((p) => p.id === src.patternId);
+        if (!pattern) return null;
+        const cloned = this.clonePatternDocument(pattern);
+        this.project.patterns.push(cloned);
+        node = {
+          type: 'patternFrame',
+          id: uid('node'),
+          patternId: cloned.id,
+          x: src.x + ox,
+          y: src.y + oy,
+          width: src.width,
+          height: src.height,
+          zIndex,
+        };
+        break;
+      }
+      case 'meshFrame': {
+        const mesh = this.project.meshes.find((m) => m.id === src.meshId);
+        if (!mesh) return null;
+        const cloned: MeshDocument = {
+          id: uid('mesh'),
+          name: `${mesh.name} copy`,
+          patternId: mesh.patternId,
+          settings: { ...mesh.settings },
+          geometry: mesh.geometry ? structuredClone(mesh.geometry) : null,
+        };
+        this.project.meshes.push(cloned);
+        node = {
+          type: 'meshFrame',
+          id: uid('node'),
+          meshId: cloned.id,
+          x: src.x + ox,
+          y: src.y + oy,
+          width: src.width,
+          height: src.height,
+          zIndex,
+        };
+        break;
+      }
+      case 'transform3d': {
+        const transform = this.project.transforms.find((t) => t.id === src.transformId);
+        if (!transform) return null;
+        const cloned = {
+          id: uid('transform'),
+          name: `${transform.name} copy`,
+          meshId: transform.meshId,
+          camera: structuredClone(transform.camera),
+          pose: transform.pose ? structuredClone(transform.pose) : null,
+          pieceTransforms: structuredClone(transform.pieceTransforms),
+        };
+        this.project.transforms.push(cloned);
+        this.project.meshTransformAssignments.push({
+          id: uid('assign'),
+          meshId: cloned.meshId,
+          transformId: cloned.id,
+        });
+        node = {
+          type: 'transform3d',
+          id: uid('node'),
+          transformId: cloned.id,
+          x: src.x + ox,
+          y: src.y + oy,
+          width: src.width,
+          height: src.height,
+          zIndex,
+        };
+        needsGpu = true;
+        break;
+      }
+      case 'simViewport': {
+        const sim = this.project.sims.find((s) => s.id === src.simId);
+        if (!sim) return null;
+        // Capture live pose/camera before cloning
+        this.persistSimStates();
+        const live = this.project.sims.find((s) => s.id === src.simId)!;
+        const cloned: SimInstance = {
+          id: uid('sim'),
+          name: `${live.name} copy`,
+          params: {
+            ...live.params,
+            wind: [...live.params.wind] as [number, number, number],
+          },
+          pose: live.pose ? structuredClone(live.pose) : null,
+          camera: structuredClone(live.camera),
+          dropped: live.dropped,
+        };
+        this.project.sims.push(cloned);
+        for (const a of this.project.assignments.filter((x) => x.simId === src.simId)) {
+          this.project.assignments.push({
+            id: uid('assign'),
+            meshId: a.meshId,
+            simId: cloned.id,
+          });
+        }
+        for (const a of this.project.transformSimAssignments.filter(
+          (x) => x.simId === src.simId
+        )) {
+          this.project.transformSimAssignments.push({
+            id: uid('assign'),
+            transformId: a.transformId,
+            simId: cloned.id,
+          });
+        }
+        node = {
+          type: 'simViewport',
+          id: uid('node'),
+          simId: cloned.id,
+          x: src.x + ox,
+          y: src.y + oy,
+          width: src.width,
+          height: src.height,
+          zIndex,
+        };
+        needsGpu = true;
+        break;
+      }
+      case 'image': {
+        node = {
+          type: 'image',
+          id: uid('node'),
+          x: src.x + ox,
+          y: src.y + oy,
+          width: src.width,
+          height: src.height,
+          zIndex,
+          src: src.src,
+          label: src.label ? `${src.label} copy` : undefined,
+          naturalAspect: src.naturalAspect,
+        };
+        break;
+      }
+      case 'text': {
+        node = {
+          type: 'text',
+          id: uid('node'),
+          x: src.x + ox,
+          y: src.y + oy,
+          width: src.width,
+          height: src.height,
+          zIndex,
+          text: src.text,
+          fontSize: src.fontSize,
+        };
+        break;
+      }
+    }
+
+    this.project.canvas.nodes.push(node);
+    this.mountNode(node);
+    if (opts.select !== false) {
+      this.selectedNodeId = node.id;
+      this.renderInspector();
+    }
+    this.layoutNodes();
+    this.drawWires();
+    if (needsGpu) void this.initGpuAndSims();
+    return node;
+  }
+
+  private clonePatternDocument(src: PatternDocument): PatternDocument {
+    const pieceIdMap = new Map<string, string>();
+    const pointIdMap = new Map<string, string>();
+    const pieces = src.pieces.map((piece) => {
+      const newPieceId = uid('piece');
+      pieceIdMap.set(piece.id, newPieceId);
+      const points = piece.points.map((pt) => {
+        const newPtId = uid('pt');
+        pointIdMap.set(pt.id, newPtId);
+        return {
+          id: newPtId,
+          anchor: { ...pt.anchor },
+          handleIn: pt.handleIn ? { ...pt.handleIn } : null,
+          handleOut: pt.handleOut ? { ...pt.handleOut } : null,
+          handlesParallel: pt.handlesParallel,
+        };
+      });
+      return {
+        id: newPieceId,
+        name: piece.name,
+        closed: piece.closed,
+        points,
+        grainline: piece.grainline
+          ? {
+              from: { ...piece.grainline.from },
+              to: { ...piece.grainline.to },
+            }
+          : undefined,
+      };
+    });
+    const remapEdge = (edge: PatternDocument['seams'][number]['a']) => ({
+      pieceId: pieceIdMap.get(edge.pieceId) ?? edge.pieceId,
+      fromPointId: pointIdMap.get(edge.fromPointId) ?? edge.fromPointId,
+      toPointId: pointIdMap.get(edge.toPointId) ?? edge.toPointId,
+      t0: edge.t0,
+      t1: edge.t1,
+    });
+    return {
+      id: uid('pattern'),
+      name: `${src.name} copy`,
+      pieces,
+      seams: src.seams.map((seam) => ({
+        id: uid('seam'),
+        a: remapEdge(seam.a),
+        b: remapEdge(seam.b),
+        restGapCm: seam.restGapCm,
+      })),
+    };
+  }
+
+  private addPatternFrame(): void {
+    const patternId = uid('pattern');
+    this.project.patterns.push({
+      id: patternId,
+      name: `Pattern ${this.project.patterns.length + 1}`,
+      pieces: [rectPiece('Panel', 40, 50, { x: 5, y: 5 })],
+      seams: [],
+    });
+    const node = {
+      type: 'patternFrame' as const,
+      id: uid('node'),
+      patternId,
+      x: 60,
+      y: 100 + this.project.patterns.length * 30,
+      width: 400,
+      height: 440,
+      zIndex: this.project.canvas.nodes.length + 1,
+    };
+    this.project.canvas.nodes.push(node);
+    this.mountNode(node);
+    this.drawWires();
+  }
+
+  private addMeshFrame(): void {
+    const pattern = this.project.patterns[0];
+    if (!pattern) {
+      alert('Add a pattern first.');
+      return;
+    }
+    const mesh = createMeshDocument(pattern.id, `Mesh ${this.project.meshes.length + 1}`);
+    remeshDocument(mesh, pattern);
+    this.project.meshes.push(mesh);
+    const node: MeshFrameNode = {
+      type: 'meshFrame',
+      id: uid('node'),
+      meshId: mesh.id,
+      x: 400,
+      y: 100 + this.project.meshes.length * 30,
+      width: DEFAULT_MESH_FRAME_WIDTH,
+      height: DEFAULT_MESH_FRAME_HEIGHT,
+      zIndex: this.project.canvas.nodes.length + 1,
+    };
+    this.project.canvas.nodes.push(node);
+    this.mountNode(node);
+    this.drawWires();
+  }
+
+  private addTransform3dViewport(): void {
+    const defaultMesh = this.project.meshes[0];
+    if (!defaultMesh) {
+      alert('Add a mesh first.');
+      return;
+    }
+    const transform = createTransform3dDocument(defaultMesh.id, `Transform ${this.project.transforms.length + 1}`);
+    this.project.transforms.push(transform);
+    this.project.meshTransformAssignments.push({
+      id: uid('assign'),
+      meshId: defaultMesh.id,
+      transformId: transform.id,
+    });
+    const node: Transform3dNode = {
+      type: 'transform3d',
+      id: uid('node'),
+      transformId: transform.id,
+      x: 560,
+      y: 80 + this.project.transforms.length * 40,
+      width: 380,
+      height: 320,
+      zIndex: this.project.canvas.nodes.length + 1,
+    };
+    this.project.canvas.nodes.push(node);
+    this.mountNode(node);
+    void this.initGpuAndSims();
+    this.drawWires();
+  }
+
+  private addSimViewport(): void {
+    const simId = uid('sim');
+    const sim: SimInstance = {
+      id: simId,
+      name: `Drape ${this.project.sims.length + 1}`,
+      params: { ...DEFAULT_SIM_PARAMS },
+      pose: null,
+      camera: getDefaultSimCamera(this.project),
+      dropped: false,
+    };
+    this.project.sims.push(sim);
+    const defaultMesh = this.project.meshes[0];
+    if (defaultMesh) {
+      this.project.assignments.push({
+        id: uid('assign'),
+        meshId: defaultMesh.id,
+        simId,
+      });
+    }
+    const node: SimViewportNode = {
+      type: 'simViewport',
+      id: uid('node'),
+      simId,
+      x: 560,
+      y: 80 + this.project.sims.length * 40,
+      width: 420,
+      height: 320,
+      zIndex: this.project.canvas.nodes.length + 1,
+    };
+    this.project.canvas.nodes.push(node);
+    this.mountNode(node);
+    void this.initGpuAndSims();
+    this.drawWires();
+  }
+
+  private addTextNote(): void {
+    const node: TextAnnotationNode = {
+      type: 'text',
+      id: uid('node'),
+      x: 40,
+      y: 580,
+      width: 280,
+      height: 80,
+      zIndex: this.project.canvas.nodes.length + 1,
+      text: 'New note',
+      fontSize: 14,
+    };
+    this.project.canvas.nodes.push(node);
+    this.mountNode(node);
+  }
+
+  private assignSelected(): void {
+    const node = this.project.canvas.nodes.find((n) => n.id === this.selectedNodeId);
+    let meshId: string | null = null;
+    let simId: string | null = null;
+    if (node?.type === 'meshFrame') meshId = node.meshId;
+    if (node?.type === 'simViewport') simId = node.simId;
+
+    if (meshId && !simId) simId = this.project.sims[0]?.id ?? null;
+    if (simId && !meshId) meshId = this.project.meshes[0]?.id ?? null;
+
+    if (!meshId || !simId) {
+      alert('Select a mesh or sim frame first.');
+      return;
+    }
+    this.project.assignments = this.project.assignments.filter((a) => a.simId !== simId);
+    this.project.assignments.push({ id: uid('assign'), meshId, simId });
+    this.drawWires();
+    this.setStatus('Assigned mesh → sim (Rebuild on sim to apply)');
+  }
+}

@@ -1,4 +1,20 @@
-# Cloth Simulation - WebGPU
+# patternCanvas
+
+Open-canvas pattern drafting + cloth draping studio (browser / WebGPU).
+
+See **[docs/PRD.md](docs/PRD.md)** for product requirements and architecture (multi-sim canvas, one active runner, pattern↔sim assignments).
+
+```bash
+npm install
+npm run dev
+```
+
+- Studio app: `/` (`index.html`)
+- Legacy cloth demo: [`demo.html`](demo.html)
+
+---
+
+# Legacy: Cloth Simulation - WebGPU
 
 ![WebGPU](https://img.shields.io/badge/WebGPU-FF4B4B.svg?style=for-the-badge)
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178C6.svg?style=for-the-badge&logo=typescript&logoColor=white)

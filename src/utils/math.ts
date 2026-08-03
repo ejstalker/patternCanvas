@@ -8,10 +8,10 @@ export function mat4ToArray(m: mat4): Float32Array {
     return new Float32Array(m);
 }
 
-// Helper to create perspective matrix
+// Helper to create a WebGPU-friendly perspective matrix (clip Z in [0, 1]).
 export function perspective(fov: number, aspect: number, near: number, far: number): mat4 {
     const m = mat4.create();
-    mat4.perspective(m, fov * Math.PI / 180, aspect, near, far);
+    mat4.perspectiveZO(m, (fov * Math.PI) / 180, aspect, near, far);
     return m;
 }
 
