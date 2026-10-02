@@ -25,6 +25,7 @@
     "delaunator": "^5.1.0",
     "fflate": "^0.8.2",
     "gl-matrix": "^3.4.3",
+    "lucide": "^1.49.0",
     "numcodecs": "^0.3.2"
   }
 }

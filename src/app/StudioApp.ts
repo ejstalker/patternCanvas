@@ -29,6 +29,7 @@ import type {
   SimViewportNode,
   TextAnnotationNode,
   Transform3dNode,
+  Transform3dInstance,
   MeshAlgorithm,
   SimCameraState,
 } from '../project/types';
@@ -37,6 +38,19 @@ import { MeshPreview } from '../mesh/MeshPreview';
 import { createSharedGpu, SimViewportRuntime } from '../sim/SimViewportRuntime';
 import { Transform3dRuntime } from '../sim/Transform3dRuntime';
 import { DEFAULT_TRANSFORM_PIECE_ROTATION_DEG } from '../sim/transformDefaults';
+import {
+  createIcons,
+  FilePlus2,
+  Folder,
+  Image as ImageIcon,
+  Redo2,
+  Ruler,
+  Scissors,
+  Shirt,
+  StickyNote,
+  Undo2,
+  UserRound,
+} from 'lucide';
 import {
   DEFAULT_AUTOSAVE_MINUTES,
   createDirtyState,
@@ -195,6 +209,7 @@ export class StudioApp {
     this.bindImportFile();
     this.bindImageImport();
     this.bindBoardPan();
+    this.bindNodeContextMenu();
     this.bindUndoHotkey();
     this.bindImagePasteAndDrop();
     window.addEventListener('resize', () => this.drawWires());
@@ -1126,6 +1141,7 @@ export class StudioApp {
       this.importFileInput.click();
     });
     this.modalRoot.querySelector('[data-projects-act="export-archive"]')?.addEventListener('click', () => {
+      this.persistSimStates();
       void exportProjectFile(this.project, true);
     });
     this.modalRoot.querySelector('#autosaveMinutes')?.addEventListener('change', (e) => {
@@ -1280,25 +1296,22 @@ export class StudioApp {
 
   private buildToolbar(): void {
     this.toolbar.innerHTML = `
-      <div class="brand">patternCanvas</div>
-      <input class="project-name" id="projectName" value="" />
+      <button type="button" data-act="new"><i data-lucide="file-plus-2" aria-hidden="true"></i><span>New</span></button>
+      <button type="button" data-act="projects"><i data-lucide="folder" aria-hidden="true"></i><span>Projects</span></button>
       <div class="toolbar-sep"></div>
-      <button type="button" data-act="undo" disabled title="Nothing to undo">Undo</button>
-      <button type="button" data-act="redo" disabled title="Nothing to redo">Redo</button>
+      <input class="project-name" id="projectName" value="" aria-label="Project name" />
       <div class="toolbar-sep"></div>
-      <button type="button" data-act="new">New</button>
-      <button type="button" data-act="projects">Projects</button>
-      <button type="button" data-act="loadAvatar">Load avatar model</button>
+      <button type="button" data-act="undo" disabled title="Nothing to undo" aria-label="Undo"><i data-lucide="undo-2" aria-hidden="true"></i><span>Undo</span></button>
+      <button type="button" data-act="redo" disabled title="Nothing to redo" aria-label="Redo"><i data-lucide="redo-2" aria-hidden="true"></i><span>Redo</span></button>
       <div class="toolbar-sep"></div>
-      <button type="button" data-act="unit">Units: cm</button>
+      <button type="button" data-act="loadAvatar"><i data-lucide="user-round" aria-hidden="true"></i><span>Load avatar model</span></button>
       <div class="toolbar-sep"></div>
-      <button type="button" data-act="addPattern">+ Pattern</button>
-      <button type="button" data-act="addMesh">+ Mesh</button>
-      <button type="button" data-act="addTransform">+ Transform 3D</button>
-      <button type="button" data-act="addSim">+ Sim</button>
-      <button type="button" data-act="addText">+ Note</button>
-      <button type="button" data-act="addImage" title="Add image reference (or paste / drop on canvas)">+ Image</button>
-      <button type="button" data-act="assign">Assign mesh→sim</button>
+      <button type="button" data-act="unit" title="Display units"><i data-lucide="ruler" aria-hidden="true"></i><span>Units: cm</span></button>
+      <div class="toolbar-sep"></div>
+      <button type="button" data-act="addPattern"><i data-lucide="scissors" aria-hidden="true"></i><span>+ Pattern</span></button>
+      <button type="button" data-act="addSim"><i data-lucide="shirt" aria-hidden="true"></i><span>+ Sim</span></button>
+      <button type="button" data-act="addText"><i data-lucide="sticky-note" aria-hidden="true"></i><span>+ Note</span></button>
+      <button type="button" data-act="addImage" title="Add image reference (or paste / drop on canvas)"><i data-lucide="image" aria-hidden="true"></i><span>+ Image</span></button>
     `;
     this.syncProjectNameInput();
     this.updateHistoryButtons();
@@ -1312,11 +1325,28 @@ export class StudioApp {
       void this.onToolbar(btn.dataset.act!);
     });
     this.updateUnitButton();
+    // Swap every <i data-lucide="…"> for its inline SVG.
+    createIcons({
+      icons: {
+        FilePlus2,
+        Folder,
+        Undo2,
+        Redo2,
+        UserRound,
+        Ruler,
+        Scissors,
+        Shirt,
+        StickyNote,
+        Image: ImageIcon,
+      },
+    });
   }
 
   private updateUnitButton(): void {
-    const btn = this.toolbar.querySelector('[data-act="unit"]') as HTMLButtonElement;
-    if (btn) btn.textContent = `Units: ${this.project.displayUnit}`;
+    const btn = this.toolbar.querySelector('[data-act="unit"]') as HTMLButtonElement | null;
+    // Leave the icon in place — only the label changes.
+    const label = btn?.querySelector('span');
+    if (label) label.textContent = `Units: ${this.project.displayUnit}`;
   }
 
   private async onToolbar(act: string): Promise<void> {
@@ -1347,14 +1377,6 @@ export class StudioApp {
         this.pushUndo();
         this.addPatternFrame();
         break;
-      case 'addMesh':
-        this.pushUndo();
-        this.addMeshFrame();
-        break;
-      case 'addTransform':
-        this.pushUndo();
-        this.addTransform3dViewport();
-        break;
       case 'addSim':
         this.pushUndo();
         this.addSimViewport();
@@ -1366,11 +1388,84 @@ export class StudioApp {
       case 'addImage':
         this.imageFileInput.click();
         break;
-      case 'assign':
-        this.pushUndo();
-        this.assignSelected();
-        break;
     }
+  }
+
+  private nodeMenu: HTMLElement | null = null;
+
+  /** Right-click a node on the board for its duplicate / delete popover. */
+  private bindNodeContextMenu(): void {
+    this.board.addEventListener('contextmenu', (e) => {
+      const el = (e.target as HTMLElement).closest('.canvas-node') as HTMLElement | null;
+      const node = el
+        ? this.project.canvas.nodes.find((n) => n.id === el.dataset.nodeId)
+        : undefined;
+      // Empty board keeps the browser menu.
+      if (!node) return;
+      e.preventDefault();
+      this.showNodeMenu(node, e.clientX, e.clientY);
+    });
+    // Any press elsewhere, plus Esc / resize / pan / zoom, dismisses the popover.
+    document.addEventListener('pointerdown', () => this.closeNodeMenu());
+    window.addEventListener('resize', () => this.closeNodeMenu());
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') this.closeNodeMenu();
+    });
+  }
+
+  private showNodeMenu(node: CanvasNode, clientX: number, clientY: number): void {
+    this.selectedNodeId = node.id;
+    this.layoutNodes();
+    this.renderInspector();
+    this.openNodeMenu(node, clientX, clientY);
+  }
+
+  private openNodeMenu(node: CanvasNode, clientX: number, clientY: number): void {
+    this.closeNodeMenu();
+    const menu = document.createElement('div');
+    menu.className = 'node-context-menu';
+    menu.setAttribute('role', 'menu');
+    menu.innerHTML = `
+      <p class="node-context-title">${this.escapeHtml(this.nodeLabel(node))}</p>
+      <button type="button" role="menuitem" data-node-act="duplicate">Duplicate node</button>
+      <button type="button" role="menuitem" data-node-act="delete" class="is-danger">Delete node</button>
+    `;
+    // Keep the press inside the popover from reaching the dismiss listener.
+    menu.addEventListener('pointerdown', (e) => e.stopPropagation());
+    menu.addEventListener('contextmenu', (e) => e.preventDefault());
+    menu.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest(
+        'button[data-node-act]'
+      ) as HTMLButtonElement | null;
+      if (!btn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const act = btn.dataset.nodeAct;
+      this.closeNodeMenu();
+      if (act === 'duplicate') {
+        const dup = this.duplicateNode(node.id, { recordUndo: true, select: true });
+        if (dup) this.setStatus(`Duplicated · ${this.nodeLabel(dup)}`);
+      } else if (act === 'delete') {
+        this.deleteNode(node.id);
+      }
+    });
+    menu.style.left = `${clientX}px`;
+    menu.style.top = `${clientY}px`;
+    document.body.appendChild(menu);
+    this.nodeMenu = menu;
+
+    const rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth - 8) {
+      menu.style.left = `${Math.max(8, window.innerWidth - rect.width - 8)}px`;
+    }
+    if (rect.bottom > window.innerHeight - 8) {
+      menu.style.top = `${Math.max(8, window.innerHeight - rect.height - 8)}px`;
+    }
+  }
+
+  private closeNodeMenu(): void {
+    this.nodeMenu?.remove();
+    this.nodeMenu = null;
   }
 
   private bindBoardPan(): void {
@@ -1531,12 +1626,16 @@ export class StudioApp {
       }
       this.closeNodeFullscreen();
     }
-    const el = this.board.querySelector(`[data-node-id="${nodeId}"]`) as HTMLElement | null;
+    // A transform / drape carries the remesh with it: catch it up on arrival.
+    this.remeshIfStale(nodeId);
     const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
+    const el = this.findNodeEl(nodeId);
     if (!el || !node) return;
 
     const placeholder = document.createElement('div');
-    placeholder.className = 'canvas-node-placeholder';
+    placeholder.className = `canvas-node-placeholder${
+      this.isEmbeddedNode(node) ? ' is-embedded' : ''
+    }`;
     placeholder.dataset.nodeId = nodeId;
     placeholder.style.left = `${node.x}px`;
     placeholder.style.top = `${node.y}px`;
@@ -1628,6 +1727,10 @@ export class StudioApp {
   /** Dock inspector inside the expanded modal, under chrome, beside the viewport. */
   private dockInspectorToFullscreen(): void {
     if (!this.expandOverlay || !this.expandedNodeId) return;
+    // The 2D pattern stage is about drawing: the tool rail and the option bars
+    // are the useful chrome there, so the inspector stays out of the way.
+    const expanded = this.project.canvas.nodes.find((n) => n.id === this.expandedNodeId);
+    if (expanded?.type === 'patternFrame') return;
     const nodeEl = this.expandOverlay.querySelector(
       `[data-node-id="${this.expandedNodeId}"]`
     ) as HTMLElement | null;
@@ -1672,10 +1775,13 @@ export class StudioApp {
     const prevEl = this.expandOverlay.querySelector(
       `[data-node-id="${prevId}"]`
     ) as HTMLElement | null;
-    const nextEl = this.board.querySelector(`[data-node-id="${nextId}"]`) as HTMLElement | null;
+    const nextEl = this.findNodeEl(nextId);
     const prevNode = this.project.canvas.nodes.find((n) => n.id === prevId);
     const nextNode = this.project.canvas.nodes.find((n) => n.id === nextId);
     if (!prevEl || !nextEl || !prevNode || !nextNode) return;
+
+    // Moving on to a later stage rebuilds the mesh first if the pattern moved on.
+    this.remeshIfStale(nextId);
 
     this.undockInspectorFromFullscreen();
 
@@ -1692,7 +1798,9 @@ export class StudioApp {
 
     // Placeholder for the node we're about to expand
     const placeholder = document.createElement('div');
-    placeholder.className = 'canvas-node-placeholder';
+    placeholder.className = `canvas-node-placeholder${
+      this.isEmbeddedNode(nextNode) ? ' is-embedded' : ''
+    }`;
     placeholder.dataset.nodeId = nextId;
     placeholder.style.left = `${nextNode.x}px`;
     placeholder.style.top = `${nextNode.y}px`;
@@ -1724,6 +1832,43 @@ export class StudioApp {
     });
   }
 
+  /**
+   * The mesh behind a downstream stage (transform / drape) when it still needs a
+   * rebuild — `geometry` is nulled by `invalidateMeshesForPattern`.
+   */
+  private staleMeshForStage(nodeId: string): MeshDocument | undefined {
+    const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
+    if (!node) return undefined;
+    let mesh: MeshDocument | undefined;
+    if (node.type === 'transform3d') {
+      const transform = this.project.transforms.find((t) => t.id === node.transformId);
+      mesh = transform
+        ? this.project.meshes.find((m) => m.id === transform.meshId)
+        : undefined;
+    } else if (node.type === 'simViewport') {
+      mesh = this.simChain(node.simId).mesh;
+    } else {
+      return undefined;
+    }
+    return mesh && !mesh.geometry ? mesh : undefined;
+  }
+
+  /** Downstream stages carry the remesh with them, so catch it up on arrival. */
+  private remeshIfStale(nodeId: string): void {
+    const mesh = this.staleMeshForStage(nodeId);
+    if (!mesh) return;
+    this.remesh(mesh.id, { recordUndo: false });
+  }
+
+  /** Re-paint the fullscreen pipeline strip (stale markers change live). */
+  private refreshFullscreenTabs(): void {
+    if (!this.expandedNodeId || !this.expandOverlay) return;
+    const el = this.expandOverlay.querySelector(
+      `[data-node-id="${this.expandedNodeId}"]`
+    ) as HTMLElement | null;
+    if (el) this.syncFullscreenTabs(el, this.expandedNodeId);
+  }
+
   private setExpandButtonMode(el: HTMLElement, fullscreen: boolean): void {
     const expandBtn = el.querySelector('.node-expand-btn') as HTMLButtonElement | null;
     if (!expandBtn) return;
@@ -1738,81 +1883,237 @@ export class StudioApp {
     }
   }
 
-  /** Pattern → mesh → transform → sim chain containing this node (wired connections only). */
-  private pipelineNodesFor(nodeId: string): CanvasNode[] {
-    const adj = new Map<string, Set<string>>();
-    const link = (aId: string | undefined, bId: string | undefined) => {
-      if (!aId || !bId || aId === bId) return;
-      if (!adj.has(aId)) adj.set(aId, new Set());
-      if (!adj.has(bId)) adj.set(bId, new Set());
-      adj.get(aId)!.add(bId);
-      adj.get(bId)!.add(aId);
-    };
+  /** Resolve the drape a node ultimately feeds (a pattern may feed several). */
+  private drapeNodeFor(nodeId: string): SimViewportNode | undefined {
+    const simNode = (simId: string) =>
+      this.project.canvas.nodes.find(
+        (n): n is SimViewportNode => n.type === 'simViewport' && n.simId === simId
+      );
+    const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
+    if (!node) return undefined;
+    if (node.type === 'simViewport') return node;
 
-    for (const mesh of this.project.meshes) {
-      const patNode = this.project.canvas.nodes.find(
-        (n) => n.type === 'patternFrame' && n.patternId === mesh.patternId
+    if (node.type === 'transform3d') {
+      const link = this.project.transformSimAssignments.find(
+        (a) => a.transformId === node.transformId
       );
-      const meshNode = this.project.canvas.nodes.find(
-        (n) => n.type === 'meshFrame' && n.meshId === mesh.id
-      );
-      link(patNode?.id, meshNode?.id);
-    }
-    for (const a of this.project.assignments) {
-      const meshNode = this.project.canvas.nodes.find(
-        (n) => n.type === 'meshFrame' && n.meshId === a.meshId
-      );
-      const simNode = this.project.canvas.nodes.find(
-        (n) => n.type === 'simViewport' && n.simId === a.simId
-      );
-      link(meshNode?.id, simNode?.id);
-    }
-    for (const a of this.project.meshTransformAssignments) {
-      const meshNode = this.project.canvas.nodes.find(
-        (n) => n.type === 'meshFrame' && n.meshId === a.meshId
-      );
-      const transformNode = this.project.canvas.nodes.find(
-        (n) => n.type === 'transform3d' && n.transformId === a.transformId
-      );
-      link(meshNode?.id, transformNode?.id);
-    }
-    for (const a of this.project.transformSimAssignments) {
-      const transformNode = this.project.canvas.nodes.find(
-        (n) => n.type === 'transform3d' && n.transformId === a.transformId
-      );
-      const simNode = this.project.canvas.nodes.find(
-        (n) => n.type === 'simViewport' && n.simId === a.simId
-      );
-      link(transformNode?.id, simNode?.id);
+      return link ? simNode(link.simId) : undefined;
     }
 
-    if (!adj.has(nodeId)) {
-      const alone = this.project.canvas.nodes.find((n) => n.id === nodeId);
-      return alone ? [alone] : [];
+    if (node.type === 'meshFrame') {
+      const viaTransform = this.project.meshTransformAssignments.find(
+        (a) => a.meshId === node.meshId
+      );
+      if (viaTransform) {
+        const link = this.project.transformSimAssignments.find(
+          (a) => a.transformId === viaTransform.transformId
+        );
+        if (link) return simNode(link.simId);
+      }
+      const direct = this.project.assignments.find((a) => a.meshId === node.meshId);
+      return direct ? simNode(direct.simId) : undefined;
     }
 
-    const seen = new Set<string>();
-    const queue = [nodeId];
-    seen.add(nodeId);
-    while (queue.length > 0) {
-      const id = queue.shift()!;
-      for (const n of adj.get(id) ?? []) {
-        if (seen.has(n)) continue;
-        seen.add(n);
-        queue.push(n);
+    if (node.type === 'patternFrame') {
+      for (const mesh of this.project.meshes) {
+        if (mesh.patternId !== node.patternId) continue;
+        const meshNode = this.project.canvas.nodes.find(
+          (n) => n.type === 'meshFrame' && n.meshId === mesh.id
+        );
+        const drape = meshNode ? this.drapeNodeFor(meshNode.id) : undefined;
+        if (drape) return drape;
       }
     }
+    return undefined;
+  }
 
-    const order: Record<string, number> = {
-      patternFrame: 0,
-      meshFrame: 1,
-      transform3d: 2,
-      simViewport: 3,
+  /**
+   * The stages of the drape this node belongs to, in modifier order:
+   * pattern → remesh → transform → drape. Scoped to that one drape, so a shared
+   * pattern feeding several drapes does not merge them into one list.
+   */
+  private pipelineNodesFor(nodeId: string): CanvasNode[] {
+    const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
+    const drape = this.drapeNodeFor(nodeId);
+    if (!drape) return node ? [node] : [];
+
+    const chain = this.simChain(drape.simId);
+    const stage = <T extends CanvasNode['type']>(type: T): CanvasNode | undefined => {
+      if (type === 'patternFrame') {
+        return this.project.canvas.nodes.find(
+          (n) => n.type === 'patternFrame' && n.patternId === chain.pattern?.id
+        );
+      }
+      if (type === 'meshFrame') {
+        return this.project.canvas.nodes.find(
+          (n) => n.type === 'meshFrame' && n.meshId === chain.mesh?.id
+        );
+      }
+      if (type === 'transform3d') {
+        return this.project.canvas.nodes.find(
+          (n) => n.type === 'transform3d' && n.transformId === chain.transform?.id
+        );
+      }
+      return drape;
     };
-    return [...seen]
-      .map((id) => this.project.canvas.nodes.find((n) => n.id === id))
-      .filter((n): n is CanvasNode => !!n && n.type in order)
-      .sort((a, b) => (order[a.type] ?? 9) - (order[b.type] ?? 9));
+
+    return [
+      stage('patternFrame'),
+      stage('meshFrame'),
+      stage('transform3d'),
+      drape,
+    ].filter((n): n is CanvasNode => !!n);
+  }
+
+  /**
+   * The stages a drape owns internally, walked backwards along the real wiring:
+   * drape → transform → mesh → pattern.
+   */
+  private simChain(simId: string): {
+    pattern?: PatternDocument;
+    mesh?: MeshDocument;
+    transform?: Transform3dInstance;
+  } {
+    const tLink = this.project.transformSimAssignments.find((a) => a.simId === simId);
+    const transform = tLink
+      ? this.project.transforms.find((t) => t.id === tLink.transformId)
+      : undefined;
+    let mesh = transform
+      ? (this.project.meshes.find((m) => m.id === transform.meshId) ??
+        this.project.meshes.find((m) =>
+          this.project.meshTransformAssignments.some(
+            (a) => a.transformId === transform.id && a.meshId === m.id
+          )
+        ))
+      : undefined;
+    if (!mesh) {
+      const link = this.project.assignments.find((a) => a.simId === simId);
+      mesh = link ? this.project.meshes.find((m) => m.id === link.meshId) : undefined;
+    }
+    const pattern = mesh
+      ? this.project.patterns.find((p) => p.id === mesh!.patternId)
+      : undefined;
+    return { pattern, mesh, transform };
+  }
+
+  /**
+   * True when a remesh / transform node is owned by a drape rather than being a
+   * standalone stage on the board. Derived from the wiring, so it can never go
+   * stale the way a persisted flag would.
+   */
+  private isEmbeddedNode(node: CanvasNode): boolean {
+    if (node.type !== 'meshFrame' && node.type !== 'transform3d') return false;
+    for (const sim of this.project.sims) {
+      const chain = this.simChain(sim.id);
+      if (node.type === 'meshFrame' && chain.mesh?.id === node.meshId) return true;
+      if (node.type === 'transform3d' && chain.transform?.id === node.transformId) return true;
+    }
+    return false;
+  }
+
+  /** Keep the `is-embedded` class in step with the current wiring. */
+  private syncEmbeddedNodes(): void {
+    for (const node of this.project.canvas.nodes) {
+      const el = this.findNodeEl(node.id);
+      if (!el) continue;
+      el.classList.toggle('is-embedded', this.isEmbeddedNode(node));
+    }
+    this.drawWires();
+  }
+
+  /**
+   * Wire a 2D pattern straight into a drape. Remesh and transform are part of
+   * the drape, so they are created on demand and never shown on the board.
+   * Returns true when a transform stage had to be added.
+   */
+  private connectPatternToSim(pattern: PatternDocument, sim: SimInstance): boolean {
+    const chain = this.simChain(sim.id);
+    const created: string[] = [];
+
+    let mesh = chain.mesh;
+    if (!mesh) {
+      mesh = createMeshDocument(pattern.id, `Mesh ${this.project.meshes.length + 1}`);
+      remeshDocument(mesh, pattern);
+      this.project.meshes.push(mesh);
+      const node: MeshFrameNode = {
+        type: 'meshFrame',
+        id: uid('node'),
+        meshId: mesh.id,
+        x: 40,
+        y: 40,
+        width: DEFAULT_MESH_FRAME_WIDTH,
+        height: DEFAULT_MESH_FRAME_HEIGHT,
+        zIndex: this.project.canvas.nodes.length + 1,
+      };
+      this.project.canvas.nodes.push(node);
+      this.mountNode(node);
+      created.push('remesh');
+    }
+
+    mesh.patternId = pattern.id;
+    remeshDocument(mesh, pattern);
+    for (const [nodeId, preview] of this.meshPreviews) {
+      const node = this.project.canvas.nodes.find((c) => c.id === nodeId);
+      if (node?.type === 'meshFrame' && node.meshId === mesh.id) preview.setMesh(mesh, pattern);
+    }
+
+    let transform = chain.transform;
+    let addedTransform = false;
+    if (!transform) {
+      transform = createTransform3dDocument(
+        mesh.id,
+        `Transform ${this.project.transforms.length + 1}`
+      );
+      this.project.transforms.push(transform);
+      const node: Transform3dNode = {
+        type: 'transform3d',
+        id: uid('node'),
+        transformId: transform.id,
+        x: 40,
+        y: 40,
+        width: 380,
+        height: 320,
+        zIndex: this.project.canvas.nodes.length + 1,
+      };
+      this.project.canvas.nodes.push(node);
+      this.mountNode(node);
+      created.push('transform');
+      addedTransform = true;
+    }
+    transform.meshId = mesh.id;
+
+    // A drape runs pattern → remesh → transform → drape, so a direct mesh→drape
+    // link is replaced by the transform stage.
+    this.project.meshTransformAssignments = this.project.meshTransformAssignments.filter(
+      (a) => a.transformId !== transform!.id
+    );
+    this.project.meshTransformAssignments.push({
+      id: uid('assign'),
+      meshId: mesh.id,
+      transformId: transform.id,
+    });
+    this.project.assignments = this.project.assignments.filter((a) => a.simId !== sim.id);
+    this.project.transformSimAssignments = this.project.transformSimAssignments.filter(
+      (a) => a.simId !== sim.id
+    );
+    this.project.transformSimAssignments.push({
+      id: uid('assign'),
+      transformId: transform.id,
+      simId: sim.id,
+    });
+
+    this.rebuildConnectedTransform(transform.id);
+    this.rebuildConnectedSim(sim.id, true);
+    this.syncEmbeddedNodes();
+    this.setStatus(
+      created.length
+        ? `Connected ${pattern.name} → ${sim.name} · added internal ${created.join(' + ')} stage${
+            created.length === 1 ? '' : 's'
+          }`
+        : `Connected ${pattern.name} → ${sim.name}`
+    );
+    this.renderInspector();
+    return addedTransform;
   }
 
   private pipelineTabLabel(node: CanvasNode): string {
@@ -1846,15 +2147,25 @@ export class StudioApp {
 
     if (title) title.hidden = true;
     tabs.hidden = false;
+    // Stroked chips joined by arrows so the chain reads as a run of sequential
+    // modifiers: pattern → remesh → transform → drape. A remesh whose pattern
+    // moved on since the last build is flagged red.
     tabs.innerHTML = pipeline
-      .map(
-        (n) =>
-          `<button type="button" role="tab" class="node-fullscreen-tab${
-            n.id === activeId ? ' is-active' : ''
-          }" data-fs-node="${n.id}" aria-selected="${n.id === activeId}">${this.escapeHtml(
-            this.pipelineTabLabel(n)
-          )}</button>`
-      )
+      .map((n, i) => {
+        const stale =
+          n.type === 'meshFrame' &&
+          !this.project.meshes.find((m) => m.id === n.meshId)?.geometry;
+        const chip = `<button type="button" role="tab" class="node-fullscreen-tab${
+          n.id === activeId ? ' is-active' : ''
+        }${stale ? ' is-stale' : ''}" data-fs-node="${n.id}" aria-selected="${
+          n.id === activeId
+        }"${stale ? ' title="Pattern changed since this mesh was built — it rebuilds when you open a later stage"' : ''}>${this.escapeHtml(
+          this.pipelineTabLabel(n)
+        )}</button>`;
+        if (i >= pipeline.length - 1) return chip;
+        const link = `<span class="node-fullscreen-link" aria-hidden="true"><svg viewBox="0 0 26 10" width="26" height="10" fill="none"><path class="node-fullscreen-link-line" d="M0 5 H 17" /><path class="node-fullscreen-link-head" d="M16 2 L 21 5 L 16 8" /></svg></span>`;
+        return chip + link;
+      })
       .join('');
 
     tabs.querySelectorAll('button[data-fs-node]').forEach((btn) => {
@@ -1864,6 +2175,13 @@ export class StudioApp {
         const id = (btn as HTMLButtonElement).dataset.fsNode;
         if (id) this.switchFullscreenNode(id);
       });
+    });
+
+    // The strip scrolls horizontally; make sure the stage you are looking at is
+    // the one in view (and that a stage is never clipped out of reach).
+    tabs.querySelector('.node-fullscreen-tab.is-active')?.scrollIntoView({
+      block: 'nearest',
+      inline: 'nearest',
     });
   }
 
@@ -1890,6 +2208,8 @@ export class StudioApp {
   }
 
   private beginNodeDrag(node: CanvasNode, e: PointerEvent): void {
+    // Secondary buttons belong to the context menu, not to dragging.
+    if (e.button !== 0) return;
     if (this.expandedNodeId === node.id) return;
     this.pushUndo();
 
@@ -1920,7 +2240,11 @@ export class StudioApp {
 
   private mountNode(node: CanvasNode): void {
     const el = document.createElement('div');
-    el.className = `canvas-node node-${node.type}`;
+    // Remesh / transform stages owned by a drape live inside it: they keep their
+    // DOM (so the fullscreen tabs can adopt them) but stay off the board.
+    el.className = `canvas-node node-${node.type}${
+      this.isEmbeddedNode(node) ? ' is-embedded' : ''
+    }`;
     el.dataset.nodeId = node.id;
     el.style.left = `${node.x}px`;
     el.style.top = `${node.y}px`;
@@ -1953,6 +2277,13 @@ export class StudioApp {
       chrome.addEventListener('pointerdown', (e) => {
         if ((e.target as HTMLElement).closest('button')) return;
         this.beginNodeDrag(node, e);
+      });
+      // The header always offers the node's own menu, whatever the body does
+      // with right-clicks (the pattern editor uses them for piece actions).
+      chrome.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.showNodeMenu(node, e.clientX, e.clientY);
       });
     } else {
       body.addEventListener('pointerdown', (e) => {
@@ -2004,6 +2335,8 @@ export class StudioApp {
         onChange: () => {
           this.setStatus('Pattern edited — remesh to update');
           this.invalidateMeshesForPattern(pattern.id);
+          // Flag the remesh chip immediately when editing inside fullscreen.
+          this.refreshFullscreenTabs();
         },
       });
       this.editors.set(node.id, editor);
@@ -2141,6 +2474,11 @@ export class StudioApp {
       addPort('out', 'transform', node.transformId);
     } else if (node.type === 'simViewport') {
       addPort('in', 'sim', node.simId);
+      const port = el.querySelector('.node-port-in') as HTMLElement | null;
+      if (port) {
+        port.title =
+          'Drop a pattern (or a mesh / transform) here — the remesh and transform stages live inside this drape';
+      }
     }
   }
 
@@ -2174,7 +2512,7 @@ export class StudioApp {
 
       const existingSim = this.simRuntimes.get(sim.id);
       if (existingSim) {
-        existingSim.cloth?.destroy();
+        existingSim.dispose();
         this.simRuntimes.delete(sim.id);
       }
 
@@ -2192,7 +2530,7 @@ export class StudioApp {
       );
       await runtime.initRenderer();
       if (!stillCurrent()) {
-        runtime.cloth?.destroy();
+        runtime.dispose();
         return;
       }
       runtime.rebuildCloth(
@@ -2218,7 +2556,7 @@ export class StudioApp {
 
       const existingTransform = this.transformRuntimes.get(transform.id);
       if (existingTransform) {
-        existingTransform.cloth?.destroy();
+        existingTransform.dispose();
         this.transformRuntimes.delete(transform.id);
       }
 
@@ -2232,9 +2570,12 @@ export class StudioApp {
         {
           onBeforePoseChange: () => this.pushUndo(),
           onPoseChange: () => {
-            if (this.restoringUndo) return;
+            // Ignore the write-back that `persistSimStates()` performs.
+            if (this.restoringUndo || this.capturingState) return;
             this.rebuildSimsFromTransform(transform.id);
             if (this.selectedNodeId === node.id) this.renderInspector();
+            // Transform settings are document data — make sure they reach the file.
+            this.markDirty(true);
           },
           onSelectionChange: (pieceId) => {
             this.transformInspectorPieceId = pieceId;
@@ -2244,7 +2585,7 @@ export class StudioApp {
       );
       await runtime.initRenderer();
       if (!stillCurrent()) {
-        runtime.cloth?.destroy();
+        runtime.dispose();
         return;
       }
       runtime.rebuildCloth(
@@ -2559,19 +2900,32 @@ export class StudioApp {
     }
   }
 
+  /**
+   * True while live viewport state is being copied into the document. The
+   * runtimes report those copies as pose changes, and re-acting to them would
+   * rebuild sims mid-save and re-schedule the save we are already running.
+   */
+  private capturingState = false;
+
   private persistSimStates(): void {
-    this.persistTransformStates();
-    for (const sim of this.project.sims) {
-      const rt = this.simRuntimes.get(sim.id);
-      if (!rt?.cloth) continue;
-      rt.captureCamera(sim);
-      sim.pose = rt.cloth.exportPose();
-      sim.dropped = true;
-    }
-    syncDefaultCameraFromDrapeA(this.project);
-    const defaults = getDefaultSimCamera(this.project);
-    for (const rt of this.simRuntimes.values()) {
-      rt.setDefaultCamera(defaults);
+    const previous = this.capturingState;
+    this.capturingState = true;
+    try {
+      this.persistTransformStates();
+      for (const sim of this.project.sims) {
+        const rt = this.simRuntimes.get(sim.id);
+        if (!rt?.cloth) continue;
+        rt.captureCamera(sim);
+        sim.pose = rt.cloth.exportPose();
+        sim.dropped = true;
+      }
+      syncDefaultCameraFromDrapeA(this.project);
+      const defaults = getDefaultSimCamera(this.project);
+      for (const rt of this.simRuntimes.values()) {
+        rt.setDefaultCamera(defaults);
+      }
+    } finally {
+      this.capturingState = previous;
     }
   }
 
@@ -2735,7 +3089,8 @@ export class StudioApp {
     const kind = target.dataset.portKind;
     return (
       target.dataset.portDirection === 'in' &&
-      ((this.wireDrag.kind === 'pattern' && kind === 'mesh' && this.isMeshFrameInput(target)) ||
+      ((this.wireDrag.kind === 'pattern' &&
+        ((kind === 'mesh' && this.isMeshFrameInput(target)) || kind === 'sim')) ||
         (this.wireDrag.kind === 'mesh' &&
           ((kind === 'mesh' && this.isTransformInput(target)) || kind === 'sim')) ||
         (this.wireDrag.kind === 'transform' && kind === 'sim'))
@@ -2762,26 +3117,36 @@ export class StudioApp {
       this.pushUndo();
       const targetId = target!.dataset.entityId!;
       if (source.kind === 'pattern') {
-        const mesh = this.project.meshes.find((candidate) => candidate.id === targetId);
         const pattern = this.project.patterns.find((candidate) => candidate.id === source.id);
-        if (mesh && pattern) {
-          mesh.patternId = pattern.id;
-          remeshDocument(mesh, pattern);
-          for (const [nodeId, preview] of this.meshPreviews) {
-            const node = this.project.canvas.nodes.find((candidate) => candidate.id === nodeId);
-            if (node?.type === 'meshFrame' && node.meshId === mesh.id) {
-              preview.setMesh(mesh, pattern);
+        if (pattern && target!.dataset.portKind === 'sim') {
+          // Pattern dropped straight on a drape: remesh + transform are created
+          // inside it, so no mesh/transform nodes are needed on the board.
+          const sim = this.project.sims.find((candidate) => candidate.id === targetId);
+          if (sim) {
+            const addedTransform = this.connectPatternToSim(pattern, sim);
+            if (addedTransform) void this.initGpuAndSims();
+          }
+        } else {
+          const mesh = this.project.meshes.find((candidate) => candidate.id === targetId);
+          if (mesh && pattern) {
+            mesh.patternId = pattern.id;
+            remeshDocument(mesh, pattern);
+            for (const [nodeId, preview] of this.meshPreviews) {
+              const node = this.project.canvas.nodes.find((candidate) => candidate.id === nodeId);
+              if (node?.type === 'meshFrame' && node.meshId === mesh.id) {
+                preview.setMesh(mesh, pattern);
+              }
             }
+            for (const assignment of this.project.assignments) {
+              if (assignment.meshId === mesh.id) this.rebuildConnectedSim(assignment.simId, true);
+            }
+            for (const link of this.project.meshTransformAssignments.filter(
+              (assignment) => assignment.meshId === mesh.id
+            )) {
+              this.rebuildConnectedTransform(link.transformId);
+            }
+            this.setStatus(`Connected ${pattern.name} → ${mesh.name}`);
           }
-          for (const assignment of this.project.assignments) {
-            if (assignment.meshId === mesh.id) this.rebuildConnectedSim(assignment.simId, true);
-          }
-          for (const link of this.project.meshTransformAssignments.filter(
-            (assignment) => assignment.meshId === mesh.id
-          )) {
-            this.rebuildConnectedTransform(link.transformId);
-          }
-          this.setStatus(`Connected ${pattern.name} → ${mesh.name}`);
         }
       } else if (source.kind === 'transform') {
         const transform = this.project.transforms.find((candidate) => candidate.id === source.id);
@@ -2878,12 +3243,16 @@ export class StudioApp {
       port.classList.remove('is-connected');
     });
 
+    const wiredIn = new Set<string>();
     const wire = (
       a: CanvasNode,
       b: CanvasNode,
       cls: string
     ) => {
+      // Stages embedded in a drape have no board presence, so no board wire.
+      if (this.isEmbeddedNode(a) || this.isEmbeddedNode(b)) return;
       this.appendWirePath(this.nodePortPoint(a, 'out'), this.nodePortPoint(b, 'in'), cls);
+      wiredIn.add(b.id);
       this.board
         .querySelector(`[data-node-id="${a.id}"] > .node-port-out`)
         ?.classList.add('is-connected');
@@ -2938,6 +3307,26 @@ export class StudioApp {
       if (transformNode && simNode) {
         wire(transformNode, simNode, 'assign-wire wire-transform-sim');
       }
+    }
+
+    // A drape whose stages are embedded still reads as one connection: draw it
+    // from the first visible upstream stage (usually the pattern).
+    for (const sim of this.project.sims) {
+      const simNode = this.project.canvas.nodes.find(
+        (n) => n.type === 'simViewport' && n.simId === sim.id
+      );
+      if (!simNode || wiredIn.has(simNode.id)) continue;
+      const chain = this.simChain(sim.id);
+      const upstream =
+        (chain.pattern &&
+          this.project.canvas.nodes.find(
+            (n) => n.type === 'patternFrame' && n.patternId === chain.pattern!.id
+          )) ||
+        (chain.mesh &&
+          this.project.canvas.nodes.find(
+            (n) => n.type === 'meshFrame' && n.meshId === chain.mesh!.id
+          ));
+      if (upstream) wire(upstream, simNode, 'assign-wire wire-pattern-mesh');
     }
 
     if (this.wireDrag) {
@@ -3028,7 +3417,9 @@ export class StudioApp {
         ${this.deleteButtonHtml()}
       `;
       this.inspector.querySelector('#transformName')?.addEventListener('change', (e) => {
+        this.pushUndo();
         transform.name = (e.target as HTMLInputElement).value;
+        this.markDirty(true);
         this.renderAll();
         void this.initGpuAndSims();
       });
@@ -3393,7 +3784,7 @@ export class StudioApp {
         <h3>${pattern.name}</h3>
         <label>Name <input id="patName" value="${pattern.name}" /></label>
         <button type="button" id="addPt">Add point</button>
-        <p class="muted">Tools: Move · Pen · Rect · Circle · Knife · Dart · Bend. Middle-drag pan · scroll wheel zoom.</p>
+        <p class="muted">Tools: Move · Pen · Rect · Circle · Knife · Dart · Bend. Middle-drag pan · scroll wheel zoom. Shift-drag a scale handle locks the aspect · Alt-drag one scales about the centre of the selection.</p>
         ${this.deleteButtonHtml()}
       `;
       this.inspector.querySelector('#patName')?.addEventListener('change', (e) => {
@@ -3504,6 +3895,46 @@ export class StudioApp {
     });
   }
 
+  /**
+   * Drop the stages a deleted drape owned. Without this they would fall out of
+   * every sim's chain and reappear on the board as orphan nodes.
+   */
+  private dropEmbeddedChain(chain: {
+    mesh?: MeshDocument;
+    transform?: Transform3dInstance;
+  }): void {
+    const transformId = chain.transform?.id;
+    const meshId = chain.mesh?.id;
+
+    if (transformId) {
+      // Another drape may still drive this transform — leave it alone then.
+      if (this.project.transformSimAssignments.some((a) => a.transformId === transformId)) return;
+      this.transformRuntimes.get(transformId)?.cloth?.destroy();
+      this.transformRuntimes.delete(transformId);
+      this.project.transforms = this.project.transforms.filter((t) => t.id !== transformId);
+      this.project.canvas.nodes = this.project.canvas.nodes.filter(
+        (n) => !(n.type === 'transform3d' && n.transformId === transformId)
+      );
+      this.project.meshTransformAssignments = this.project.meshTransformAssignments.filter(
+        (a) => a.transformId !== transformId
+      );
+      this.project.transformSimAssignments = this.project.transformSimAssignments.filter(
+        (a) => a.transformId !== transformId
+      );
+    }
+
+    if (!meshId) return;
+    const meshStillUsed =
+      this.project.assignments.some((a) => a.meshId === meshId) ||
+      this.project.meshTransformAssignments.some((a) => a.meshId === meshId);
+    if (meshStillUsed) return;
+    this.project.meshes = this.project.meshes.filter((m) => m.id !== meshId);
+    this.project.canvas.nodes = this.project.canvas.nodes.filter(
+      (n) => !(n.type === 'meshFrame' && n.meshId === meshId)
+    );
+    this.project.assignments = this.project.assignments.filter((a) => a.meshId !== meshId);
+  }
+
   private deleteNode(nodeId: string): void {
     const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
     if (!node) return;
@@ -3514,6 +3945,8 @@ export class StudioApp {
 
     if (node.type === 'simViewport') {
       const simId = node.simId;
+      // Capture the internal chain before the wiring is torn down.
+      const chain = this.simChain(simId);
       const stillUsed = this.project.canvas.nodes.some(
         (n) => n.type === 'simViewport' && n.simId === simId
       );
@@ -3523,6 +3956,10 @@ export class StudioApp {
         this.simRuntimes.delete(simId);
         this.project.sims = this.project.sims.filter((s) => s.id !== simId);
         this.project.assignments = this.project.assignments.filter((a) => a.simId !== simId);
+        this.project.transformSimAssignments = this.project.transformSimAssignments.filter(
+          (a) => a.simId !== simId
+        );
+        this.dropEmbeddedChain(chain);
         if (this.project.activeSimId === simId) this.project.activeSimId = null;
       }
     } else if (node.type === 'meshFrame') {
@@ -3941,59 +4378,6 @@ export class StudioApp {
     this.drawWires();
   }
 
-  private addMeshFrame(): void {
-    const pattern = this.project.patterns[0];
-    if (!pattern) {
-      alert('Add a pattern first.');
-      return;
-    }
-    const mesh = createMeshDocument(pattern.id, `Mesh ${this.project.meshes.length + 1}`);
-    remeshDocument(mesh, pattern);
-    this.project.meshes.push(mesh);
-    const node: MeshFrameNode = {
-      type: 'meshFrame',
-      id: uid('node'),
-      meshId: mesh.id,
-      x: 400,
-      y: 100 + this.project.meshes.length * 30,
-      width: DEFAULT_MESH_FRAME_WIDTH,
-      height: DEFAULT_MESH_FRAME_HEIGHT,
-      zIndex: this.project.canvas.nodes.length + 1,
-    };
-    this.project.canvas.nodes.push(node);
-    this.mountNode(node);
-    this.drawWires();
-  }
-
-  private addTransform3dViewport(): void {
-    const defaultMesh = this.project.meshes[0];
-    if (!defaultMesh) {
-      alert('Add a mesh first.');
-      return;
-    }
-    const transform = createTransform3dDocument(defaultMesh.id, `Transform ${this.project.transforms.length + 1}`);
-    this.project.transforms.push(transform);
-    this.project.meshTransformAssignments.push({
-      id: uid('assign'),
-      meshId: defaultMesh.id,
-      transformId: transform.id,
-    });
-    const node: Transform3dNode = {
-      type: 'transform3d',
-      id: uid('node'),
-      transformId: transform.id,
-      x: 560,
-      y: 80 + this.project.transforms.length * 40,
-      width: 380,
-      height: 320,
-      zIndex: this.project.canvas.nodes.length + 1,
-    };
-    this.project.canvas.nodes.push(node);
-    this.mountNode(node);
-    void this.initGpuAndSims();
-    this.drawWires();
-  }
-
   private addSimViewport(): void {
     const simId = uid('sim');
     const sim: SimInstance = {
@@ -4005,14 +4389,6 @@ export class StudioApp {
       dropped: false,
     };
     this.project.sims.push(sim);
-    const defaultMesh = this.project.meshes[0];
-    if (defaultMesh) {
-      this.project.assignments.push({
-        id: uid('assign'),
-        meshId: defaultMesh.id,
-        simId,
-      });
-    }
     const node: SimViewportNode = {
       type: 'simViewport',
       id: uid('node'),
@@ -4025,6 +4401,14 @@ export class StudioApp {
     };
     this.project.canvas.nodes.push(node);
     this.mountNode(node);
+    // A drape carries its own remesh + transform stages; wire in the first
+    // pattern so the fullscreen tab strip is complete straight away.
+    const pattern = this.project.patterns[0];
+    if (pattern) {
+      this.connectPatternToSim(pattern, sim);
+    } else {
+      this.syncEmbeddedNodes();
+    }
     void this.initGpuAndSims();
     this.drawWires();
   }
@@ -4043,25 +4427,5 @@ export class StudioApp {
     };
     this.project.canvas.nodes.push(node);
     this.mountNode(node);
-  }
-
-  private assignSelected(): void {
-    const node = this.project.canvas.nodes.find((n) => n.id === this.selectedNodeId);
-    let meshId: string | null = null;
-    let simId: string | null = null;
-    if (node?.type === 'meshFrame') meshId = node.meshId;
-    if (node?.type === 'simViewport') simId = node.simId;
-
-    if (meshId && !simId) simId = this.project.sims[0]?.id ?? null;
-    if (simId && !meshId) meshId = this.project.meshes[0]?.id ?? null;
-
-    if (!meshId || !simId) {
-      alert('Select a mesh or sim frame first.');
-      return;
-    }
-    this.project.assignments = this.project.assignments.filter((a) => a.simId !== simId);
-    this.project.assignments.push({ id: uid('assign'), meshId, simId });
-    this.drawWires();
-    this.setStatus('Assigned mesh → sim (Rebuild on sim to apply)');
   }
 }

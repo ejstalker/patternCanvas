@@ -49,12 +49,6 @@ body {
   z-index: 5;
 }
 
-.brand {
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  margin-right: 8px;
-}
-
 .project-name {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -72,6 +66,9 @@ body {
 }
 
 .studio-toolbar button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   background: var(--panel);
   border: 1px solid var(--border);
   color: var(--ink);
@@ -80,6 +77,19 @@ body {
   cursor: pointer;
   font: inherit;
   font-size: 13px;
+  line-height: 1;
+}
+
+.studio-toolbar button svg {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  stroke-width: 1.9;
+  opacity: 0.85;
+}
+
+.studio-toolbar button:hover:not(:disabled) svg {
+  opacity: 1;
 }
 
 .studio-toolbar button:hover:not(:disabled) {
@@ -117,8 +127,17 @@ body {
 .studio-body {
   flex: 1;
   display: grid;
-  grid-template-columns: 1fr 280px;
+  grid-template-columns: 1fr;
   min-height: 0;
+}
+
+/*
+ * The inspector is only surfaced while a node is expanded to full screen —
+ * `dockInspectorToFullscreen()` re-parents it into the modal, so this rule
+ * (a direct-child match) stops applying there. The board itself stays clean.
+ */
+.studio-body > .studio-inspector {
+  display: none;
 }
 
 .studio-board-wrap {
@@ -556,6 +575,15 @@ body {
   flex-direction: row;
   align-items: stretch;
   overflow: hidden;
+  border-radius: 0 0 8px 8px;
+}
+
+/* Nodes expanded without a docked inspector (the pattern stage) size the body
+   directly against the node instead of the wrapper row. */
+.canvas-node.is-expanded > .node-body {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
   border-radius: 0 0 8px 8px;
 }
 
@@ -2150,4 +2178,168 @@ body {
   width: 0;
   background: var(--accent, #6ea8fe);
   transition: width 0.15s ease;
+}
+
+/* ---------------------------------------------------------------------------
+ * Chrome hidden on the board.
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Pattern window: the left tool rail and the floating option bars stay off the
+ * board but come back in the fullscreen overlay, which is where the drawing
+ * tools actually have room to work.
+ */
+.canvas-node:not(.is-expanded) .pattern-toolbar,
+.canvas-node:not(.is-expanded) .pattern-xray-bar,
+.canvas-node:not(.is-expanded) .pattern-avatar-bar {
+  display: none !important;
+}
+
+/*
+ * Transform 3D and Sim headers are bare on the board — only the full-screen
+ * button. Once a node is expanded into the overlay (`is-expanded`), its action
+ * buttons come back: Reset layout / Rebuild, Play / Pause / Reset / Rebuild /
+ * Snapshot / Strain. Mesh keeps Remesh in both places.
+ */
+.node-transform3d:not(.is-expanded) .node-actions,
+.node-simViewport:not(.is-expanded) .node-actions {
+  display: none;
+}
+
+/*
+ * A drape on the board is just the fabric: its in-viewport controls (Move /
+ * Rotate, Draw pattern points, the view gnomon) only appear in fullscreen,
+ * where there is room to work with them. Transform 3D keeps its board tools —
+ * Snap to quadrant is a canvas gesture.
+ */
+.node-simViewport:not(.is-expanded) .sim-transform-toggle,
+.node-simViewport:not(.is-expanded) .sim-points-toggle,
+.node-simViewport:not(.is-expanded) .viewport-gnomon {
+  display: none !important;
+}
+
+/*
+ * Stages embedded in a drape (remesh / transform) keep their DOM — the
+ * fullscreen tab strip adopts them — but have no presence on the board.
+ */
+.canvas-node.is-embedded {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.canvas-node.is-embedded.is-expanded {
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.canvas-node-placeholder.is-embedded {
+  display: none;
+}
+
+/* ---------------------------------------------------------------------------
+ * Fullscreen pipeline tabs — a run of sequential modifiers.
+ * ------------------------------------------------------------------------- */
+
+.node-fullscreen-tab {
+  background: #2f2b26;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 11px;
+  color: var(--ink);
+}
+
+.node-fullscreen-tab:hover {
+  border-color: var(--accent);
+  background: #3a342c;
+}
+
+.node-fullscreen-tab.is-active {
+  background: #3a342c;
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* Remesh is out of date with the pattern — rebuild needed. */
+.node-fullscreen-tab.is-stale,
+.node-fullscreen-tab.is-stale:hover {
+  border-color: #c45c4a;
+  color: #f0a091;
+  background: rgba(196, 92, 74, 0.16);
+}
+
+.node-fullscreen-tab.is-stale.is-active {
+  border-color: #e07a63;
+  color: #ffb9a6;
+  background: rgba(196, 92, 74, 0.26);
+  box-shadow: inset 0 0 0 1px #e07a63;
+}
+
+.node-fullscreen-link {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  padding: 0 1px;
+  pointer-events: none;
+}
+
+.node-fullscreen-link-line {
+  stroke: var(--border);
+  stroke-width: 1.2;
+}
+
+.node-fullscreen-link-head {
+  stroke: var(--muted);
+  stroke-width: 1.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/*
+ * Right-click popover on board nodes (duplicate / delete). Fixed-positioned so
+ * it escapes the board's pan/zoom transform.
+ */
+.node-context-menu {
+  position: fixed;
+  z-index: 5000;
+  min-width: 168px;
+  padding: 4px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  font-size: 12px;
+  user-select: none;
+}
+
+.node-context-title {
+  margin: 2px 4px 5px;
+  padding: 0 4px 6px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-context-menu button {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.node-context-menu button:hover {
+  background: #3a342c;
+}
+
+.node-context-menu button.is-danger:hover {
+  background: rgba(196, 92, 74, 0.22);
+  color: #f0a091;
 }

@@ -23,6 +23,56 @@ describe('projectCodec', () => {
     const normalized = normalizeProject(raw as never);
     expect(Array.isArray(normalized.transforms)).toBe(true);
   });
+
+  it('keeps transform settings through a JSON round trip', () => {
+    const project = createSmallFixture();
+    const pieceId = project.patterns[0]!.pieces[0]!.id;
+    const expected = project.transforms[0]!.pieceTransforms[pieceId];
+    expect(expected).toBeDefined();
+
+    const parsed = parseProject(serializeProject(project));
+    expect(parsed.transforms).toHaveLength(1);
+    expect(parsed.transforms[0]!.pieceTransforms[pieceId]).toEqual(expected);
+    expect(parsed.meshTransformAssignments).toHaveLength(1);
+  });
+});
+
+describe('transform persistence through the save payload', () => {
+  it('keeps per-piece transform settings', async () => {
+    const project = createSmallFixture();
+    const pieceId = project.patterns[0]!.pieces[0]!.id;
+    const expected = project.transforms[0]!.pieceTransforms[pieceId];
+
+    const payload = await documentToSavePayload(project, {
+      projectId: project.id,
+      revision: 1,
+    });
+    const hydrated = manifestToDocument(
+      payload.manifest,
+      new Map(payload.assets.map((a) => [a.id, a.blob])),
+      new Map(payload.poses.map((p) => [p.id, p])),
+      new Map(payload.meshCaches.map((m) => [m.id, m])),
+      (_id, blob) => URL.createObjectURL(blob)
+    );
+
+    expect(hydrated.transforms).toHaveLength(1);
+    expect(hydrated.transforms[0]!.name).toBe('Transform 3D');
+    expect(hydrated.transforms[0]!.meshId).toBe(project.transforms[0]!.meshId);
+    expect(hydrated.transforms[0]!.camera).toEqual(project.transforms[0]!.camera);
+    expect(hydrated.transforms[0]!.pieceTransforms[pieceId]).toEqual(expected);
+  });
+
+  it('keeps transform settings through an archive round trip', async () => {
+    const project = createSmallFixture();
+    const pieceId = project.patterns[0]!.pieces[0]!.id;
+    const expected = project.transforms[0]!.pieceTransforms[pieceId];
+
+    const bytes = await exportProjectArchiveBytes(project);
+    const imported = await importProjectArchive(bytes);
+
+    expect(imported.transforms).toHaveLength(1);
+    expect(imported.transforms[0]!.pieceTransforms[pieceId]).toEqual(expected);
+  });
 });
 
 describe('mesh geometry pack/unpack', () => {

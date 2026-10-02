@@ -50,12 +50,13 @@ describe('HistoryManager', () => {
       },
     });
     hm.push(project);
-    project.transforms[0].pieceTransforms.piece_a = {
+    project.transforms.find((t) => t.id === transformId)!.pieceTransforms.piece_a = {
       position: [9, 9, 9],
       rotationDeg: [90, 0, 0],
     };
     const prev = hm.undo(project);
-    expect(prev?.transforms[0].pieceTransforms.piece_a.position).toEqual([1, 2, 3]);
-    expect(prev?.transforms[0].pieceTransforms.piece_a.rotationDeg).toEqual([0, 45, 0]);
+    const restored = prev?.transforms.find((t) => t.id === transformId);
+    expect(restored?.pieceTransforms.piece_a.position).toEqual([1, 2, 3]);
+    expect(restored?.pieceTransforms.piece_a.rotationDeg).toEqual([0, 45, 0]);
   });
 });

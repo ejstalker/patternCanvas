@@ -8,6 +8,7 @@ export function createSmallFixture(): ProjectDocument {
   const patternId = 'pattern_small';
   const meshId = 'mesh_small';
   const simId = 'sim_small';
+  const transformId = 'transform_small';
   const piece = rectPiece('Panel', 20, 30, { x: 0, y: 0 });
   return {
     version: 2,
@@ -28,7 +29,22 @@ export function createSmallFixture(): ProjectDocument {
         ),
       },
     ],
-    transforms: [],
+    transforms: [
+      {
+        id: transformId,
+        name: 'Transform 3D',
+        meshId,
+        camera: getDefaultSimCamera(),
+        pose: null,
+        pieceTransforms: {
+          [piece.id]: {
+            position: [1.5, 4, -2.25],
+            rotationDeg: [-90, 22.5, 0],
+            rotationQuat: [0.0, 0.0, 0.19509, 0.98079],
+          },
+        },
+      },
+    ],
     sims: [{
       id: simId,
       name: 'Sim',
@@ -38,7 +54,7 @@ export function createSmallFixture(): ProjectDocument {
       dropped: false,
     }],
     assignments: [{ id: uid('assign'), meshId, simId }],
-    meshTransformAssignments: [],
+    meshTransformAssignments: [{ id: uid('assign'), meshId, transformId }],
     transformSimAssignments: [],
     activeSimId: null,
   };

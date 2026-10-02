@@ -104,8 +104,14 @@ type DragKind =
       /** 'both' = corner (Shift locks aspect); 'x'/'y' = edge handle. */
       axis: 'both' | 'x' | 'y';
       start: Vec2;
+      /** Default pivot: the opposite corner / edge of the selection box. */
       fixed: Vec2;
+      /** Alt pivot: the centre of the selection box, so scaling is symmetric. */
+      center: Vec2;
+      /** Grabbed handle's offset from `fixed`. */
       startSize: Vec2;
+      /** Grabbed handle's offset from `center`. */
+      centerSize: Vec2;
       snapshots: PointSnapshot[];
     };
 
@@ -2358,11 +2364,11 @@ export class PatternEditor {
 
   private onContextMenu(e: MouseEvent): void {
     e.preventDefault();
-    e.stopPropagation();
     this.root.focus({ preventScroll: true });
 
     // Cancel pending sew pick instead of opening the piece menu
     if (this.pendingSeam) {
+      e.stopPropagation();
       this.pendingSeam = null;
       this.hoverEdge = null;
       this.hideContextMenu();
@@ -2373,6 +2379,7 @@ export class PatternEditor {
     const p = this.svgPointFromClient(e.clientX, e.clientY);
     const seamHit = this.findSeamNearClick(p);
     if (seamHit) {
+      e.stopPropagation();
       this.contextSeamId = seamHit.id;
       this.contextPieceId = null;
       this.showContextMenu(e.clientX, e.clientY, 'seam');
@@ -2382,9 +2389,12 @@ export class PatternEditor {
 
     const piece = this.resolveContextPiece(e);
     if (!piece || piece.points.length === 0) {
+      // Nothing pattern-specific under the cursor: let the event carry on so
+      // the node's own context menu (duplicate / delete) can take over.
       this.hideContextMenu();
       return;
     }
+    e.stopPropagation();
     this.selectEntirePiece(piece);
     this.contextPieceId = piece.id;
     this.contextSeamId = null;
@@ -2521,8 +2531,14 @@ export class PatternEditor {
     this.root.focus({ preventScroll: true });
     if (e.button === 0) this.hideContextMenu();
 
+    // Alt over a scale handle means "scale about the selection centre", so the
+    // handle takes precedence over the Alt-pan gesture there.
+    const hitEl = e.target as SVGElement;
+    const onScaleHandle =
+      this.tool === 'move' && hitEl.dataset?.kind === 'scale' && !!hitEl.dataset.handle;
+
     // Middle-mouse (or Alt-left) pans the pattern view
-    if (e.button === 1 || (e.button === 0 && e.altKey)) {
+    if (e.button === 1 || (e.button === 0 && e.altKey && !onScaleHandle)) {
       this.drag = {
         type: 'pan',
         startClient: { x: e.clientX, y: e.clientY },
@@ -2582,6 +2598,10 @@ export class PatternEditor {
       const box = this.selectionScaleBox();
       if (!handle || !box || this.selectedIds.size < 2) return;
       const fixed = this.scaleFixedPoint(box, handle);
+      const center = {
+        x: (box.minX + box.maxX) / 2,
+        y: (box.minY + box.maxY) / 2,
+      };
       const startHandle = this.scaleHandlePoint(box, handle);
       this.markBeforeChange();
       this.drag = {
@@ -2590,9 +2610,14 @@ export class PatternEditor {
         axis: this.scaleAxisForHandle(handle),
         start: p,
         fixed,
+        center,
         startSize: {
           x: startHandle.x - fixed.x,
           y: startHandle.y - fixed.y,
+        },
+        centerSize: {
+          x: startHandle.x - center.x,
+          y: startHandle.y - center.y,
         },
         snapshots: this.snapshotSelection(),
       };
@@ -3388,8 +3413,13 @@ export class PatternEditor {
 
     if (this.drag.type === 'scaleSelection') {
       const d = this.drag;
-      let sx = d.startSize.x === 0 ? 1 : (p.x - d.fixed.x) / d.startSize.x;
-      let sy = d.startSize.y === 0 ? 1 : (p.y - d.fixed.y) / d.startSize.y;
+      // Alt scales about the centre of the selection — symmetric growth —
+      // instead of about the opposite corner / edge.
+      const fromCenter = e.altKey;
+      const pivot = fromCenter ? d.center : d.fixed;
+      const size = fromCenter ? d.centerSize : d.startSize;
+      let sx = size.x === 0 ? 1 : (p.x - pivot.x) / size.x;
+      let sy = size.y === 0 ? 1 : (p.y - pivot.y) / size.y;
       if (d.axis === 'x') sy = 1;
       else if (d.axis === 'y') sx = 1;
       else if (e.shiftKey) {
@@ -3398,7 +3428,7 @@ export class PatternEditor {
         sx = s;
         sy = s;
       }
-      this.applySnapshotsScaled(d.snapshots, d.fixed, sx, sy);
+      this.applySnapshotsScaled(d.snapshots, pivot, sx, sy);
       this.redraw();
       this.cbs.onChange();
       return;

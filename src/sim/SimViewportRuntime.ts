@@ -156,6 +156,34 @@ export class SimViewportRuntime {
     this.defaultCamera = camera;
   }
 
+  /**
+   * Tear the runtime down completely. Rebuilding a sim replaces its runtime, so
+   * every element appended to the host has to go with it or the next one stacks
+   * a second set of controls on top.
+   */
+  dispose(): void {
+    this.cloth?.destroy();
+    this.cloth = null;
+    this.renderer = null;
+    this.viewGnomon?.destroy();
+    this.viewGnomon = null;
+    this.moveGizmo?.destroy();
+    this.moveGizmo = null;
+    this.selectionOverlay?.destroy();
+    this.selectionOverlay = null;
+    this.transformToggle?.remove();
+    this.transformToggle = null;
+    this.pointsToggle?.remove();
+    this.pointsToggle = null;
+    this.pointsLayer?.remove();
+    this.pointsLayer = null;
+    this.pointOverlay?.destroy();
+    this.pointOverlay = null;
+    this.pointMarkerEls = [];
+    this.pointMarkers = [];
+    this.incidentTriangles = null;
+  }
+
   syncFromDocument(sim: SimInstance): void {
     this.sim = sim;
   }
