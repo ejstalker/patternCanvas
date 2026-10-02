@@ -121,6 +121,7 @@ export class MoveGizmo {
       hit.setAttribute('stroke', 'transparent');
       hit.setAttribute('stroke-width', '14');
       hit.setAttribute('stroke-linecap', 'round');
+      hit.setAttribute('pointer-events', 'stroke');
       hit.style.cursor = this.mode === 'rotate' ? 'alias' : 'pointer';
       g.appendChild(hit);
 
@@ -136,6 +137,7 @@ export class MoveGizmo {
     center.setAttribute('stroke-width', '2');
     center.dataset.axis = 'free';
     center.setAttribute('class', 'move-gizmo-free');
+    center.setAttribute('pointer-events', 'all');
     center.style.cursor = this.mode === 'rotate' ? 'alias' : 'move';
     this.svg.appendChild(center);
 
@@ -262,7 +264,8 @@ export function worldToCanvasPx(
   return {
     x: (ndcX * 0.5 + 0.5) * w,
     y: (-ndcY * 0.5 + 0.5) * h,
-    behind: ndcZ < -1 || ndcZ > 1 || clip[3] < 0,
+    // Camera uses WebGPU ZO projection, whose NDC depth range is [0, 1].
+    behind: ndcZ < 0 || ndcZ > 1 || clip[3] < 0,
   };
 }
 
@@ -278,7 +281,9 @@ export function unprojectRay(
   const ndcY = -(((clientY - rect.top) / rect.height) * 2 - 1);
   const inv = mat4.create();
   if (!mat4.invert(inv, viewProj)) return null;
-  const near = vec4.fromValues(ndcX, ndcY, -1, 1);
+  // Camera projection is perspectiveZO/orthoZO for WebGPU. Using OpenGL's
+  // -1 near depth skews perspective rays and is especially wrong in ortho.
+  const near = vec4.fromValues(ndcX, ndcY, 0, 1);
   const far = vec4.fromValues(ndcX, ndcY, 1, 1);
   vec4.transformMat4(near, near, inv);
   vec4.transformMat4(far, far, inv);

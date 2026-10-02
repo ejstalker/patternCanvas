@@ -1,8 +1,8 @@
 struct Params {
-  nConstraints: u32,
+  offset: u32,
+  count: u32,
   compliance: f32,
   nParticles: u32,
-  _pad1: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -10,13 +10,11 @@ struct Params {
 @group(0) @binding(2) var<storage, read> invMasses: array<f32>;
 @group(0) @binding(3) var<storage, read> stretchIndices: array<u32>;
 @group(0) @binding(4) var<storage, read> stretchRest: array<f32>;
-@group(0) @binding(5) var<storage, read_write> deltaXYZ: array<f32>;
-@group(0) @binding(6) var<storage, read_write> deltaCounts: array<f32>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let id = gid.x;
-  if (id >= params.nConstraints) { return; }
+  if (gid.x >= params.count) { return; }
+  let id = params.offset + gid.x;
   let idx1 = stretchIndices[id * 2u];
   let idx2 = stretchIndices[id * 2u + 1u];
   if (idx1 >= params.nParticles || idx2 >= params.nParticles || idx1 == idx2) { return; }
@@ -38,13 +36,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let C = distance - expected;
   if (abs(C) < 1e-8) { return; }
 
-  // Soft under-relaxed distance constraint (racey Jacobi writes).
+  // Color-class Gauss–Seidel: no shared vertices within a dispatch → safe stores.
   let nrm = diff / distance;
-  let alpha = max(params.compliance, 0.05);
-  let corr = nrm * ((C / wSum) * alpha);
+  let alpha = clamp(params.compliance, 0.0, 1.0);
+  let corr = nrm * ((C / wSum) * (1.0 - alpha));
   predicted[idx1] = vec4<f32>(p1 - corr * w1, 0.0);
   predicted[idx2] = vec4<f32>(p2 + corr * w2, 0.0);
-
-  let _keep = deltaXYZ[0] + deltaCounts[0];
-  if (_keep > 1e30) { deltaCounts[0] = _keep; }
 }

@@ -14,7 +14,9 @@ export type ObstacleGpu = {
 const OBSTACLE_FLOATS = 28; // 7 vec4s
 
 export function packObstacles(obstacles: ObstacleGpu[]): Float32Array {
+  // Obstacle.kind is u32 in WGSL — must write integer bit pattern, not f32(kind).
   const out = new Float32Array(Math.max(obstacles.length, 1) * OBSTACLE_FLOATS);
+  const u32 = new Uint32Array(out.buffer);
   for (let i = 0; i < obstacles.length; i++) {
     const o = obstacles[i];
     const base = i * OBSTACLE_FLOATS;
@@ -24,7 +26,10 @@ export function packObstacles(obstacles: ObstacleGpu[]): Float32Array {
     out.set(o.rot2, base + 12);
     out.set(o.a, base + 16);
     out.set(o.b, base + 20);
-    out[base + 24] = o.kind;
+    u32[base + 24] = o.kind >>> 0;
+    u32[base + 25] = o.pad[0] >>> 0;
+    u32[base + 26] = o.pad[1] >>> 0;
+    u32[base + 27] = o.pad[2] >>> 0;
   }
   return out;
 }

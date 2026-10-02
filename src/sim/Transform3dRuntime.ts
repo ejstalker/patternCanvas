@@ -25,6 +25,7 @@ import { DEFAULT_MESH_SETTINGS, triangulatePattern } from '../mesh/triangulate';
 import { migrateLegacySimCamera } from './cameraDefaults';
 import { createViewportRenderer } from './SimViewportRuntime';
 import { FALLBACK_PIECE_ID } from './meshTopology';
+import { DEFAULT_TRANSFORM_PIECE_ROTATION_DEG } from './transformDefaults';
 import type {
   MeshGeometry,
   PatternDocument,
@@ -230,6 +231,10 @@ export class Transform3dRuntime {
     return [...ids];
   }
 
+  syncFromDocument(transform: Transform3dInstance): void {
+    this.transform = transform;
+  }
+
   applyCamera(transform: Transform3dInstance): void {
     migrateLegacySimCamera(transform.camera, this.defaultCamera);
     this.camera.setDistance(transform.camera.distance);
@@ -288,6 +293,59 @@ export class Transform3dRuntime {
     }
   }
 
+  /** Record an incremental local-axis rotation so remesh can restore orientation. */
+  private accumulatePieceLocalRotation(
+    pieceId: string,
+    localAxis: vec3,
+    radians: number
+  ): void {
+    if (!this.cloth || Math.abs(radians) < 1e-8) return;
+    const existing = this.transform.pieceTransforms[pieceId];
+    const current = quat.fromValues(
+      ...resolvePieceQuat(
+        existing ?? {
+          position: this.cloth.getPieceCentroidTuple(pieceId),
+          rotationDeg: [0, 0, 0],
+        }
+      )
+    );
+    const delta = quat.create();
+    const normalizedLocal = vec3.clone(localAxis);
+    if (vec3.squaredLength(normalizedLocal) < 1e-8) return;
+    vec3.normalize(normalizedLocal, normalizedLocal);
+    quat.setAxisAngle(delta, normalizedLocal, radians);
+    quat.multiply(current, current, delta);
+    quat.normalize(current, current);
+    const rotationQuat: [number, number, number, number] = [
+      current[0],
+      current[1],
+      current[2],
+      current[3],
+    ];
+    this.transform.pieceTransforms[pieceId] = {
+      position: this.cloth.getPieceCentroidTuple(pieceId),
+      rotationDeg: quatToEulerDeg(rotationQuat),
+      rotationQuat,
+    };
+  }
+
+  private pieceLocalAxisInWorld(pieceId: string, localAxis: vec3): vec3 | null {
+    const existing = this.transform.pieceTransforms[pieceId];
+    const orientation = quat.fromValues(
+      ...resolvePieceQuat(
+        existing ?? {
+          position: this.cloth?.getPieceCentroidTuple(pieceId) ?? [0, 0, 0],
+          rotationDeg: [0, 0, 0],
+        }
+      )
+    );
+    const worldAxis = vec3.create();
+    vec3.transformQuat(worldAxis, localAxis, orientation);
+    if (vec3.squaredLength(worldAxis) < 1e-8) return null;
+    vec3.normalize(worldAxis, worldAxis);
+    return worldAxis;
+  }
+
   /** Record an incremental world-axis rotation so remesh can restore orientation. */
   private accumulatePieceRotation(pieceId: string, axis: vec3, radians: number): void {
     if (!this.cloth || Math.abs(radians) < 1e-8) return;
@@ -332,14 +390,39 @@ export class Transform3dRuntime {
 
   resetLayout(): void {
     this.markBeforePoseChange();
-    this.transform.pose = null;
-    this.transform.pieceTransforms = {};
     if (this.cloth) {
       this.cloth.resetToInitialState();
+      this.applyDefaultArrangement();
       this.setPieceSelected(null);
-      this.onPoseChange?.(this.transform);
+      this.persistArrangement();
+    } else {
+      this.transform.pose = null;
+      this.transform.pieceTransforms = {};
     }
     this.endPoseHistoryGesture();
+  }
+
+  /** Stand pattern pieces upright (-90° X) from the flat mesh layout. */
+  private applyDefaultArrangement(): void {
+    if (!this.cloth) return;
+    const axis = vec3.fromValues(1, 0, 0);
+    const radians = (DEFAULT_TRANSFORM_PIECE_ROTATION_DEG[0] * Math.PI) / 180;
+    if (Math.abs(radians) > 1e-8) {
+      for (const pieceId of this.getPieceIds()) {
+        this.cloth.rotateBy(axis, radians, pieceId);
+      }
+    }
+    const rotationQuat = eulerDegToQuat(DEFAULT_TRANSFORM_PIECE_ROTATION_DEG);
+    const pieceTransforms: Record<string, PieceTransform3d> = {};
+    for (const pieceId of this.getPieceIds()) {
+      pieceTransforms[pieceId] = {
+        position: this.cloth.getPieceCentroidTuple(pieceId),
+        rotationDeg: [...DEFAULT_TRANSFORM_PIECE_ROTATION_DEG],
+        rotationQuat: [...rotationQuat],
+      };
+    }
+    this.transform.pieceTransforms = pieceTransforms;
+    this.transform.pose = this.cloth.exportPose();
   }
 
   async initRenderer(): Promise<void> {
@@ -353,6 +436,41 @@ export class Transform3dRuntime {
     this.mountMoveGizmo();
     this.mountTransformToggle();
     this.bindPointer();
+    this.bindKeyboard();
+  }
+
+  /** Rotate the selected piece by 90° around its local X axis. */
+  rotateSelectedPieceQuarterTurn(): void {
+    if (!this.cloth || !this.selectedPieceId) return;
+    const localX = vec3.fromValues(1, 0, 0);
+    const axis = this.pieceLocalAxisInWorld(this.selectedPieceId, localX);
+    if (!axis) return;
+    const quarter = Math.PI / 2;
+    this.markBeforePoseChange();
+    this.cloth.rotateBy(axis, quarter, this.selectedPieceId);
+    this.accumulatePieceLocalRotation(this.selectedPieceId, localX, quarter);
+    this.persistArrangement();
+    this.syncMoveGizmo();
+  }
+
+  private bindKeyboard(): void {
+    this.canvas.tabIndex = 0;
+    this.canvas.style.outline = 'none';
+    this.canvas.addEventListener('keydown', (e) => {
+      if (e.key !== 'r' && e.key !== 'R') return;
+      const t = e.target as HTMLElement | null;
+      if (
+        t &&
+        t !== this.canvas &&
+        (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)
+      ) {
+        return;
+      }
+      if (!this.cloth || !this.selectedPieceId) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.rotateSelectedPieceQuarterTurn();
+    });
   }
 
   private mountTransformToggle(): void {
@@ -379,8 +497,8 @@ export class Transform3dRuntime {
       this.transformToggle.classList.toggle('is-rotate', rotating);
       this.transformToggle.textContent = rotating ? 'Rotate' : 'Move';
       this.transformToggle.title = rotating
-        ? 'Rotation mode — drag a gizmo axis to rotate the selected piece'
-        : 'Move mode — drag the selected piece or a gizmo axis to translate';
+        ? 'Rotation mode — drag a gizmo axis to rotate the selected piece · R = 90° on local X'
+        : 'Move mode — drag the selected piece or a gizmo axis to translate · R = 90° on local X';
       this.transformToggle.setAttribute('aria-pressed', String(rotating));
     }
     this.syncMoveGizmo();
@@ -585,7 +703,7 @@ export class Transform3dRuntime {
       }
       this.transform.pose = this.cloth.exportPose();
     } else {
-      this.transform.pose = null;
+      this.applyDefaultArrangement();
     }
     this.setPieceSelected(null);
   }
@@ -620,6 +738,7 @@ export class Transform3dRuntime {
       this.pointerMoved = false;
       this.lastX = e.clientX;
       this.lastY = e.clientY;
+      this.canvas.focus({ preventScroll: true });
       this.canvas.style.cursor =
         this.nav === 'pan'
           ? 'move'

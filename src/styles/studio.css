@@ -191,6 +191,43 @@ body {
   fill: none;
 }
 
+.mesh-seam-line {
+  stroke: var(--seam);
+  stroke-linecap: round;
+  fill: none;
+  pointer-events: none;
+  opacity: 0.85;
+}
+
+.mesh-seam-connector {
+  stroke: var(--seam);
+  stroke-linecap: round;
+  stroke-dasharray: 1.1 0.85;
+  fill: none;
+  pointer-events: none;
+}
+
+.mesh-seam-binding {
+  stroke: var(--seam);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+  pointer-events: none;
+}
+
+.mesh-seam-binding.mesh-seam-stale {
+  stroke: #a07020;
+  opacity: 0.55;
+}
+
+.mesh-seam-notch {
+  stroke: var(--seam);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+  pointer-events: none;
+}
+
 .studio-inspector select {
   display: block;
   width: 100%;
@@ -510,6 +547,35 @@ body {
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
 }
 
+/* Viewport + inspector row under the chrome ribbon */
+.canvas-node.is-expanded > .node-expand-main {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  overflow: hidden;
+  border-radius: 0 0 8px 8px;
+}
+
+.canvas-node.is-expanded > .node-expand-main > .node-body {
+  flex: 1;
+  min-width: 0;
+  border-radius: 0;
+}
+
+.studio-inspector.is-fullscreen-docked {
+  flex: 0 0 280px;
+  width: 280px;
+  max-width: min(320px, 40vw);
+  align-self: stretch;
+  border-left: 1px solid var(--border);
+  border-radius: 0 0 8px 0;
+  box-shadow: none;
+  z-index: 2;
+}
+
 .canvas-node.is-expanded .resize-handle,
 .canvas-node.is-expanded > .node-port {
   display: none !important;
@@ -592,12 +658,53 @@ body {
   border-right: 1px solid var(--border);
   z-index: 3;
   flex-shrink: 0;
+  overflow: visible;
 }
 
 .pattern-toolbar-tools {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.pattern-tool-flyout {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.pattern-tool-flyout-menu {
+  position: absolute;
+  left: calc(100% + 6px);
+  top: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  min-width: 88px;
+}
+
+.pattern-tool-flyout-menu[hidden] {
+  display: none !important;
+}
+
+.pattern-tool-flyout-menu button {
+  width: 100%;
+  height: auto;
+  padding: 5px 8px;
+  justify-content: flex-start;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.pattern-tool-flyout-menu button.is-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
 }
 
 .pattern-toolbar-spacer {
@@ -634,6 +741,186 @@ body {
 .pattern-toolbar button svg {
   display: block;
   pointer-events: none;
+}
+
+.pattern-toolbar-tip {
+  position: fixed;
+  z-index: 10060;
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: #1a1815;
+  color: var(--ink);
+  font: 500 11px/1.2 var(--font);
+  white-space: nowrap;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+
+.pattern-import-dialog-root {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+}
+
+.pattern-import-backdrop {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(12, 11, 10, 0.55);
+}
+
+.pattern-import-dialog {
+  width: min(360px, 100%);
+  max-height: min(70vh, 520px);
+  overflow: auto;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px 16px;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.45);
+}
+
+.pattern-import-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.pattern-import-dialog h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.pattern-import-close {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.pattern-import-close:hover {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+
+.pattern-import-file {
+  margin: 0 0 10px;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.pattern-import-meta {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.pattern-import-meta > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  font-size: 13px;
+}
+
+.pattern-import-meta .muted {
+  font-size: 11px;
+}
+
+.pattern-import-scale {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 4px;
+  font-size: 13px;
+}
+
+.pattern-import-scale input {
+  width: 5.5rem;
+  background: var(--bg, #1c1a17);
+  border: 1px solid var(--border);
+  color: var(--ink);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font: inherit;
+}
+
+.pattern-import-scale-hint {
+  margin: 0 0 10px;
+  font-size: 11px;
+}
+
+.pattern-import-warnings {
+  margin: 0 0 12px;
+  padding: 8px 10px 8px 24px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, #c9a227 55%, var(--border));
+  background: color-mix(in srgb, #c9a227 12%, var(--panel));
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.pattern-import-warnings li + li {
+  margin-top: 4px;
+}
+
+.pattern-import-error {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid #a33;
+  background: #5a2020;
+  color: #f0c0c0;
+  font-size: 12px;
+}
+
+.pattern-import-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.pattern-import-actions button {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--ink);
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+
+.pattern-import-actions button:hover {
+  border-color: var(--accent);
+}
+
+.pattern-import-actions button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.pattern-import-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .pattern-snap-guide {
@@ -796,6 +1083,32 @@ body {
   text-overflow: ellipsis;
 }
 
+.pattern-knife-preview {
+  stroke: var(--accent);
+  stroke-dasharray: 4 3;
+  fill: none;
+  pointer-events: none;
+}
+
+.pattern-knife-point {
+  fill: var(--accent);
+  stroke: #fff;
+  pointer-events: none;
+}
+
+.pattern-knife-hit {
+  fill: #c45c26;
+  stroke: #fff;
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+.pattern-knife-hit-ok {
+  fill: #2f6f4e;
+  stroke: #fff;
+  pointer-events: none;
+}
+
 .pattern-avatar-mesh {
   fill: #6a7078;
   fill-opacity: 0.15;
@@ -907,6 +1220,12 @@ body {
   pointer-events: none;
 }
 
+.pattern-shape-preview {
+  fill: rgba(196, 92, 38, 0.1);
+  stroke: var(--accent);
+  pointer-events: none;
+}
+
 .pattern-selection-box {
   fill: rgba(61, 126, 166, 0.06);
   stroke: #3d7ea6;
@@ -971,6 +1290,14 @@ body {
   filter: drop-shadow(0 0 0.4px rgba(212, 160, 23, 0.9));
 }
 
+.pattern-seam-multi-source {
+  stroke: #d4a017;
+}
+
+.pattern-seam-multi-target {
+  stroke: #3d7ea6;
+}
+
 .pattern-seam-hover {
   stroke: #e8c040;
   stroke-linecap: round;
@@ -983,6 +1310,47 @@ body {
   stroke: var(--seam);
   stroke-linecap: round;
   stroke-linejoin: round;
+  fill: none;
+  pointer-events: none;
+}
+
+.pattern-sew-bar {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  transform: translateX(-50%);
+  padding: 5px 6px 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: rgba(35, 31, 27, 0.94);
+  color: var(--text);
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.35);
+  font: 11px var(--mono);
+  white-space: nowrap;
+}
+
+.pattern-sew-bar[hidden] {
+  display: none !important;
+}
+
+.pattern-sew-bar button {
+  min-height: 24px;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
+.pattern-sew-bar [data-sew-next] {
+  border-color: var(--seam);
+}
+
+.pattern-seam-connector {
+  stroke: var(--seam);
+  stroke-linecap: round;
+  stroke-dasharray: 1.1 0.85;
   fill: none;
   pointer-events: none;
 }
@@ -1051,7 +1419,8 @@ body {
   height: 120px;
   margin-left: -60px;
   margin-top: -60px;
-  pointer-events: auto;
+  /* Do not let the invisible 120×120 gizmo box block cloth picking. */
+  pointer-events: none;
   user-select: none;
   filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.5));
 }
@@ -1059,6 +1428,12 @@ body {
 .move-gizmo svg {
   display: block;
   overflow: visible;
+  pointer-events: none;
+}
+
+.move-gizmo-axis line[stroke='transparent'],
+.move-gizmo-free {
+  pointer-events: auto;
 }
 
 .move-gizmo-axis:hover line:not([stroke='transparent']) {

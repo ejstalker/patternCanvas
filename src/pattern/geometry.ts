@@ -1,4 +1,4 @@
-import type { BezierPoint, PatternPiece, Vec2 } from '../project/types';
+import type { BezierPoint, PatternPiece, SeamEdgeRef, Vec2 } from '../project/types';
 
 export function dist(a: Vec2, b: Vec2): number {
   const dx = a.x - b.x;
@@ -128,6 +128,59 @@ export function sampleEdgeByPointIds(
     (!b.handleIn || (b.handleIn.x === b.anchor.x && b.handleIn.y === b.anchor.y));
   if (linear) return [a.anchor, b.anchor];
   return sampleCubic(a.anchor, c0, c1, b.anchor, steps);
+}
+
+/** Sample points along a parametric sub-span [t0, t1] of an edge (for seam drawing). */
+export function sampleEdgeSpanByPointIds(
+  piece: PatternPiece,
+  fromPointId: string,
+  toPointId: string,
+  t0: number,
+  t1: number,
+  steps = 16
+): Vec2[] | null {
+  const table = buildEdgeArcTable(piece, fromPointId, toPointId);
+  if (!table) return null;
+  const lo = Math.min(t0, t1);
+  const hi = Math.max(t0, t1);
+  if (hi - lo < 1e-6) return null;
+  const pts: Vec2[] = [];
+  for (let i = 0; i <= steps; i++) {
+    const hit = pointOnEdgeAtArcFractionInSpan(piece, fromPointId, toPointId, lo, hi, i / steps, table);
+    if (hit) pts.push(hit.pos);
+  }
+  return pts.length >= 2 ? pts : null;
+}
+
+export function sameSeamEdgeTopology(
+  a: { pieceId: string; fromPointId: string; toPointId: string },
+  b: { pieceId: string; fromPointId: string; toPointId: string }
+): boolean {
+  return (
+    a.pieceId === b.pieceId &&
+    a.fromPointId === b.fromPointId &&
+    a.toPointId === b.toPointId
+  );
+}
+
+export function sameSeamSpan(a: SeamEdgeRef, b: SeamEdgeRef): boolean {
+  return (
+    sameSeamEdgeTopology(a, b) &&
+    Math.abs(a.t0 - b.t0) < 1e-5 &&
+    Math.abs(a.t1 - b.t1) < 1e-5
+  );
+}
+
+export function sameSeamBindingPair(
+  a1: SeamEdgeRef,
+  b1: SeamEdgeRef,
+  a2: SeamEdgeRef,
+  b2: SeamEdgeRef
+): boolean {
+  return (
+    (sameSeamSpan(a1, a2) && sameSeamSpan(b1, b2)) ||
+    (sameSeamSpan(a1, b2) && sameSeamSpan(b1, a2))
+  );
 }
 
 /** Arc length (cm) of the edge fromPointId → toPointId. */

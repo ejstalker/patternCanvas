@@ -1,6 +1,6 @@
 struct Params {
   invH: f32,
-  damping: f32,
+  velRetain: f32,
   maxSpeed: f32,
   n: u32,
 }
@@ -20,10 +20,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     velocities[i] = vec4<f32>(0.0);
     return;
   }
-  let q = predicted[i].xyz;
   let p = positions[i].xyz;
-  var v = (q - p) * params.invH;
-  v = v * (1.0 - params.damping);
+  var q = predicted[i].xyz;
+  var delta = q - p;
+  let dlen = length(delta);
+  // Clamp constraint-induced travel this substep so sew/stretch can't teleport
+  // through the avatar or crumple into self-intersections.
+  let maxDelta = max(params.maxSpeed * (1.0 / max(params.invH, 1e-4)), 1e-5);
+  if (dlen > maxDelta && dlen > 1e-8) {
+    delta = delta * (maxDelta / dlen);
+    q = p + delta;
+  }
+  var v = delta * params.invH;
+  v = v * params.velRetain;
   let speed = length(v);
   if (speed > params.maxSpeed && speed > 1e-8) {
     v = v * (params.maxSpeed / speed);

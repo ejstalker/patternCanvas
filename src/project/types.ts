@@ -145,9 +145,8 @@ export type SimParams = {
   /** Self-collision / SDF particle radius = scalar × avg edge length. */
   particleDiameterScalar?: number;
   /**
-   * Contact friction / grip (0–1).
-   * CPU: tangential velocity retain ≈ 1 − friction.
-   * GPU: Coulomb μ in SDF contact.
+   * Contact friction / grip (0–2).
+   * Tangential velocity retain ≈ max(0, 1 − friction × 0.95).
    */
   contactFriction?: number;
   enableSelfCollision?: boolean;
@@ -231,7 +230,9 @@ export type Transform3dNode = CanvasNodeBase & {
 
 export type ImageNode = CanvasNodeBase & {
   type: 'image';
-  /** Data URL or other browser-loadable image src (reference / snapshot). */
+  /** IndexedDB asset reference when persisted externally. */
+  assetId?: string;
+  /** Data URL, blob URL, or other browser-loadable image src (reference / snapshot). */
   src: string;
   label?: string;
   /** Natural pixel aspect (width/height) for Shift-resize locking. */

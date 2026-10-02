@@ -138,7 +138,12 @@ export class SdfVolume {
     if (dist >= margin) return false;
 
     const normal = this.gradientAt(pos, vec3.create());
-    vec3.scaleAndAdd(pos, pos, normal, margin - dist);
+    // Cap correction — deep/wrong SDF samples (common after loading a volume for GPU)
+    // were slamming every particle onto the isosurface each substep: shrink, jitter,
+    // and apparent loss of gravity.
+    const maxPush = Math.max(margin * 2, edgeLength > 0 ? edgeLength * 1.5 : margin * 2);
+    const push = Math.min(margin - dist, maxPush);
+    vec3.scaleAndAdd(pos, pos, normal, push);
 
     const vel = p.getVelocity();
     const velDotNormal = vec3.dot(vel, normal);

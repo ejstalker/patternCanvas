@@ -1,5 +1,11 @@
-import type { MeshDocument, MeshGeometry, UnitDisplay } from '../project/types';
+import type { MeshDocument, MeshGeometry, PatternDocument, UnitDisplay } from '../project/types';
 import { boundsOf } from '../pattern/geometry';
+import {
+  drawMeshSeamBindings,
+  drawMeshSeamConnectors,
+  drawMeshSeamLines,
+  seamRefsFromPattern,
+} from './meshSeamDraw';
 
 /**
  * Top-down 2D preview of a triangulated fabric mesh.
@@ -8,10 +14,17 @@ export class MeshPreview {
   private root: HTMLElement;
   private svg: SVGSVGElement;
   private mesh: MeshDocument;
+  private pattern: PatternDocument | null;
   private unit: UnitDisplay;
 
-  constructor(host: HTMLElement, mesh: MeshDocument, unit: UnitDisplay) {
+  constructor(
+    host: HTMLElement,
+    mesh: MeshDocument,
+    unit: UnitDisplay,
+    pattern: PatternDocument | null = null
+  ) {
     this.mesh = mesh;
+    this.pattern = pattern;
     this.unit = unit;
     this.root = host;
     this.root.classList.add('mesh-preview');
@@ -28,8 +41,14 @@ export class MeshPreview {
     this.redraw();
   }
 
-  setMesh(mesh: MeshDocument): void {
+  setMesh(mesh: MeshDocument, pattern?: PatternDocument | null): void {
     this.mesh = mesh;
+    if (pattern !== undefined) this.pattern = pattern;
+    this.redraw();
+  }
+
+  setPattern(pattern: PatternDocument | null): void {
+    this.pattern = pattern;
     this.redraw();
   }
 
@@ -48,6 +67,7 @@ export class MeshPreview {
     this.svg.setAttribute('viewBox', `${min.x - pad} ${min.y - pad} ${w + pad * 2} ${h + pad * 2}`);
 
     this.drawGeometry(geom);
+    this.drawSeams(geom);
   }
 
   private drawGeometry(geom: MeshGeometry): void {
@@ -72,5 +92,13 @@ export class MeshPreview {
       line.setAttribute('class', 'mesh-edge');
       this.svg.appendChild(line);
     }
+  }
+
+  private drawSeams(geom: MeshGeometry): void {
+    if (!this.pattern || this.pattern.seams.length === 0) return;
+    const seamRefs = seamRefsFromPattern(this.pattern);
+    drawMeshSeamLines(this.svg, geom, seamRefs);
+    drawMeshSeamConnectors(this.svg, this.pattern);
+    drawMeshSeamBindings(this.svg, this.pattern);
   }
 }

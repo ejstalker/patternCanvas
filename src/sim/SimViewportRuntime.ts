@@ -112,6 +112,10 @@ export class SimViewportRuntime {
     this.defaultCamera = camera;
   }
 
+  syncFromDocument(sim: SimInstance): void {
+    this.sim = sim;
+  }
+
   applyCamera(sim: SimInstance): void {
     if (sim.name !== 'Drape A') {
       migrateLegacySimCamera(sim.camera, this.defaultCamera);
@@ -377,6 +381,51 @@ export class SimViewportRuntime {
     this.cloth?.setAvatar(body);
   }
 
+  /**
+   * Pick the rendered cloth. The center ray stays exact; a small CSS-pixel
+   * fallback ring makes thin folds and triangle edges selectable without
+   * changing the actual cloth collision geometry.
+   */
+  private pickCloth(
+    clientX: number,
+    clientY: number
+  ): ReturnType<ClothSimulator['raycast']> {
+    if (!this.cloth) return null;
+    // Fullscreen/node resize can happen between render frames. Keep the camera
+    // aspect current before converting this pointer into a ray.
+    this.resize();
+    this.camera.update();
+
+    const offsets: ReadonlyArray<readonly [number, number]> = [
+      [0, 0],
+      [-5, 0],
+      [5, 0],
+      [0, -5],
+      [0, 5],
+      [-3.5, -3.5],
+      [3.5, -3.5],
+      [-3.5, 3.5],
+      [3.5, 3.5],
+    ];
+    let best: ReturnType<ClothSimulator['raycast']> = null;
+    for (const [dx, dy] of offsets) {
+      const ray = unprojectRay(
+        clientX + dx,
+        clientY + dy,
+        this.canvas,
+        this.camera.getViewProjectMtx()
+      );
+      if (!ray) continue;
+      const hit = this.cloth.raycast(ray.origin, ray.dir);
+      if (!hit) continue;
+      // Exact center hit always wins. Otherwise choose the nearest visible
+      // surface among the tolerance rays.
+      if (dx === 0 && dy === 0) return hit;
+      if (!best || hit.t < best.t) best = hit;
+    }
+    return best;
+  }
+
   private bindPointer(): void {
     this.canvas.style.cursor = 'grab';
 
@@ -387,9 +436,7 @@ export class SimViewportRuntime {
         this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
       } else if (e.button === 0) {
         // LMB on fabric → select that pattern piece and transform only it.
-        this.camera.update();
-        const ray = unprojectRay(e.clientX, e.clientY, this.canvas, this.camera.getViewProjectMtx());
-        const hit = ray && this.cloth ? this.cloth.raycast(ray.origin, ray.dir) : null;
+        const hit = this.pickCloth(e.clientX, e.clientY);
         if (hit && this.cloth) {
           this.setPieceSelected(hit.pieceId);
           this.beginClothDrag(e.clientX, e.clientY);

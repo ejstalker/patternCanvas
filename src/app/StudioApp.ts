@@ -34,22 +34,26 @@ import { PatternEditor } from '../pattern/PatternEditor';
 import { MeshPreview } from '../mesh/MeshPreview';
 import { createSharedGpu, SimViewportRuntime } from '../sim/SimViewportRuntime';
 import { Transform3dRuntime } from '../sim/Transform3dRuntime';
+import { DEFAULT_TRANSFORM_PIECE_ROTATION_DEG } from '../sim/transformDefaults';
 import {
   DEFAULT_AUTOSAVE_MINUTES,
+  createDirtyState,
   deleteProjectFromLibrary,
-  exportProjectJson,
+  exportProjectFile,
   formatProjectDate,
   getActiveProjectId,
   getAutosaveIntervalMinutes,
   getSavedProject,
-  importProjectJson,
+  getStorageEstimate,
+  importProjectFile,
+  initializeProjectLibrary,
   listSavedProjects,
-  migrateLegacyProjectStorage,
   saveProjectToLibrary,
   setActiveProjectId,
   setAutosaveIntervalMinutes,
+  type DirtyState,
 } from '../project/projectLibrary';
-import { UndoStack, cloneProject } from '../project/undoStack';
+import { HistoryManager } from '../project/history/HistoryManager';
 import {
   AVATAR_UNIT_TO_WORLD,
   avatarStatusLabel,
@@ -108,6 +112,7 @@ export class StudioApp {
   private board: HTMLElement;
   private wiresSvg: SVGSVGElement;
   private toolbar: HTMLElement;
+  private studioBody: HTMLElement;
   private inspector: HTMLElement;
   private editors = new Map<string, PatternEditor>();
   private meshPreviews = new Map<string, MeshPreview>();
@@ -133,11 +138,17 @@ export class StudioApp {
     origH: number;
   } | null = null;
   private raf = 0;
+  /** Bumped on each board remount so in-flight initGpuAndSims cannot register stale runtimes. */
+  private gpuInitGeneration = 0;
   private modalRoot: HTMLElement;
   private importFileInput: HTMLInputElement;
   private avatarLoadAbort: AbortController | null = null;
-  private undoStack = new UndoStack();
+  private undoStack = new HistoryManager();
   private autosaveTimer: ReturnType<typeof setInterval> | null = null;
+  private persistDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private dirty: DirtyState = createDirtyState(true);
+  private saveInFlight = false;
+  private saveQueued = false;
   private restoringUndo = false;
   private expandedNodeId: string | null = null;
   private expandPlaceholder: HTMLElement | null = null;
@@ -146,8 +157,8 @@ export class StudioApp {
   private imageFileInput: HTMLInputElement;
   private resizeShiftKey = false;
 
-  constructor(root: HTMLElement) {
-    this.project = this.loadOrDefault();
+  private constructor(root: HTMLElement) {
+    this.project = ensureVisibleConnections(createDefaultProject());
     root.innerHTML = `
       <div class="studio">
         <header class="studio-toolbar" id="toolbar"></header>
@@ -160,11 +171,12 @@ export class StudioApp {
         </div>
         <div class="studio-status" id="status"></div>
         <div class="studio-modal-root" id="modalRoot" hidden></div>
-        <input type="file" id="importFile" accept="application/json,.json" hidden />
+        <input type="file" id="importFile" accept="application/json,.json,.patterncanvas,application/zip" hidden />
         <input type="file" id="imageFile" accept="image/*" multiple hidden />
       </div>
     `;
     this.toolbar = root.querySelector('#toolbar')!;
+    this.studioBody = root.querySelector('.studio-body')!;
     this.board = root.querySelector('#board')!;
     this.wiresSvg = root.querySelector('#wires')!;
     this.inspector = root.querySelector('#inspector')!;
@@ -177,31 +189,75 @@ export class StudioApp {
     this.bindBoardPan();
     this.bindUndoHotkey();
     this.bindImagePasteAndDrop();
-    this.restartAutosave();
-    this.renderAll();
-    void this.initGpuAndSims();
     window.addEventListener('resize', () => this.drawWires());
   }
 
-  private loadOrDefault(): ProjectDocument {
-    migrateLegacyProjectStorage();
+  static async create(root: HTMLElement): Promise<StudioApp> {
+    const app = new StudioApp(root);
+    app.setStatus('Loading projects…');
     try {
-      const activeId = getActiveProjectId();
+      await initializeProjectLibrary();
+      app.project = app.prepareLoadedProject(await app.loadInitialProject());
+      app.syncProjectNameInput();
+      app.restartAutosave();
+      app.renderAll();
+      void app.initGpuAndSims();
+      void app.refreshStorageStatus();
+    } catch (err) {
+      console.warn('Project library init failed:', err);
+      app.setStatus('Could not load saved projects — using new project');
+      app.renderAll();
+      void app.initGpuAndSims();
+    }
+    return app;
+  }
+
+  private async loadInitialProject(): Promise<ProjectDocument> {
+    try {
+      const activeId = await getActiveProjectId();
       if (activeId) {
-        const project = getSavedProject(activeId);
-        if (project) return this.prepareLoadedProject(project);
+        const project = await getSavedProject(activeId);
+        if (project) return project;
       }
-      const saved = listSavedProjects();
+      const saved = await listSavedProjects();
       if (saved[0]) {
-        setActiveProjectId(saved[0].id);
-        return this.prepareLoadedProject(saved[0].data);
+        await setActiveProjectId(saved[0].id);
+        const project = await getSavedProject(saved[0].id);
+        if (project) return project;
       }
     } catch {
       /* ignore */
     }
     const project = ensureVisibleConnections(createDefaultProject());
-    saveProjectToLibrary(project);
+    const { write } = await saveProjectToLibrary(project, createDirtyState(true));
+    if (!write.ok) {
+      console.warn('Initial project save failed:', write.error);
+    }
     return project;
+  }
+
+  private async refreshStorageStatus(): Promise<void> {
+    const est = await getStorageEstimate();
+    if (est.usage != null && est.quota != null) {
+      const mb = (n: number) => (n / (1024 * 1024)).toFixed(1);
+      this.setStatus(`Ready · storage ${mb(est.usage)} / ${mb(est.quota)} MB`);
+    }
+  }
+
+  private markDirty(all = true): void {
+    if (all) {
+      this.dirty = createDirtyState(true);
+    } else {
+      this.dirty.manifest = true;
+    }
+    this.scheduleDebouncedPersist();
+  }
+
+  private scheduleDebouncedPersist(): void {
+    if (this.persistDebounceTimer) clearTimeout(this.persistDebounceTimer);
+    this.persistDebounceTimer = setTimeout(() => {
+      void this.persistLocal({ quiet: true });
+    }, 750);
   }
 
   private prepareLoadedProject(project: ProjectDocument): ProjectDocument {
@@ -214,62 +270,230 @@ export class StudioApp {
     return ensureVisibleConnections(project);
   }
 
-  private persistLocal(quiet = false): void {
+  private async persistLocal(opts: { quiet?: boolean; label?: string; forceFull?: boolean } = {}): Promise<void> {
+    if (this.saveInFlight) {
+      this.saveQueued = true;
+      return;
+    }
+    this.saveInFlight = true;
     this.persistSimStates();
-    saveProjectToLibrary(this.project);
-    if (!quiet) this.setStatus(`Saved “${this.project.name}”`);
+    const dirty =
+      opts.forceFull || !opts.quiet ? createDirtyState(true) : this.dirty;
+    this.dirty = createDirtyState(false);
+    try {
+      const { write } = await saveProjectToLibrary(this.project, dirty);
+      const label = opts.label ?? 'Saved';
+      if (!write.ok) {
+        this.dirty.manifest = true;
+        this.setStatus(write.error ?? 'Local save failed — export your project');
+        return;
+      }
+      if (!opts.quiet) {
+        this.setStatus(`${label} “${this.project.name}”`);
+      }
+    } finally {
+      this.saveInFlight = false;
+      if (this.saveQueued) {
+        this.saveQueued = false;
+        void this.persistLocal(opts);
+      }
+    }
   }
 
   /** Snapshot current project before a user edit (max 15 levels). */
   private pushUndo(): void {
     if (this.restoringUndo) return;
     this.persistSimStates();
-    this.undoStack.push(cloneProject(this.project));
+    this.undoStack.push(this.project);
     this.updateHistoryButtons();
   }
 
   private performUndo(): void {
     if (!this.undoStack.canUndo) return;
-    this.persistSimStates();
-    const prev = this.undoStack.undo(cloneProject(this.project));
+    this.snapshotProjectForHistory();
+    const prev = this.undoStack.undo(this.project);
     this.updateHistoryButtons();
     if (!prev) return;
-    this.restoreHistoryProject(prev, `Undo (${this.undoStack.size} left)`);
+    this.markDirty(true);
+    void this.restoreHistoryProject(prev, `Undo (${this.undoStack.size} left)`);
   }
 
   private performRedo(): void {
     if (!this.undoStack.canRedo) return;
-    this.persistSimStates();
-    const next = this.undoStack.redo(cloneProject(this.project));
+    this.snapshotProjectForHistory();
+    const next = this.undoStack.redo(this.project);
     this.updateHistoryButtons();
     if (!next) return;
-    this.restoreHistoryProject(next, `Redo (${this.undoStack.redoSize} left)`);
+    this.markDirty(true);
+    void this.restoreHistoryProject(next, `Redo (${this.undoStack.redoSize} left)`);
   }
 
-  private restoreHistoryProject(project: ProjectDocument, status: string): void {
+  private async restoreHistoryProject(project: ProjectDocument, status: string): Promise<void> {
     const expandedId = this.expandedNodeId;
+    const prevSelectedNodeId = this.selectedNodeId;
+    const prevTransformPieceId = this.transformInspectorPieceId;
+    const needsRemount =
+      this.canvasRuntimeSignature(this.project) !== this.canvasRuntimeSignature(project);
     this.restoringUndo = true;
     try {
       this.project = this.prepareLoadedProject(project);
-      setActiveProjectId(this.project.id);
-      this.selectedNodeId = null;
-      this.transformInspectorPieceId = null;
-      this.teardownSims();
+      void setActiveProjectId(this.project.id);
+      this.selectedNodeId =
+        prevSelectedNodeId &&
+        this.project.canvas.nodes.some((n) => n.id === prevSelectedNodeId)
+          ? prevSelectedNodeId
+          : null;
+      this.transformInspectorPieceId = prevTransformPieceId;
       this.syncProjectNameInput();
-      this.renderAll();
-      // Undo remounts the board (which collapses fullscreen). Re-open if still valid,
-      // and never dismiss an open studio modal (modalRoot is outside the board).
-      if (
-        expandedId &&
-        this.project.canvas.nodes.some((n) => n.id === expandedId)
-      ) {
-        this.openNodeFullscreen(expandedId);
+
+      if (needsRemount) {
+        this.renderAll();
+        if (
+          expandedId &&
+          this.project.canvas.nodes.some((n) => n.id === expandedId)
+        ) {
+          this.openNodeFullscreen(expandedId);
+        }
+        await this.initGpuAndSims();
+      } else {
+        await this.syncLiveRuntimesFromProject();
+        if (this.hasMissingViewportRuntimes()) {
+          await this.initGpuAndSims();
+        }
       }
-      void this.initGpuAndSims();
+
+      this.restoreTransformInspectorSelection();
+      this.renderInspector();
       this.setStatus(status);
     } finally {
       this.restoringUndo = false;
     }
+  }
+
+  /** True when undo/redo can update live viewports without remounting the canvas board. */
+  private canvasRuntimeSignature(project: ProjectDocument): string {
+    const nodes = [...project.canvas.nodes]
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .map((n) => {
+        switch (n.type) {
+          case 'patternFrame':
+            return `${n.id}:pattern:${n.patternId}`;
+          case 'meshFrame':
+            return `${n.id}:mesh:${n.meshId}`;
+          case 'transform3d':
+            return `${n.id}:transform:${n.transformId}`;
+          case 'simViewport':
+            return `${n.id}:sim:${n.simId}`;
+          case 'image':
+            return `${n.id}:image:${n.assetId ?? ''}`;
+          case 'text':
+            return `${n.id}:text`;
+        }
+      })
+      .join('|');
+    return [
+      nodes,
+      project.patterns.map((p) => p.id).sort().join(','),
+      project.meshes.map((m) => m.id).sort().join(','),
+      project.transforms.map((t) => t.id).sort().join(','),
+      project.sims.map((s) => s.id).sort().join(','),
+    ].join(';;');
+  }
+
+  private async syncLiveRuntimesFromProject(): Promise<void> {
+    for (const node of this.project.canvas.nodes) {
+      if (node.type === 'patternFrame') {
+        const pattern = this.project.patterns.find((p) => p.id === node.patternId);
+        const editor = this.editors.get(node.id);
+        if (pattern && editor) editor.setPattern(pattern);
+        continue;
+      }
+      if (node.type === 'meshFrame') {
+        const mesh = this.project.meshes.find((m) => m.id === node.meshId);
+        const preview = this.meshPreviews.get(node.id);
+        if (mesh && preview) {
+          preview.setMesh(mesh, this.project.patterns.find((p) => p.id === mesh.patternId) ?? null);
+        }
+        continue;
+      }
+      if (node.type === 'image') {
+        const el = this.findNodeEl(node.id);
+        const img = el?.querySelector('img') as HTMLImageElement | null;
+        if (img && node.src && img.src !== node.src) img.src = node.src;
+        continue;
+      }
+      if (node.type === 'text') {
+        const el = this.findNodeEl(node.id);
+        const ta = el?.querySelector('textarea') as HTMLTextAreaElement | null;
+        if (ta && ta.value !== node.text) ta.value = node.text;
+      }
+    }
+
+    for (const transform of this.project.transforms) {
+      const rt = this.transformRuntimes.get(transform.id);
+      if (!rt) continue;
+      rt.syncFromDocument(transform);
+      rt.applyCamera(transform);
+      rt.rebuildCloth(
+        this.meshGeometryForTransform(transform.id),
+        transform.pose,
+        transform.pieceTransforms,
+        this.patternForTransform(transform.id)
+      );
+    }
+
+    syncDefaultCameraFromDrapeA(this.project);
+    const defaults = getDefaultSimCamera(this.project);
+    for (const sim of this.project.sims) {
+      const rt = this.simRuntimes.get(sim.id);
+      if (!rt) continue;
+      rt.syncFromDocument(sim);
+      rt.setDefaultCamera(defaults);
+      rt.applyCamera(sim);
+      this.rebuildConnectedSim(sim.id, false);
+    }
+
+    this.ensureRenderLoop();
+    this.layoutNodes();
+    this.drawWires();
+    if (this.expandedNodeId) {
+      this.notifyNodeViewportResize(this.expandedNodeId);
+    }
+  }
+
+  private hasMissingViewportRuntimes(): boolean {
+    for (const node of this.project.canvas.nodes) {
+      if (node.type === 'transform3d') {
+        if (!this.transformRuntimes.has(node.transformId)) return true;
+      } else if (node.type === 'simViewport') {
+        if (!this.simRuntimes.has(node.simId)) return true;
+      }
+    }
+    return false;
+  }
+
+  private ensureRenderLoop(): void {
+    if (this.raf) return;
+    const loop = () => {
+      this.tick();
+      this.raf = requestAnimationFrame(loop);
+    };
+    this.raf = requestAnimationFrame(loop);
+  }
+
+  private restoreTransformInspectorSelection(): void {
+    if (!this.transformInspectorPieceId) return;
+    const node = this.project.canvas.nodes.find((n) => n.id === this.selectedNodeId);
+    if (node?.type !== 'transform3d') return;
+    const rt = this.transformRuntimes.get(node.transformId);
+    if (!rt) return;
+    const pieceIds = rt.getPieceIds();
+    if (!pieceIds.includes(this.transformInspectorPieceId)) {
+      this.transformInspectorPieceId = null;
+      return;
+    }
+    rt.setSelectedPieceId(this.transformInspectorPieceId);
+    this.renderInspector();
   }
 
   private updateHistoryButtons(): void {
@@ -464,7 +688,8 @@ export class StudioApp {
     this.layoutNodes();
     this.drawWires();
     this.renderInspector();
-    this.persistLocal();
+    this.markDirty(true);
+    void this.persistLocal();
     this.setStatus(
       images.length === 1 ? 'Image reference placed on canvas' : `${images.length} image references placed`
     );
@@ -478,17 +703,15 @@ export class StudioApp {
     const minutes = getAutosaveIntervalMinutes();
     if (minutes <= 0) return;
     this.autosaveTimer = setInterval(
-      () => {
-        this.persistLocal(true);
-        this.setStatus(`Auto-saved “${this.project.name}”`);
-      },
+      () => this.persistLocal({ label: 'Auto-saved' }),
       minutes * 60 * 1000
     );
   }
 
   private switchToProject(project: ProjectDocument, opts: { resetUndo?: boolean } = {}): void {
     this.project = this.prepareLoadedProject(project);
-    setActiveProjectId(project.id);
+    void setActiveProjectId(project.id);
+    this.markDirty(true);
     this.selectedNodeId = null;
     this.transformInspectorPieceId = null;
     if (opts.resetUndo !== false) {
@@ -510,19 +733,21 @@ export class StudioApp {
     this.importFileInput.addEventListener('change', (e) => {
       const file = (e.target as HTMLInputElement).files?.[0];
       if (!file) return;
-      const reader = new FileReader();
-      reader.onload = () => {
+      void (async () => {
         try {
-          const project = importProjectJson(String(reader.result));
-          saveProjectToLibrary(project);
+          const project = await importProjectFile(file);
+          const { write } = await saveProjectToLibrary(project, createDirtyState(true));
           this.switchToProject(project);
-          this.setStatus(`Imported “${project.name}”`);
+          if (!write.ok) {
+            this.setStatus(write.error ?? 'Import loaded, but local save failed');
+          } else {
+            this.setStatus(`Imported “${project.name}”`);
+          }
           this.closeModal();
         } catch (err) {
           alert(`Import failed: ${err}`);
         }
-      };
-      reader.readAsText(file);
+      })();
       (e.target as HTMLInputElement).value = '';
     });
   }
@@ -569,15 +794,21 @@ export class StudioApp {
   }
 
   private startNewProject(): void {
-    const project = ensureVisibleConnections(createDefaultProject());
-    saveProjectToLibrary(project);
-    this.switchToProject(project);
-    this.setStatus('New project started');
+    void (async () => {
+      const project = ensureVisibleConnections(createDefaultProject());
+      const { write } = await saveProjectToLibrary(project, createDirtyState(true));
+      this.switchToProject(project);
+      if (!write.ok) {
+        this.setStatus(write.error ?? 'New project started, but local save failed');
+      } else {
+        this.setStatus('New project started');
+      }
+    })();
   }
 
   private openProjectsModal(): void {
     this.modalRoot.hidden = false;
-    this.renderProjectsModal();
+    void this.renderProjectsModal();
   }
 
   private openAvatarModal(): void {
@@ -804,8 +1035,13 @@ export class StudioApp {
     }
   }
 
-  private renderProjectsModal(): void {
-    const projects = listSavedProjects();
+  private async renderProjectsModal(): Promise<void> {
+    const projects = await listSavedProjects();
+    const est = await getStorageEstimate();
+    const storageHint =
+      est.usage != null && est.quota != null
+        ? ` · ${(est.usage / (1024 * 1024)).toFixed(1)} / ${(est.quota / (1024 * 1024)).toFixed(1)} MB used`
+        : '';
     const rows =
       projects.length === 0
         ? `<p class="muted studio-modal-empty">No saved projects yet.</p>`
@@ -835,10 +1071,11 @@ export class StudioApp {
             <h2 id="projectsTitle">Projects</h2>
             <button type="button" class="studio-modal-close" data-modal-close aria-label="Close">×</button>
           </div>
-          <p class="muted">Current: <strong>${this.escapeHtml(this.project.name)}</strong></p>
+          <p class="muted">Current: <strong>${this.escapeHtml(this.project.name)}</strong>${storageHint}</p>
           <div class="studio-modal-toolbar">
             <button type="button" class="primary" data-projects-act="save">Save current</button>
-            <button type="button" data-projects-act="import">Import JSON</button>
+            <button type="button" data-projects-act="import">Import</button>
+            <button type="button" data-projects-act="export-archive">Export archive</button>
             <label class="autosave-field">
               Auto-save every
               <input type="number" id="autosaveMinutes" min="0" max="120" step="1" value="${getAutosaveIntervalMinutes()}" />
@@ -858,11 +1095,13 @@ export class StudioApp {
       this.closeModal();
     });
     this.modalRoot.querySelector('[data-projects-act="save"]')?.addEventListener('click', () => {
-      this.persistLocal();
-      this.renderProjectsModal();
+      void this.persistLocal({ forceFull: true }).then(() => this.renderProjectsModal());
     });
     this.modalRoot.querySelector('[data-projects-act="import"]')?.addEventListener('click', () => {
       this.importFileInput.click();
+    });
+    this.modalRoot.querySelector('[data-projects-act="export-archive"]')?.addEventListener('click', () => {
+      void exportProjectFile(this.project, true);
     });
     this.modalRoot.querySelector('#autosaveMinutes')?.addEventListener('change', (e) => {
       const input = e.target as HTMLInputElement;
@@ -884,40 +1123,47 @@ export class StudioApp {
         e.stopPropagation();
         const id = (row as HTMLElement).dataset.projectId!;
         const act = btn.dataset.projectAct!;
-        if (act === 'load') {
-          const project = getSavedProject(id);
-          if (project) {
-            this.switchToProject(project);
-            this.setStatus(`Loaded “${project.name}”`);
-            this.closeModal();
+        void (async () => {
+          if (act === 'load') {
+            const project = await getSavedProject(id);
+            if (project) {
+              this.switchToProject(project);
+              this.setStatus(`Loaded “${project.name}”`);
+              this.closeModal();
+            }
+          } else if (act === 'export') {
+            const record = projects.find((p) => p.id === id);
+            if (!record) return;
+            if (id === this.project.id) this.persistSimStates();
+            if (id === this.project.id) {
+              await exportProjectFile(this.project, true);
+            } else {
+              const loaded = await getSavedProject(id);
+              if (loaded) await exportProjectFile(loaded, true);
+            }
+          } else if (act === 'delete') {
+            const record = projects.find((p) => p.id === id);
+            if (!record) return;
+            if (!confirm(`Delete “${record.name}”? This cannot be undone.`)) return;
+            const wasActive = id === this.project.id;
+            await deleteProjectFromLibrary(id);
+            if (wasActive) {
+              const nextId = await getActiveProjectId();
+              const next =
+                (nextId ? await getSavedProject(nextId) : null) ??
+                ensureVisibleConnections(createDefaultProject());
+              if (!(await getSavedProject(next.id))) {
+                await saveProjectToLibrary(next, createDirtyState(true));
+              }
+              this.switchToProject(next);
+              this.setStatus(`Deleted “${record.name}”`);
+              this.closeModal();
+            } else {
+              void this.renderProjectsModal();
+              this.setStatus(`Deleted “${record.name}”`);
+            }
           }
-        } else if (act === 'export') {
-          const record = projects.find((p) => p.id === id);
-          if (!record) return;
-          if (id === this.project.id) this.persistSimStates();
-          const data =
-            id === this.project.id ? exportProjectJson(this.project) : exportProjectJson(record.data);
-          this.downloadJson(data, `${record.name.replace(/\s+/g, '_') || 'project'}.patterncanvas.json`);
-        } else if (act === 'delete') {
-          const record = projects.find((p) => p.id === id);
-          if (!record) return;
-          if (!confirm(`Delete “${record.name}”? This cannot be undone.`)) return;
-          const wasActive = id === this.project.id;
-          deleteProjectFromLibrary(id);
-          if (wasActive) {
-            const nextId = getActiveProjectId();
-            const next =
-              (nextId ? getSavedProject(nextId) : null) ??
-              ensureVisibleConnections(createDefaultProject());
-            if (!getSavedProject(next.id)) saveProjectToLibrary(next);
-            this.switchToProject(next);
-            this.setStatus(`Deleted “${record.name}”`);
-            this.closeModal();
-          } else {
-            this.renderProjectsModal();
-            this.setStatus(`Deleted “${record.name}”`);
-          }
-        }
+        })();
       });
     });
   }
@@ -1106,11 +1352,16 @@ export class StudioApp {
     const wrap = document.getElementById('boardWrap')!;
     wrap.addEventListener('pointerdown', (e) => {
       if ((e.target as HTMLElement).closest('.canvas-node')) return;
-      if (e.button === 1 || e.button === 0 && e.altKey) {
+      if (e.button === 1 || (e.button === 0 && e.altKey)) {
         this.panning = true;
         this.panLast = { x: e.clientX, y: e.clientY };
         wrap.setPointerCapture(e.pointerId);
+        e.preventDefault();
       }
+    });
+    // Suppress browser middle-click autoscroll affordance on the board.
+    wrap.addEventListener('auxclick', (e) => {
+      if (e.button === 1) e.preventDefault();
     });
     wrap.addEventListener('pointermove', (e) => {
       if (this.wireDrag) {
@@ -1169,7 +1420,6 @@ export class StudioApp {
     wrap.addEventListener(
       'wheel',
       (e) => {
-        if (!(e.metaKey || e.ctrlKey)) return;
         e.preventDefault();
         const factor = e.deltaY > 0 ? 0.9 : 1.1;
         const oldZoom = this.project.canvas.zoom;
@@ -1198,6 +1448,7 @@ export class StudioApp {
   }
 
   private renderAll(): void {
+    this.gpuInitGeneration++;
     this.closeNodeFullscreen();
     this.teardownSims();
     this.board.innerHTML = '';
@@ -1291,6 +1542,7 @@ export class StudioApp {
     this.expandPlaceholder = placeholder;
     this.expandOverlay = overlay;
     this.selectedNodeId = nodeId;
+    this.dockInspectorToFullscreen();
     this.syncFullscreenTabs(el, nodeId);
     this.layoutNodes();
     this.renderInspector();
@@ -1317,6 +1569,9 @@ export class StudioApp {
       `[data-node-id="${nodeId}"]`
     ) as HTMLElement | null;
     const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
+
+    // Pull inspector out before moving the node back onto the board.
+    this.undockInspectorFromFullscreen();
 
     if (el && node) {
       el.classList.remove('is-expanded');
@@ -1345,6 +1600,45 @@ export class StudioApp {
     requestAnimationFrame(() => this.notifyNodeViewportResize(nodeId));
   }
 
+  /** Dock inspector inside the expanded modal, under chrome, beside the viewport. */
+  private dockInspectorToFullscreen(): void {
+    if (!this.expandOverlay || !this.expandedNodeId) return;
+    const nodeEl = this.expandOverlay.querySelector(
+      `[data-node-id="${this.expandedNodeId}"]`
+    ) as HTMLElement | null;
+    if (!nodeEl) return;
+
+    let main = nodeEl.querySelector(':scope > .node-expand-main') as HTMLElement | null;
+    if (!main) {
+      const body = nodeEl.querySelector(':scope > .node-body') as HTMLElement | null;
+      if (!body) return;
+      main = document.createElement('div');
+      main.className = 'node-expand-main';
+      body.replaceWith(main);
+      main.appendChild(body);
+    }
+
+    this.inspector.classList.add('is-fullscreen-docked');
+    main.appendChild(this.inspector);
+  }
+
+  /** Restore the inspector to the studio body and unwrap the expand layout. */
+  private undockInspectorFromFullscreen(): void {
+    this.inspector.classList.remove('is-fullscreen-docked');
+    const main = this.inspector.parentElement;
+    if (main?.classList.contains('node-expand-main')) {
+      const nodeEl = main.parentElement;
+      const body = main.querySelector(':scope > .node-body');
+      if (nodeEl && body) {
+        nodeEl.insertBefore(body, main);
+        main.remove();
+      }
+    }
+    if (this.inspector.parentElement !== this.studioBody) {
+      this.studioBody.appendChild(this.inspector);
+    }
+  }
+
   private switchFullscreenNode(nextId: string): void {
     if (!this.expandOverlay || !this.expandPlaceholder || !this.expandedNodeId) return;
     if (nextId === this.expandedNodeId) return;
@@ -1357,6 +1651,8 @@ export class StudioApp {
     const prevNode = this.project.canvas.nodes.find((n) => n.id === prevId);
     const nextNode = this.project.canvas.nodes.find((n) => n.id === nextId);
     if (!prevEl || !nextEl || !prevNode || !nextNode) return;
+
+    this.undockInspectorFromFullscreen();
 
     // Restore previous node onto the board where the placeholder was
     prevEl.classList.remove('is-expanded');
@@ -1390,9 +1686,9 @@ export class StudioApp {
     nextEl.style.zIndex = '';
     this.setExpandButtonMode(nextEl, true);
     this.expandOverlay.appendChild(nextEl);
-
     this.expandedNodeId = nextId;
     this.selectedNodeId = nextId;
+    this.dockInspectorToFullscreen();
     this.syncFullscreenTabs(nextEl, nextId);
     this.layoutNodes();
     this.renderInspector();
@@ -1563,6 +1859,8 @@ export class StudioApp {
       this.simRuntimes.get(node.simId)?.resize();
     } else if (node.type === 'transform3d') {
       this.transformRuntimes.get(node.transformId)?.resize();
+    } else if (node.type === 'patternFrame') {
+      this.editors.get(node.id)?.relayoutChrome();
     }
   }
 
@@ -1693,11 +1991,9 @@ export class StudioApp {
       const previewHost = document.createElement('div');
       previewHost.className = 'mesh-host';
       body.appendChild(previewHost);
-      if (!mesh.geometry) {
-        const pattern = this.project.patterns.find((p) => p.id === mesh.patternId);
-        remeshDocument(mesh, pattern);
-      }
-      const preview = new MeshPreview(previewHost, mesh, this.project.displayUnit);
+      const pattern = this.project.patterns.find((p) => p.id === mesh.patternId);
+      if (!mesh.geometry) remeshDocument(mesh, pattern);
+      const preview = new MeshPreview(previewHost, mesh, this.project.displayUnit, pattern ?? null);
       this.meshPreviews.set(node.id, preview);
     } else if (node.type === 'simViewport') {
       const sim = this.project.sims.find((s) => s.id === node.simId)!;
@@ -1824,17 +2120,23 @@ export class StudioApp {
   }
 
   private async initGpuAndSims(): Promise<void> {
+    const generation = this.gpuInitGeneration;
+    const stillCurrent = (): boolean => generation === this.gpuInitGeneration;
+
     try {
       if (!this.device) {
         const gpu = await createSharedGpu();
+        if (!stillCurrent()) return;
         this.device = gpu.device;
       }
     } catch (err) {
+      if (!stillCurrent()) return;
       this.setStatus(`WebGPU unavailable: ${err}`);
       return;
     }
 
     for (const node of this.project.canvas.nodes) {
+      if (!stillCurrent()) return;
       if (node.type !== 'simViewport') continue;
       const el = this.findNodeEl(node.id) as (HTMLElement & {
         _simCanvas?: HTMLCanvasElement;
@@ -1843,7 +2145,13 @@ export class StudioApp {
       const canvas = el?._simCanvas;
       const host = el?._simHost ?? el ?? null;
       const sim = this.project.sims.find((s) => s.id === node.simId);
-      if (!el || !canvas || !host || !sim || this.simRuntimes.has(sim.id)) continue;
+      if (!el || !canvas || !host || !sim) continue;
+
+      const existingSim = this.simRuntimes.get(sim.id);
+      if (existingSim) {
+        existingSim.cloth?.destroy();
+        this.simRuntimes.delete(sim.id);
+      }
 
       const runtime = new SimViewportRuntime(
         sim.id,
@@ -1854,6 +2162,10 @@ export class StudioApp {
         getDefaultSimCamera(this.project)
       );
       await runtime.initRenderer();
+      if (!stillCurrent()) {
+        runtime.cloth?.destroy();
+        return;
+      }
       runtime.rebuildCloth(
         this.meshGeometryForSim(sim.id),
         sim.params,
@@ -1864,6 +2176,7 @@ export class StudioApp {
     }
 
     for (const node of this.project.canvas.nodes) {
+      if (!stillCurrent()) return;
       if (node.type !== 'transform3d') continue;
       const el = this.findNodeEl(node.id) as (HTMLElement & {
         _transformCanvas?: HTMLCanvasElement;
@@ -1872,7 +2185,13 @@ export class StudioApp {
       const canvas = el?._transformCanvas;
       const host = el?._transformHost ?? el ?? null;
       const transform = this.project.transforms.find((t) => t.id === node.transformId);
-      if (!el || !canvas || !host || !transform || this.transformRuntimes.has(transform.id)) continue;
+      if (!el || !canvas || !host || !transform) continue;
+
+      const existingTransform = this.transformRuntimes.get(transform.id);
+      if (existingTransform) {
+        existingTransform.cloth?.destroy();
+        this.transformRuntimes.delete(transform.id);
+      }
 
       const runtime = new Transform3dRuntime(
         transform.id,
@@ -1884,6 +2203,7 @@ export class StudioApp {
         {
           onBeforePoseChange: () => this.pushUndo(),
           onPoseChange: () => {
+            if (this.restoringUndo) return;
             this.rebuildSimsFromTransform(transform.id);
             if (this.selectedNodeId === node.id) this.renderInspector();
           },
@@ -1894,6 +2214,10 @@ export class StudioApp {
         }
       );
       await runtime.initRenderer();
+      if (!stillCurrent()) {
+        runtime.cloth?.destroy();
+        return;
+      }
       runtime.rebuildCloth(
         this.meshGeometryForTransform(transform.id),
         transform.pose,
@@ -1902,6 +2226,8 @@ export class StudioApp {
       );
       this.transformRuntimes.set(transform.id, runtime);
     }
+
+    if (!stillCurrent()) return;
 
     cancelAnimationFrame(this.raf);
     const loop = () => {
@@ -1983,7 +2309,7 @@ export class StudioApp {
         // resetLayout snapshots undo via onBeforePoseChange
         rt.resetLayout();
         this.rebuildSimsFromTransform(transformId);
-        this.setStatus('Transform layout reset to default flat arrangement');
+        this.setStatus('Transform layout reset to default arrangement (-90° X)');
         break;
       case 'rebuild':
         this.pushUndo();
@@ -2066,7 +2392,7 @@ export class StudioApp {
     for (const [nodeId, preview] of this.meshPreviews) {
       const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
       if (node?.type === 'meshFrame' && node.meshId === meshId) {
-        preview.setMesh(mesh);
+        preview.setMesh(mesh, pattern ?? null);
       }
     }
     this.setStatus(`Remeshed ${mesh.name}`);
@@ -2088,8 +2414,15 @@ export class StudioApp {
   }
 
   private invalidateMeshesForPattern(patternId: string): void {
+    const pattern = this.project.patterns.find((p) => p.id === patternId);
     for (const mesh of this.project.meshes) {
       if (mesh.patternId === patternId) mesh.geometry = null;
+    }
+    for (const [nodeId, preview] of this.meshPreviews) {
+      const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
+      if (node?.type !== 'meshFrame') continue;
+      const mesh = this.project.meshes.find((m) => m.id === node.meshId);
+      if (mesh?.patternId === patternId) preview.setMesh(mesh, pattern ?? null);
     }
   }
 
@@ -2110,6 +2443,19 @@ export class StudioApp {
       rt.captureCamera(transform);
       rt.persistArrangement();
     }
+  }
+
+  /** Sync live sim/transform state into the project before recording undo/redo. */
+  private snapshotProjectForHistory(): void {
+    this.persistTransformStates();
+    for (const sim of this.project.sims) {
+      const rt = this.simRuntimes.get(sim.id);
+      if (!rt?.cloth) continue;
+      rt.captureCamera(sim);
+      sim.pose = rt.cloth.exportPose();
+      sim.dropped = true;
+    }
+    syncDefaultCameraFromDrapeA(this.project);
   }
 
   private persistSimStates(): void {
@@ -2322,7 +2668,9 @@ export class StudioApp {
           remeshDocument(mesh, pattern);
           for (const [nodeId, preview] of this.meshPreviews) {
             const node = this.project.canvas.nodes.find((candidate) => candidate.id === nodeId);
-            if (node?.type === 'meshFrame' && node.meshId === mesh.id) preview.setMesh(mesh);
+            if (node?.type === 'meshFrame' && node.meshId === mesh.id) {
+              preview.setMesh(mesh, pattern);
+            }
           }
           for (const assignment of this.project.assignments) {
             if (assignment.meshId === mesh.id) this.rebuildConnectedSim(assignment.simId, true);
@@ -2515,7 +2863,7 @@ export class StudioApp {
     this.hideInspectorTip();
     const node = this.project.canvas.nodes.find((n) => n.id === this.selectedNodeId);
     if (!node) {
-      this.inspector.innerHTML = `<h3>Inspector</h3><p class="muted">Drag an output port to a compatible input to reconnect nodes. Alt-drag board to pan.<br/>Transform 3D: arrange pieces before draping — no simulation. Drag fabric to move · empty drag to orbit · Shift-drag to raise/lower orbit · Move/Rotate toggle · wheel zoom.<br/>Sim: drag fabric to move · Play to simulate drape.</p>`;
+      this.inspector.innerHTML = `<h3>Inspector</h3><p class="muted">Drag an output port to a compatible input to reconnect nodes. Middle-drag (or Alt-drag) board to pan · scroll wheel to zoom.<br/>Transform 3D: arrange pieces before draping — no simulation. Drag fabric to move · empty drag to orbit · Shift-drag to raise/lower orbit · Move/Rotate toggle · R = 90° local X · wheel zoom.<br/>Sim: drag fabric to move · Play to simulate drape.</p>`;
       return;
     }
 
@@ -2524,7 +2872,9 @@ export class StudioApp {
       const rt = this.transformRuntimes.get(transform.id);
       const mesh = this.meshForTransform(transform.id);
       const pattern = this.patternForTransform(transform.id);
-      const pieceIds = rt?.getPieceIds() ?? [];
+      const pieceIds =
+        rt?.getPieceIds() ??
+        Object.keys(transform.pieceTransforms ?? {});
       const selectedPiece =
         this.transformInspectorPieceId ??
         rt?.getSelectedPieceId() ??
@@ -2542,10 +2892,16 @@ export class StudioApp {
           (rt?.cloth
             ? {
                 position: rt.cloth.getPieceCentroidTuple(selectedPiece),
-                rotationDeg: [0, 0, 0] as [number, number, number],
+                rotationDeg: [...DEFAULT_TRANSFORM_PIECE_ROTATION_DEG],
               }
-            : { position: [0, 0, 0], rotationDeg: [0, 0, 0] }))
-        : { position: [0, 0, 0], rotationDeg: [0, 0, 0] };
+            : {
+                position: [0, 0, 0],
+                rotationDeg: [...DEFAULT_TRANSFORM_PIECE_ROTATION_DEG],
+              }))
+        : {
+            position: [0, 0, 0],
+            rotationDeg: [...DEFAULT_TRANSFORM_PIECE_ROTATION_DEG],
+          };
       const posCm = stored.position.map((v) => (v * WORLD_TO_CM).toFixed(2));
       const rot = stored.rotationDeg.map((v) => v.toFixed(1));
       this.inspector.innerHTML = `
@@ -2567,7 +2923,7 @@ export class StudioApp {
           <label>Y <input id="transformRotY" type="number" step="1" value="${rot[1]}" /></label>
           <label>Z <input id="transformRotZ" type="number" step="1" value="${rot[2]}" /></label>
         </fieldset>
-        <p class="muted">Pose ${transform.pose ? 'saved' : 'default flat layout'} · edits apply to selected piece</p>
+        <p class="muted">Pose ${transform.pose ? 'saved' : 'default (-90° X)'} · edits apply to selected piece</p>
         ${this.deleteButtonHtml()}
       `;
       this.inspector.querySelector('#transformName')?.addEventListener('change', (e) => {
@@ -2645,8 +3001,8 @@ export class StudioApp {
               <input id="pMaxStretch" type="range" min="1" max="1.5" step="0.01" value="${p.maxStretch ?? 1.12}" /></label>
             <label>${tip('Bend springs', 'Resistance to folding, as a fraction of Spring. Low = soft drapey folds; high locks panels flat and fights seams. Recommended: 10–40% (default 20%). Avoid 100% for garments.', `${bendPct}%`, 'vBendScale')}
               <input id="pBendScale" type="range" min="0" max="1" step="0.05" value="${p.bendSpringScale ?? 0.2}" /></label>
-            <label>${tip('Contact grip', 'Friction against the avatar / ground. Higher sticks and resists sliding; lower lets cloth glide. Recommended: 0.3–0.6 (default 0.45).', (p.contactFriction ?? 0.45).toFixed(2), 'vFriction')}
-              <input id="pFriction" type="range" min="0" max="1" step="0.05" value="${p.contactFriction ?? 0.45}" /></label>
+            <label>${tip('Contact grip', 'Friction against the avatar / ground. Higher sticks and resists sliding; lower lets cloth glide. Range 0–2 (default 0.45).', (p.contactFriction ?? 0.45).toFixed(2), 'vFriction')}
+              <input id="pFriction" type="range" min="0" max="2" step="0.05" value="${p.contactFriction ?? 0.45}" /></label>
             <label>${tip('Gravity', 'Downward acceleration scale for drape. Higher hangs heavier; lower floats. Recommended: 0.6–1.2 (default 0.8).', p.gravity.toFixed(2), 'vGrav')}
               <input id="pGrav" type="range" min="0" max="5" step="0.05" value="${p.gravity}" /></label>
           </div>
@@ -2667,6 +3023,12 @@ export class StudioApp {
           <div class="inspector-section">
             <h4 class="inspector-section-title">Fabric</h4>
             <p class="muted inspector-section-hint">How the cloth feels under XPBD constraints.</p>
+            <label>${tip('Stretch', 'Edge stretch resistance (maps to XPBD stretch stiffness). Lower = stretchier / silkier; higher = firmer woven cloth. Recommended: 800–1500 (default 1000).', String(Math.round(p.springConst)), 'vSpringGpu')}
+              <input id="pSpringGpu" type="range" min="100" max="5000" value="${p.springConst}" /></label>
+            <label>${tip('Mass', 'Total garment mass (split across particles). Heavier = more inertia and drape; lighter reacts faster. Recommended: 50–150 (default 100).', String(Math.round(p.mass)), 'vMassGpu')}
+              <input id="pMassGpu" type="range" min="10" max="300" value="${p.mass}" /></label>
+            <label>${tip('Contact grip', 'Friction against the avatar / ground. Higher sticks and resists sliding; lower lets cloth glide. Range 0–2 (default 0.45).', (p.contactFriction ?? 0.45).toFixed(2), 'vFrictionGpu')}
+              <input id="pFrictionGpu" type="range" min="0" max="2" step="0.05" value="${p.contactFriction ?? 0.45}" /></label>
             <label>${tip('LRA stretchiness', 'Long-range attachment / sew slack multiplier. Higher = looser seams and attachments; lower pulls tighter. Recommended: 1.1–1.4 (default 1.2).', (p.longRangeStretchiness ?? 1.2).toFixed(2), 'vLra')}
               <input id="pLra" type="range" min="1" max="2" step="0.05" value="${p.longRangeStretchiness ?? 1.2}" /></label>
             <label>${tip('Gravity', 'Downward acceleration scale for drape. Higher hangs heavier; lower floats. Recommended: 0.6–1.2 (default 0.8).', p.gravity.toFixed(2), 'vGravGpu')}
@@ -2679,6 +3041,8 @@ export class StudioApp {
               <input id="pSubsteps" type="range" min="2" max="32" value="${p.substeps ?? 8}" /></label>
             <label>${tip('Iterations', 'Constraint solver passes per substep. More = harder stretch/seams, costlier. Recommended: 2–8 (default 4).', String(p.constraintIterations ?? 4), 'vIters')}
               <input id="pIters" type="range" min="1" max="16" value="${p.constraintIterations ?? 4}" /></label>
+            <label>${tip('Max speed', 'Clamp particle travel/speed each substep. Lower reduces slam-through during sew wrap; raise if drape feels sluggish. Recommended: 8–20 (default 30). While seams close, wrap is further capped near 10.', String(Math.round(p.maxSpeed ?? 30)), 'vMaxSpeedGpu')}
+              <input id="pMaxSpeedGpu" type="range" min="4" max="40" step="1" value="${p.maxSpeed ?? 30}" /></label>
             <label class="inspector-check">${tip('Self-collision', 'Cloth–cloth contact via spatial hash. Prevents self-intersection; expensive. Leave off for simple drapes; on for layered or bunched garments.', p.enableSelfCollision ? 'On' : 'Off', 'vSelfCol')}
               <input id="pSelfCol" type="checkbox" ${p.enableSelfCollision ? 'checked' : ''} /></label>
           </div>
@@ -2692,11 +3056,14 @@ export class StudioApp {
       };
       const syncParamValues = () => {
         setValue('vSpring', String(Math.round(p.springConst)));
+        setValue('vSpringGpu', String(Math.round(p.springConst)));
         setValue('vDamp', p.dampingConst.toFixed(1));
         setValue('vMass', String(Math.round(p.mass)));
+        setValue('vMassGpu', String(Math.round(p.mass)));
         setValue('vMaxStretch', `${(((p.maxStretch ?? 1.12) * 100) - 100).toFixed(0)}%`);
         setValue('vBendScale', `${(((p.bendSpringScale ?? 0.2) * 100)).toFixed(0)}%`);
         setValue('vFriction', (p.contactFriction ?? 0.45).toFixed(2));
+        setValue('vFrictionGpu', (p.contactFriction ?? 0.45).toFixed(2));
         setValue('vGrav', p.gravity.toFixed(2));
         setValue('vGravGpu', p.gravity.toFixed(2));
         setValue('vCpuSubsteps', String(p.substeps ?? 24));
@@ -2706,6 +3073,7 @@ export class StudioApp {
         setValue('vLra', (p.longRangeStretchiness ?? 1.2).toFixed(2));
         setValue('vSubsteps', String(p.substeps ?? 8));
         setValue('vIters', String(p.constraintIterations ?? 4));
+        setValue('vMaxSpeedGpu', String(Math.round(p.maxSpeed ?? 30)));
         setValue('vSelfCol', p.enableSelfCollision ? 'On' : 'Off');
       };
       const bind = (id: string, fn: (v: number) => void) => {
@@ -2739,6 +3107,17 @@ export class StudioApp {
         const rt = this.simRuntimes.get(sim.id);
         if (rt?.cloth) sim.pose = rt.cloth.exportPose();
         p.engine = next;
+        // CPU and GPU share one params object but mean different things by
+        // substeps/iterations. Switching must not leave GPU tuning on the CPU solver.
+        if (next === 'cpu-mass-spring') {
+          p.substeps = 24;
+          p.constraintIterations = 6;
+          if (!(p.gravity > 0)) p.gravity = DEFAULT_SIM_PARAMS.gravity;
+          if (p.velocityDamping == null) p.velocityDamping = DEFAULT_SIM_PARAMS.velocityDamping;
+        } else {
+          p.substeps = 8;
+          p.constraintIterations = 4;
+        }
         const geom = this.meshGeometryForSim(sim.id);
         const pattern = this.patternForSim(sim.id);
         rt?.rebuildCloth(geom, sim.params, sim.pose, pattern);
@@ -2746,6 +3125,9 @@ export class StudioApp {
         this.persistLocal();
       });
       bind('pSpring', (v) => {
+        p.springConst = v;
+      });
+      bind('pSpringGpu', (v) => {
         p.springConst = v;
       });
       bind('pDamp', (v) => {
@@ -2758,6 +3140,9 @@ export class StudioApp {
         p.gravity = v;
       });
       bind('pMass', (v) => {
+        p.mass = v;
+      });
+      bind('pMassGpu', (v) => {
         p.mass = v;
       });
       bind('pCpuSubsteps', (v) => {
@@ -2778,7 +3163,13 @@ export class StudioApp {
       bind('pMaxSpeed', (v) => {
         p.maxSpeed = v;
       });
+      bind('pMaxSpeedGpu', (v) => {
+        p.maxSpeed = v;
+      });
       bind('pFriction', (v) => {
+        p.contactFriction = v;
+      });
+      bind('pFrictionGpu', (v) => {
         p.contactFriction = v;
       });
       bind('pSubsteps', (v) => {
@@ -2901,7 +3292,7 @@ export class StudioApp {
         <h3>${pattern.name}</h3>
         <label>Name <input id="patName" value="${pattern.name}" /></label>
         <button type="button" id="addPt">Add point</button>
-        <p class="muted">Tools: Move · Pen · Dart (click edge → 4 cm inward V) · Bend. ⌘/Ctrl-wheel zoom, Alt-drag pan.</p>
+        <p class="muted">Tools: Move · Pen · Rect · Circle · Knife · Dart · Bend. Middle-drag pan · scroll wheel zoom.</p>
         ${this.deleteButtonHtml()}
       `;
       this.inspector.querySelector('#patName')?.addEventListener('change', (e) => {

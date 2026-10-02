@@ -6,17 +6,24 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "vitest bench --run"
   },
   "devDependencies": {
     "@types/delaunator": "^5.0.3",
     "@types/node": "^20.10.0",
     "@webgpu/types": "^0.1.38",
+    "fake-indexeddb": "^6.0.0",
+    "jsdom": "^25.0.1",
     "typescript": "^5.3.3",
-    "vite": "^5.0.8"
+    "vite": "^5.0.8",
+    "vitest": "^2.1.8"
   },
   "dependencies": {
     "delaunator": "^5.1.0",
+    "fflate": "^0.8.2",
     "gl-matrix": "^3.4.3",
     "numcodecs": "^0.3.2"
   }

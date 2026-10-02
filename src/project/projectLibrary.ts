@@ -1,119 +1,99 @@
-import { normalizeProject, parseProject, serializeProject } from './createDefault';
-import type { ProjectDocument } from './types';
+import type { ProjectDocument } from '../project/types';
+import {
+  createDirtyState,
+  projectStore,
+  type DirtyState,
+  type SaveResult,
+  type SavedProjectRecord,
+} from '../persistence/ProjectStore';
+import { downloadProjectArchive, importPortableProject } from '../persistence/projectArchive';
+import { normalizeProject, parseProject, serializeProject } from '../persistence/projectCodec';
 
-const LIBRARY_KEY = 'patternCanvas.library.v1';
-const LEGACY_KEY = 'patternCanvas.project.v2';
+export type { SavedProjectRecord, SaveResult, DirtyState };
+export { createDirtyState };
 
-export type SavedProjectRecord = {
-  id: string;
-  name: string;
-  updatedAt: number;
-  data: ProjectDocument;
+const AUTOSAVE_KEY = 'patternCanvas.autosaveMinutes';
+export const DEFAULT_AUTOSAVE_MINUTES = 5;
+
+export type LibraryWriteResult = {
+  ok: boolean;
+  error?: string;
+  revision?: number;
 };
 
-type ProjectLibrary = {
-  version: 1;
-  activeId: string | null;
-  projects: SavedProjectRecord[];
+export type SaveProjectResult = {
+  record: SavedProjectRecord;
+  write: LibraryWriteResult;
 };
 
-function emptyLibrary(): ProjectLibrary {
-  return { version: 1, activeId: null, projects: [] };
+export async function initializeProjectLibrary(): Promise<void> {
+  await projectStore.initialize();
 }
 
-function readLibrary(): ProjectLibrary {
-  try {
-    const raw = localStorage.getItem(LIBRARY_KEY);
-    if (!raw) return emptyLibrary();
-    const lib = JSON.parse(raw) as ProjectLibrary;
-    if (lib.version !== 1 || !Array.isArray(lib.projects)) return emptyLibrary();
-    return lib;
-  } catch {
-    return emptyLibrary();
-  }
+export async function listSavedProjects(): Promise<SavedProjectRecord[]> {
+  return projectStore.list();
 }
 
-function writeLibrary(lib: ProjectLibrary): void {
-  localStorage.setItem(LIBRARY_KEY, JSON.stringify(lib));
+export async function getActiveProjectId(): Promise<string | null> {
+  const id = await projectStore.getActiveId();
+  return id || null;
 }
 
-/** One-time migration from the single-project localStorage key. */
-export function migrateLegacyProjectStorage(): void {
-  const lib = readLibrary();
-  if (lib.projects.length > 0) return;
-  try {
-    const raw = localStorage.getItem(LEGACY_KEY);
-    if (!raw) return;
-    const project = normalizeProject(parseProject(raw));
-    const record: SavedProjectRecord = {
-      id: project.id,
-      name: project.name,
-      updatedAt: Date.now(),
-      data: project,
-    };
-    writeLibrary({ version: 1, activeId: project.id, projects: [record] });
-    localStorage.removeItem(LEGACY_KEY);
-  } catch {
-    /* ignore corrupt legacy data */
-  }
+export async function setActiveProjectId(id: string): Promise<LibraryWriteResult> {
+  await projectStore.setActiveId(id);
+  return { ok: true };
 }
 
-export function listSavedProjects(): SavedProjectRecord[] {
-  return [...readLibrary().projects].sort((a, b) => b.updatedAt - a.updatedAt);
+export async function getSavedProject(id: string): Promise<ProjectDocument | null> {
+  return projectStore.load(id);
 }
 
-export function getActiveProjectId(): string | null {
-  return readLibrary().activeId;
-}
-
-export function setActiveProjectId(id: string): void {
-  const lib = readLibrary();
-  lib.activeId = id;
-  writeLibrary(lib);
-}
-
-export function getSavedProject(id: string): ProjectDocument | null {
-  const record = readLibrary().projects.find((p) => p.id === id);
-  return record ? normalizeProject(record.data) : null;
-}
-
-export function saveProjectToLibrary(project: ProjectDocument): SavedProjectRecord {
-  const lib = readLibrary();
-  const now = Date.now();
-  const existing = lib.projects.find((p) => p.id === project.id);
+export async function saveProjectToLibrary(
+  project: ProjectDocument,
+  dirty?: DirtyState
+): Promise<SaveProjectResult> {
+  const result = await projectStore.saveProject(project, { dirty });
   const record: SavedProjectRecord = {
     id: project.id,
     name: project.name,
-    updatedAt: now,
-    data: project,
+    updatedAt: Date.now(),
+    revision: result.revision,
   };
-  if (existing) {
-    existing.name = record.name;
-    existing.updatedAt = now;
-    existing.data = project;
-  } else {
-    lib.projects.push(record);
-  }
-  lib.activeId = project.id;
-  writeLibrary(lib);
-  return record;
+  return {
+    record,
+    write: { ok: result.ok, error: result.error, revision: result.revision },
+  };
 }
 
-export function deleteProjectFromLibrary(id: string): void {
-  const lib = readLibrary();
-  lib.projects = lib.projects.filter((p) => p.id !== id);
-  if (lib.activeId === id) {
-    lib.activeId = lib.projects[0]?.id ?? null;
-  }
-  writeLibrary(lib);
+export async function deleteProjectFromLibrary(id: string): Promise<LibraryWriteResult> {
+  await projectStore.delete(id);
+  return { ok: true };
 }
 
 export function importProjectJson(json: string): ProjectDocument {
-  return normalizeProject(parseProject(json));
+  return projectStore.importJson(json);
 }
 
 export function exportProjectJson(project: ProjectDocument): string {
-  return serializeProject(project);
+  return projectStore.exportJson(project);
+}
+
+export async function importProjectFile(file: File): Promise<ProjectDocument> {
+  return importPortableProject(file);
+}
+
+export async function exportProjectFile(project: ProjectDocument, archive = true): Promise<void> {
+  if (archive) {
+    await downloadProjectArchive(project);
+    return;
+  }
+  const blob = new Blob([serializeProject(project)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${project.name.replace(/\s+/g, '_') || 'project'}.patterncanvas.json`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 export function formatProjectDate(ts: number): string {
@@ -125,10 +105,6 @@ export function formatProjectDate(ts: number): string {
     minute: '2-digit',
   });
 }
-
-const AUTOSAVE_KEY = 'patternCanvas.autosaveMinutes';
-/** Default auto-save interval in minutes. `0` disables auto-save. */
-export const DEFAULT_AUTOSAVE_MINUTES = 5;
 
 export function getAutosaveIntervalMinutes(): number {
   try {
@@ -146,3 +122,14 @@ export function setAutosaveIntervalMinutes(minutes: number): void {
   const n = Number.isFinite(minutes) ? Math.max(0, Math.min(120, minutes)) : DEFAULT_AUTOSAVE_MINUTES;
   localStorage.setItem(AUTOSAVE_KEY, String(n));
 }
+
+export async function getStorageEstimate(): Promise<{ usage?: number; quota?: number }> {
+  return projectStore.storageEstimate();
+}
+
+/** @deprecated Legacy sync migration — IndexedDB migration runs in ProjectStore.initialize(). */
+export function migrateLegacyProjectStorage(): void {
+  /* no-op */
+}
+
+export { normalizeProject, parseProject, serializeProject };

@@ -1,0 +1,103 @@
+import { describe, expect, it } from 'vitest';
+import { normalizeProject, parseProject, serializeProject } from './projectCodec';
+import { documentToSavePayload, manifestToDocument } from './manifestCodec';
+import { packMeshGeometry, unpackMeshGeometry, packPose, unpackPose, type PoseRecord } from './schema';
+import { createSmallFixture } from './fixtures';
+import { projectStore } from './ProjectStore';
+import { exportProjectArchiveBytes, importProjectArchive } from './projectArchive';
+
+describe('projectCodec', () => {
+  it('round-trips a small fixture', () => {
+    const project = createSmallFixture();
+    const json = serializeProject(project);
+    const parsed = parseProject(json);
+    expect(parsed.id).toBe(project.id);
+    expect(parsed.patterns.length).toBe(project.patterns.length);
+  });
+
+  it('normalizes missing transform arrays', () => {
+    const project = createSmallFixture();
+    const raw = JSON.parse(serializeProject(project)) as Record<string, unknown>;
+    delete raw.transforms;
+    delete raw.meshTransformAssignments;
+    const normalized = normalizeProject(raw as never);
+    expect(Array.isArray(normalized.transforms)).toBe(true);
+  });
+});
+
+describe('mesh geometry pack/unpack', () => {
+  it('preserves vertices and triangles', () => {
+    const project = createSmallFixture();
+    const geom = project.meshes[0]!.geometry!;
+    const packed = packMeshGeometry(geom);
+    const restored = unpackMeshGeometry(packed);
+    expect(restored.vertices.length).toBe(geom.vertices.length);
+    expect(restored.triangles.length).toBe(geom.triangles.length);
+  });
+});
+
+describe('pose pack/unpack', () => {
+  it('preserves float arrays', () => {
+    const positions = [0, 1, 2, 3, 4, 5];
+    const packed = packPose(positions, [0, 0, 0, 0, 0, 0]);
+    const record: PoseRecord = {
+      id: 'pose_test',
+      projectId: 'p',
+      ownerType: 'sim',
+      ownerId: 'sim',
+      vertexCount: 2,
+      topologyHash: 'h',
+      positions: packed.positions,
+      velocities: packed.velocities,
+      updatedAt: Date.now(),
+    };
+    const restored = unpackPose(record);
+    expect(restored.positions).toEqual(positions);
+  });
+});
+
+describe('manifest codec', () => {
+  it('externalizes and hydrates a project', async () => {
+    const project = createSmallFixture();
+    const payload = await documentToSavePayload(project, {
+      projectId: project.id,
+      revision: 1,
+    });
+    expect(payload.manifest.version).toBe(3);
+    const assets = new Map(payload.assets.map((a) => [a.id, a.blob]));
+    const poses = new Map(payload.poses.map((p) => [p.id, p]));
+    const meshCaches = new Map(payload.meshCaches.map((m) => [m.id, m]));
+    const hydrated = manifestToDocument(
+      payload.manifest,
+      assets,
+      poses,
+      meshCaches,
+      (_id, blob) => URL.createObjectURL(blob)
+    );
+    expect(hydrated.meshes[0]?.geometry?.vertices.length).toBe(
+      project.meshes[0]?.geometry?.vertices.length
+    );
+  });
+});
+
+describe('ProjectStore', () => {
+  it('saves and loads a project from IndexedDB', async () => {
+    const project = createSmallFixture();
+    await projectStore.initialize();
+    const save = await projectStore.saveProject(project, { forceFull: true });
+    expect(save.ok).toBe(true);
+    const loaded = await projectStore.load(project.id);
+    expect(loaded?.name).toBe(project.name);
+    expect(loaded?.patterns.length).toBe(project.patterns.length);
+  });
+});
+
+describe('project archive', () => {
+  it('exports and imports a zip archive', async () => {
+    const project = createSmallFixture();
+    const bytes = await exportProjectArchiveBytes(project);
+    const imported = await importProjectArchive(bytes);
+    expect(imported.id).toBe(project.id);
+    expect(imported.patterns.length).toBe(project.patterns.length);
+  });
+});

@@ -1,10 +1,12 @@
 import { vec3, quat, mat4 } from 'gl-matrix';
 import type { AvatarBody } from '../../../mesh/AvatarBody';
 import { Ground } from '../../../Ground';
+import { Particle } from '../../../physics/Particle';
 import { identity } from '../../../utils/math';
 import type { MeshGeometry, PatternDocument, SimParams, SimPose } from '../../../project/types';
 import type { ClothCollider, ClothFloor, ClothSimulator } from '../../ClothSimulator';
 import { buildClothTopology, FALLBACK_PIECE_ID, type ClothTopology } from '../../meshTopology';
+import { colorStretchConstraints } from '../../graphColoring';
 import { fillStrainColors, type StrainEdge } from '../../strainMap';
 import {
   createDummySdfTexture,
@@ -23,11 +25,25 @@ import collideSdfWgsl from './shaders/collide_sdf.wgsl?raw';
 import collideParticlesWgsl from './shaders/collide_particles.wgsl?raw';
 
 const DELTA_SCALE = 1 << 20;
-const SEAM_RAMP_SECONDS = 3.5;
+/** Slower sew so panels wrap around the body instead of tunneling through it. */
+const SEAM_RAMP_SECONDS = 6.0;
+/** Max particle speed while seams are still closing (world units/s). */
+const WRAP_MAX_SPEED = 10;
 const WG = 256;
 
 function groups(n: number): number {
   return Math.max(1, Math.ceil(n / WG));
+}
+
+/** Map fabric spring / stretchCompliance → XPBD stretch softness (0=rigid, 1=floppy). */
+function stretchComplianceFromParams(params: SimParams): number {
+  if (params.stretchCompliance != null && Number.isFinite(params.stretchCompliance)) {
+    return Math.min(0.9, Math.max(0.02, params.stretchCompliance));
+  }
+  // springConst 100 → soft (~0.55), 1000 → default (~0.12), 5000 → firm (~0.03)
+  const k = Math.min(5000, Math.max(100, params.springConst));
+  const t = (k - 100) / (5000 - 100);
+  return 0.55 * (1 - t) + 0.03 * t;
 }
 
 /** Copy typed array into an ArrayBuffer-backed view for WebGPU writeBuffer. */
@@ -60,7 +76,10 @@ function rayTriangle(
   if (u < 0 || u > 1) return null;
   const qvec = vec3.create();
   vec3.cross(qvec, tvec, edge1);
-  const v = vec3.dot(edge2, qvec) * invDet;
+  // Möller–Trumbore: v uses the ray direction. Using edge2 here made the
+  // barycentric test geometry-dependent and caused GPU cloth picks to fail
+  // once simulation deformed the triangles.
+  const v = vec3.dot(dir, qvec) * invDet;
   if (v < 0 || u + v > 1) return null;
   const t = vec3.dot(edge2, qvec) * invDet;
   return t >= 0 ? t : null;
@@ -90,7 +109,13 @@ export class XpbdGpuEngine implements ClothSimulator {
   private substeps: number;
   private iterations: number;
   private gravity: number;
+  /** Continuous drag coeff for predict (`1 - damping * h`). From dampingConst. */
   private damping: number;
+  /** Per-substep velocity retain in finalize (matches CPU `velocityDamping`). */
+  private velocityDamping: number;
+  /** Stretch softness 0=hard … 1=floppy; derived from springConst / stretchCompliance. */
+  private stretchCompliance = 0.12;
+  private totalMass = 100;
   private maxSpeed: number;
   private friction: number;
   private enableSelfCollision: boolean;
@@ -134,8 +159,15 @@ export class XpbdGpuEngine implements ClothSimulator {
   private seamLineVertexCount = 0;
   private stagingBuf!: GPUBuffer;
   private stagingBufB!: GPUBuffer;
+  private stagingVelBuf!: GPUBuffer;
+  private stagingVelBufB!: GPUBuffer;
   private stagingFlip = 0;
   private readPending = false;
+  /** CPU contact resolved; upload pos/vel before the next GPU step. */
+  private collisionFeedbackPending = false;
+  /** Stretch constraints grouped by color for race-free parallel GS. */
+  private stretchColorOffsets: Uint32Array = new Uint32Array([0]);
+  private collideProxies: Particle[] = [];
 
   private nStretch = 0;
   private nAttach = 0;
@@ -171,8 +203,11 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.iterations = params.constraintIterations ?? 4;
     this.gravity = params.gravity;
     this.damping = Math.min(0.5, params.dampingConst * 0.01);
-    this.maxSpeed = params.maxSpeed ?? 50;
-    this.friction = params.contactFriction ?? 0.3;
+    this.velocityDamping = params.velocityDamping ?? 0.998;
+    this.totalMass = Math.max(1e-3, params.mass);
+    this.stretchCompliance = stretchComplianceFromParams(params);
+    this.maxSpeed = params.maxSpeed ?? 30;
+    this.friction = params.contactFriction ?? 0.45;
     this.enableSelfCollision = params.enableSelfCollision ?? false;
     this.interleavedHash = params.interleavedHash ?? 3;
 
@@ -192,6 +227,15 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.stretchEdges = this.topo.stretch.map((s) => ({ i: s.i, j: s.j, rest: s.rest }));
     this.nTriangles = this.indices.length / 3;
     this.particleDiameter = this.topo.avgEdgeLength * (params.particleDiameterScalar ?? 1.5);
+
+    const up = vec3.fromValues(0, 1, 0);
+    this.collideProxies = [];
+    for (let i = 0; i < this.nParticles; i++) {
+      const pos = vec3.fromValues(this.cpuPos[i * 3], this.cpuPos[i * 3 + 1], this.cpuPos[i * 3 + 2]);
+      const p = new Particle(pos, vec3.clone(up), this.topo.particleMass, this.gravity, this.floorY);
+      p.setContactFriction(this.friction);
+      this.collideProxies.push(p);
+    }
 
     const floorSize = Math.max(16, avatar.getFootprintRadius() * 2.5) * 3;
     this.floor = new Ground([-floorSize * 0.5, 0, -floorSize * 0.5], floorSize, device, {
@@ -255,12 +299,15 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.normalsAccumBuf = this.createBuf(n * 16, usage, 'xpbd-nrm-accum');
 
     this.nStretch = this.topo.stretch.length;
+    const coloring = colorStretchConstraints(this.topo.stretch, this.nParticles);
+    this.stretchColorOffsets = coloring.offsets;
     const stretchIdx = new Uint32Array(Math.max(this.nStretch, 1) * 2);
     const stretchRest = new Float32Array(Math.max(this.nStretch, 1));
-    for (let i = 0; i < this.nStretch; i++) {
-      stretchIdx[i * 2] = this.topo.stretch[i].i;
-      stretchIdx[i * 2 + 1] = this.topo.stretch[i].j;
-      stretchRest[i] = this.topo.stretch[i].rest;
+    for (let slot = 0; slot < this.nStretch; slot++) {
+      const src = coloring.idx[slot]!;
+      stretchIdx[slot * 2] = this.topo.stretch[src]!.i;
+      stretchIdx[slot * 2 + 1] = this.topo.stretch[src]!.j;
+      stretchRest[slot] = this.topo.stretch[src]!.rest;
     }
     this.stretchIdxBuf = this.createBuf(stretchIdx.byteLength, usage, 'xpbd-stretch-idx');
     this.stretchRestBuf = this.createBuf(stretchRest.byteLength, usage, 'xpbd-stretch-rest');
@@ -337,6 +384,16 @@ export class XpbdGpuEngine implements ClothSimulator {
       GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
       'xpbd-staging-b'
     );
+    this.stagingVelBuf = this.createBuf(
+      n * 16,
+      GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      'xpbd-staging-vel-a'
+    );
+    this.stagingVelBufB = this.createBuf(
+      n * 16,
+      GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      'xpbd-staging-vel-b'
+    );
 
     this.cellStartBuf = this.createBuf(this.tableSize * 4, usage, 'xpbd-cell-start');
     this.cellCountBuf = this.createBuf(this.tableSize * 4, usage, 'xpbd-cell-count');
@@ -408,10 +465,7 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.uploadVec4(this.initialBuf, this.cpuInitial);
     this.writeBuf(this.invMassBuf, this.invMasses);
     this.writeBuf(this.radiiBuf, this.radii);
-    this.writeBuf(this.renderPosBuf, this.cpuPos);
-    const nrm = new Float32Array(this.nParticles * 3);
-    for (let i = 0; i < this.nParticles; i++) nrm[i * 3 + 1] = 1;
-    this.writeBuf(this.renderNrmBuf, nrm);
+    this.writeRenderMeshes();
     this.writeObstacles();
     this.simStateDirty = false;
   }
@@ -431,9 +485,8 @@ export class XpbdGpuEngine implements ClothSimulator {
   private encodeStep(encoder: GPUCommandEncoder, h: number, seamProgress: number): void {
     const n = this.nParticles;
     const pass = encoder.beginComputePass();
-
-    // Pre-stab SDF on positions (projects out of body before integrating).
-    this.dispatchCollideSdf(pass, true, h);
+    const wrapping = seamProgress < 0.999;
+    const speedCap = wrapping ? Math.min(this.maxSpeed, WRAP_MAX_SPEED) : this.maxSpeed;
 
     for (let s = 0; s < this.substeps; s++) {
       {
@@ -465,11 +518,11 @@ export class XpbdGpuEngine implements ClothSimulator {
         // this.dispatchApplyDeltas(pass);
       }
 
-      this.dispatchCollideSdf(pass, false, h);
-
       for (let it = 0; it < this.iterations; it++) {
         this.dispatchStretch(pass);
-        this.dispatchAttach(pass, seamProgress);
+        this.dispatchAttach(pass, seamProgress, h);
+        // Extra stretch pass resists seam crumpling / self-intersection.
+        if (wrapping) this.dispatchStretch(pass);
       }
 
       {
@@ -477,8 +530,11 @@ export class XpbdGpuEngine implements ClothSimulator {
         const f = new Float32Array(uData);
         const u32 = new Uint32Array(uData);
         f[0] = 1 / h;
-        f[1] = this.damping * 0.5;
-        f[2] = this.maxSpeed;
+        f[1] = Math.pow(
+          Math.min(1, Math.max(0.9, this.velocityDamping)),
+          1 / Math.max(1, this.substeps)
+        );
+        f[2] = speedCap;
         u32[3] = n;
         const u = this.uniform('finalize', uData);
         pass.setPipeline(this.pipelines.finalize);
@@ -494,56 +550,9 @@ export class XpbdGpuEngine implements ClothSimulator {
         );
         pass.dispatchWorkgroups(groups(n));
       }
-    }
 
-    {
-      const uData = new ArrayBuffer(16);
-      const u32 = new Uint32Array(uData);
-      u32[0] = n;
-      u32[1] = this.nTriangles;
-      const u = this.uniform('normals', uData);
-
-      pass.setPipeline(this.pipelines.zeroNormals);
-      pass.setBindGroup(
-        0,
-        this.bg(this.pipelines.zeroNormals, [
-          { binding: 0, resource: { buffer: u } },
-          { binding: 1, resource: { buffer: this.positionsBuf } },
-          { binding: 2, resource: { buffer: this.indicesBuf } },
-          { binding: 3, resource: { buffer: this.normalsAccumBuf } },
-          { binding: 4, resource: { buffer: this.renderPosBuf } },
-          { binding: 5, resource: { buffer: this.renderNrmBuf } },
-        ])
-      );
-      pass.dispatchWorkgroups(groups(n));
-
-      pass.setPipeline(this.pipelines.accumNormals);
-      pass.setBindGroup(
-        0,
-        this.bg(this.pipelines.accumNormals, [
-          { binding: 0, resource: { buffer: u } },
-          { binding: 1, resource: { buffer: this.positionsBuf } },
-          { binding: 2, resource: { buffer: this.indicesBuf } },
-          { binding: 3, resource: { buffer: this.normalsAccumBuf } },
-          { binding: 4, resource: { buffer: this.renderPosBuf } },
-          { binding: 5, resource: { buffer: this.renderNrmBuf } },
-        ])
-      );
-      pass.dispatchWorkgroups(groups(this.nTriangles));
-
-      pass.setPipeline(this.pipelines.normCopy);
-      pass.setBindGroup(
-        0,
-        this.bg(this.pipelines.normCopy, [
-          { binding: 0, resource: { buffer: u } },
-          { binding: 1, resource: { buffer: this.positionsBuf } },
-          { binding: 2, resource: { buffer: this.indicesBuf } },
-          { binding: 3, resource: { buffer: this.normalsAccumBuf } },
-          { binding: 4, resource: { buffer: this.renderPosBuf } },
-          { binding: 5, resource: { buffer: this.renderNrmBuf } },
-        ])
-      );
-      pass.dispatchWorkgroups(groups(n));
+      // Body/floor contact after finalize so sew can't pull through the avatar.
+      this.dispatchCollideSdf(pass, h);
     }
 
     pass.end();
@@ -551,38 +560,52 @@ export class XpbdGpuEngine implements ClothSimulator {
 
   private dispatchStretch(pass: GPUComputePassEncoder): void {
     if (this.nStretch === 0) return;
-    const uData = new ArrayBuffer(16);
-    const f = new Float32Array(uData);
-    const u32 = new Uint32Array(uData);
-    u32[0] = this.nStretch;
-    f[1] = 0.35; // under-relaxation / soft compliance factor
-    u32[2] = this.nParticles;
-    const u = this.uniform('stretch', uData);
+    const compliance = this.stretchCompliance;
     pass.setPipeline(this.pipelines.stretch);
-    pass.setBindGroup(
-      0,
-      this.bg(this.pipelines.stretch, [
-        { binding: 0, resource: { buffer: u } },
-        { binding: 1, resource: { buffer: this.predictedBuf } },
-        { binding: 2, resource: { buffer: this.invMassBuf } },
-        { binding: 3, resource: { buffer: this.stretchIdxBuf } },
-        { binding: 4, resource: { buffer: this.stretchRestBuf } },
-        { binding: 5, resource: { buffer: this.deltaXYZBuf } },
-        { binding: 6, resource: { buffer: this.deltaCountsBuf } },
-      ])
-    );
-    pass.dispatchWorkgroups(groups(this.nStretch));
+    for (let c = 0; c < this.stretchColorOffsets.length - 1; c++) {
+      const offset = this.stretchColorOffsets[c]!;
+      const count = this.stretchColorOffsets[c + 1]! - offset;
+      if (count <= 0) continue;
+      const uData = new ArrayBuffer(16);
+      const f = new Float32Array(uData);
+      const u32 = new Uint32Array(uData);
+      u32[0] = offset;
+      u32[1] = count;
+      f[2] = compliance;
+      u32[3] = this.nParticles;
+      const u = this.uniform(`stretch-${c}`, uData);
+      pass.setBindGroup(
+        0,
+        this.bg(this.pipelines.stretch, [
+          { binding: 0, resource: { buffer: u } },
+          { binding: 1, resource: { buffer: this.predictedBuf } },
+          { binding: 2, resource: { buffer: this.invMassBuf } },
+          { binding: 3, resource: { buffer: this.stretchIdxBuf } },
+          { binding: 4, resource: { buffer: this.stretchRestBuf } },
+        ])
+      );
+      pass.dispatchWorkgroups(groups(count));
+    }
   }
 
-  private dispatchAttach(pass: GPUComputePassEncoder, seamProgress: number): void {
+  private dispatchAttach(pass: GPUComputePassEncoder, seamProgress: number, h: number): void {
     if (this.nAttach === 0) return;
-    const uData = new ArrayBuffer(16);
+    // Softer while wrapping; a bit firmer once nearly closed.
+    const t = Math.min(1, Math.max(0, seamProgress));
+    const underRelax = 0.12 + 0.18 * t;
+    // Limit how much gap one solve may close (≈ travel budget for this substep).
+    const maxClose = Math.max(
+      this.topo.avgEdgeLength * 0.08,
+      Math.min(this.maxSpeed, WRAP_MAX_SPEED) * h / Math.max(1, this.iterations)
+    );
+    const uData = new ArrayBuffer(32);
     const f = new Float32Array(uData);
     const u32 = new Uint32Array(uData);
     u32[0] = this.nAttach;
     f[1] = seamProgress;
     u32[2] = this.nParticles;
-    f[3] = 0.55; // soft under-relaxation so seams don't overpower stretch
+    f[3] = underRelax;
+    f[4] = maxClose;
     const u = this.uniform('attach', uData);
     pass.setPipeline(this.pipelines.attach);
     pass.setBindGroup(
@@ -594,11 +617,42 @@ export class XpbdGpuEngine implements ClothSimulator {
         { binding: 3, resource: { buffer: this.seamIdxBuf } },
         { binding: 4, resource: { buffer: this.seamRestBuf } },
         { binding: 5, resource: { buffer: this.seamInitialBuf } },
-        { binding: 6, resource: { buffer: this.deltaXYZBuf } },
-        { binding: 7, resource: { buffer: this.deltaCountsBuf } },
       ])
     );
     pass.dispatchWorkgroups(groups(this.nAttach));
+  }
+
+  private dispatchCollideSdf(pass: GPUComputePassEncoder, h: number): void {
+    if (this.meshObstacles.length === 0 && this.floorY === 0) {
+      // Still resolve floor even without mesh SDF.
+    }
+    const margin = Math.max(0.05, this.topo.avgEdgeLength * 0.35);
+    const maxPush = Math.min(margin * 2, Math.max(margin * 0.35, this.maxSpeed * h));
+    const tangRetain = Math.max(0, 1 - Math.min(2, Math.max(0, this.friction)) * 0.95);
+    const uData = new ArrayBuffer(32);
+    const f = new Float32Array(uData);
+    const u32 = new Uint32Array(uData);
+    f[0] = tangRetain;
+    f[1] = maxPush;
+    u32[2] = this.nParticles;
+    u32[3] = this.meshObstacles.length;
+    f[4] = this.floorY;
+    f[5] = margin;
+    const u = this.uniform('sdf', uData);
+
+    pass.setPipeline(this.pipelines.collideSdf);
+    pass.setBindGroup(
+      0,
+      this.bg(this.pipelines.collideSdf, [
+        { binding: 0, resource: { buffer: u } },
+        { binding: 1, resource: { buffer: this.positionsBuf } },
+        { binding: 2, resource: { buffer: this.velocitiesBuf } },
+        { binding: 3, resource: { buffer: this.invMassBuf } },
+        { binding: 4, resource: { buffer: this.obstaclesBuf } },
+        { binding: 5, resource: this.sdfView },
+      ])
+    );
+    pass.dispatchWorkgroups(groups(this.nParticles));
   }
 
   private dispatchApplyDeltas(pass: GPUComputePassEncoder): void {
@@ -616,42 +670,6 @@ export class XpbdGpuEngine implements ClothSimulator {
         { binding: 1, resource: { buffer: this.predictedBuf } },
         { binding: 2, resource: { buffer: this.deltaXYZBuf } },
         { binding: 3, resource: { buffer: this.deltaCountsBuf } },
-      ])
-    );
-    pass.dispatchWorkgroups(groups(this.nParticles));
-  }
-
-  private dispatchCollideSdf(
-    pass: GPUComputePassEncoder,
-    preStabilize: boolean,
-    _h: number
-  ): void {
-    const uData = new ArrayBuffer(32);
-    const f = new Float32Array(uData);
-    const u32 = new Uint32Array(uData);
-    f[0] = 0; // alpha
-    f[1] = this.friction;
-    u32[2] = this.nParticles;
-    u32[3] = this.meshObstacles.length;
-    u32[4] = preStabilize ? 1 : 0;
-    f[5] = this.floorY;
-    const u = this.uniform(preStabilize ? 'sdf-pre' : 'sdf-sub', uData);
-
-    // Never bind the same buffer as both read_write and read (WebGPU aliasing rule).
-    // Pre-stab only writes `q` and ignores friction vs qRef — use predicted as unused read target.
-    const qBuf = preStabilize ? this.positionsBuf : this.predictedBuf;
-    const qRef = preStabilize ? this.predictedBuf : this.positionsBuf;
-    pass.setPipeline(this.pipelines.collideSdf);
-    pass.setBindGroup(
-      0,
-      this.bg(this.pipelines.collideSdf, [
-        { binding: 0, resource: { buffer: u } },
-        { binding: 1, resource: { buffer: qBuf } },
-        { binding: 2, resource: { buffer: qRef } },
-        { binding: 3, resource: { buffer: this.invMassBuf } },
-        { binding: 4, resource: { buffer: this.radiiBuf } },
-        { binding: 5, resource: { buffer: this.obstaclesBuf } },
-        { binding: 6, resource: this.sdfView },
       ])
     );
     pass.dispatchWorkgroups(groups(this.nParticles));
@@ -735,15 +753,25 @@ export class XpbdGpuEngine implements ClothSimulator {
     if (this.readPending) return;
     this.readPending = true;
     const staging = this.stagingFlip === 0 ? this.stagingBuf : this.stagingBufB;
+    const stagingVel = this.stagingFlip === 0 ? this.stagingVelBuf : this.stagingVelBufB;
     try {
       await staging.mapAsync(GPUMapMode.READ);
       const data = new Float32Array(staging.getMappedRange().slice(0));
       staging.unmap();
+      await stagingVel.mapAsync(GPUMapMode.READ);
+      const velData = new Float32Array(stagingVel.getMappedRange().slice(0));
+      stagingVel.unmap();
       for (let i = 0; i < this.nParticles; i++) {
-        this.cpuPos[i * 3] = data[i * 4];
-        this.cpuPos[i * 3 + 1] = data[i * 4 + 1];
-        this.cpuPos[i * 3 + 2] = data[i * 4 + 2];
+        this.cpuPos[i * 3] = data[i * 4]!;
+        this.cpuPos[i * 3 + 1] = data[i * 4 + 1]!;
+        this.cpuPos[i * 3 + 2] = data[i * 4 + 2]!;
+        this.cpuVel[i * 3] = velData[i * 4]!;
+        this.cpuVel[i * 3 + 1] = velData[i * 4 + 1]!;
+        this.cpuVel[i * 3 + 2] = velData[i * 4 + 2]!;
       }
+      this.applyCpuCollision();
+      this.writeRenderMeshes();
+      this.collisionFeedbackPending = true;
       if (typeof window !== 'undefined') {
         let y = 0;
         for (let i = 0; i < this.nParticles; i++) y += this.cpuPos[i * 3 + 1]!;
@@ -760,6 +788,99 @@ export class XpbdGpuEngine implements ClothSimulator {
     } finally {
       this.readPending = false;
     }
+  }
+
+  /** Same contact model as CPU PatternCloth — stable on SDF / triangle avatar. */
+  private applyCpuCollision(): void {
+    const edge = this.topo.avgEdgeLength;
+    for (let i = 0; i < this.nParticles; i++) {
+      if (this.invMasses[i]! <= 0) continue;
+      const proxy = this.collideProxies[i]!;
+      const pos = proxy.position;
+      const vel = proxy.getVelocity();
+      const x0 = this.cpuPos[i * 3]!;
+      const y0 = this.cpuPos[i * 3 + 1]!;
+      const z0 = this.cpuPos[i * 3 + 2]!;
+      pos[0] = x0;
+      pos[1] = y0;
+      pos[2] = z0;
+      vel[0] = this.cpuVel[i * 3]!;
+      vel[1] = this.cpuVel[i * 3 + 1]!;
+      vel[2] = this.cpuVel[i * 3 + 2]!;
+      proxy.setGroundPos(this.floorY);
+      proxy.setContactFriction(this.friction);
+      proxy.groundCollision();
+      this.avatar.resolveParticle(proxy, edge);
+      const dx = pos[0]! - x0;
+      const dy = pos[1]! - y0;
+      const dz = pos[2]! - z0;
+      const movedSq = dx * dx + dy * dy + dz * dz;
+      // Extra settle when contact actually projected — kills chatter against the body.
+      if (movedSq > 1e-10) {
+        vel[0]! *= 0.92;
+        vel[1]! *= 0.92;
+        vel[2]! *= 0.92;
+      }
+      const speedCap =
+        this.seamRampElapsed < SEAM_RAMP_SECONDS
+          ? Math.min(this.maxSpeed, WRAP_MAX_SPEED)
+          : this.maxSpeed;
+      const speed = Math.hypot(vel[0]!, vel[1]!, vel[2]!);
+      if (speed > speedCap && speed > 1e-8) {
+        const s = speedCap / speed;
+        vel[0]! *= s;
+        vel[1]! *= s;
+        vel[2]! *= s;
+      }
+      this.cpuPos[i * 3] = pos[0]!;
+      this.cpuPos[i * 3 + 1] = pos[1]!;
+      this.cpuPos[i * 3 + 2] = pos[2]!;
+      this.cpuVel[i * 3] = vel[0]!;
+      this.cpuVel[i * 3 + 1] = vel[1]!;
+      this.cpuVel[i * 3 + 2] = vel[2]!;
+    }
+  }
+
+  /** Stable face-area weighted normals (no GPU race flicker). */
+  private writeRenderMeshes(): void {
+    const nrm = new Float32Array(this.nParticles * 3);
+    const idx = this.indices;
+    for (let t = 0; t + 2 < idx.length; t += 3) {
+      const i0 = idx[t]!;
+      const i1 = idx[t + 1]!;
+      const i2 = idx[t + 2]!;
+      const ax = this.cpuPos[i1 * 3]! - this.cpuPos[i0 * 3]!;
+      const ay = this.cpuPos[i1 * 3 + 1]! - this.cpuPos[i0 * 3 + 1]!;
+      const az = this.cpuPos[i1 * 3 + 2]! - this.cpuPos[i0 * 3 + 2]!;
+      const bx = this.cpuPos[i2 * 3]! - this.cpuPos[i0 * 3]!;
+      const by = this.cpuPos[i2 * 3 + 1]! - this.cpuPos[i0 * 3 + 1]!;
+      const bz = this.cpuPos[i2 * 3 + 2]! - this.cpuPos[i0 * 3 + 2]!;
+      const nx = ay * bz - az * by;
+      const ny = az * bx - ax * bz;
+      const nz = ax * by - ay * bx;
+      nrm[i0 * 3] += nx;
+      nrm[i0 * 3 + 1] += ny;
+      nrm[i0 * 3 + 2] += nz;
+      nrm[i1 * 3] += nx;
+      nrm[i1 * 3 + 1] += ny;
+      nrm[i1 * 3 + 2] += nz;
+      nrm[i2 * 3] += nx;
+      nrm[i2 * 3 + 1] += ny;
+      nrm[i2 * 3 + 2] += nz;
+    }
+    for (let i = 0; i < this.nParticles; i++) {
+      const ox = i * 3;
+      const len = Math.hypot(nrm[ox]!, nrm[ox + 1]!, nrm[ox + 2]!);
+      if (len > 1e-8) {
+        nrm[ox]! /= len;
+        nrm[ox + 1]! /= len;
+        nrm[ox + 2]! /= len;
+      } else {
+        nrm[ox + 1] = 1;
+      }
+    }
+    this.writeBuf(this.renderPosBuf, this.cpuPos);
+    this.writeBuf(this.renderNrmBuf, nrm);
   }
 
   private syncStrainColors(force = false): void {
@@ -839,13 +960,14 @@ export class XpbdGpuEngine implements ClothSimulator {
     const seamProgress = Math.min(1, this.seamRampElapsed / SEAM_RAMP_SECONDS);
     const h = dt / this.substeps;
 
-    // Keep pos/vel resident on the GPU across frames. Re-uploading every frame from the
-    // CPU mirror zeroes velocity (never read back) and freezes draping motion.
-    if (this.simStateDirty) {
+    // Keep pos/vel resident on the GPU across frames unless CPU contact feedback
+    // or an explicit edit (drag/reset) dirtied the CPU mirror.
+    if (this.simStateDirty || this.collisionFeedbackPending) {
       this.uploadVec4(this.positionsBuf, this.cpuPos);
       this.uploadVec4(this.velocitiesBuf, this.cpuVel);
       this.uploadVec4(this.predictedBuf, this.cpuPos);
       this.simStateDirty = false;
+      this.collisionFeedbackPending = false;
     }
     this.writeObstacles();
     // Seam LRA targets + spatial hash must be written before the compute pass opens.
@@ -860,10 +982,15 @@ export class XpbdGpuEngine implements ClothSimulator {
     const encoder = this.device.createCommandEncoder();
     try {
       this.encodeStep(encoder, h, seamProgress);
-      this.stagingFlip = 1 - this.stagingFlip;
-      const staging = this.stagingFlip === 0 ? this.stagingBuf : this.stagingBufB;
+      // Only flip + copy when the previous readback finished. Flipping while
+      // readPending left collision feedback reading a stale staging buffer and
+      // fighting the live GPU state (high-frequency jitter).
       if (!this.readPending) {
+        this.stagingFlip = 1 - this.stagingFlip;
+        const staging = this.stagingFlip === 0 ? this.stagingBuf : this.stagingBufB;
+        const stagingVel = this.stagingFlip === 0 ? this.stagingVelBuf : this.stagingVelBufB;
         encoder.copyBufferToBuffer(this.positionsBuf, 0, staging, 0, this.nParticles * 16);
+        encoder.copyBufferToBuffer(this.velocitiesBuf, 0, stagingVel, 0, this.nParticles * 16);
       }
       this.device.queue.submit([encoder.finish()]);
       this.debugStepCount = (this.debugStepCount ?? 0) + 1;
@@ -878,11 +1005,13 @@ export class XpbdGpuEngine implements ClothSimulator {
       return;
     }
 
-    void this.finishReadback();
+    if (!this.readPending) {
+      void this.finishReadback();
+    }
   }
 
   private syncRenderFromCpu(): void {
-    this.writeBuf(this.renderPosBuf, this.cpuPos);
+    this.writeRenderMeshes();
     this.uploadVec4(this.positionsBuf, this.cpuPos);
     this.uploadVec4(this.velocitiesBuf, this.cpuVel);
     this.simStateDirty = false;
@@ -895,10 +1024,21 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.iterations = params.constraintIterations ?? this.iterations;
     this.gravity = params.gravity;
     this.damping = Math.min(0.5, params.dampingConst * 0.01);
+    this.velocityDamping = params.velocityDamping ?? this.velocityDamping;
     this.maxSpeed = params.maxSpeed ?? this.maxSpeed;
     this.friction = params.contactFriction ?? this.friction;
     this.enableSelfCollision = params.enableSelfCollision ?? this.enableSelfCollision;
     this.interleavedHash = params.interleavedHash ?? this.interleavedHash;
+    this.stretchCompliance = stretchComplianceFromParams(params);
+
+    const mass = Math.max(1e-3, params.mass);
+    if (Math.abs(mass - this.totalMass) > 1e-6) {
+      this.totalMass = mass;
+      const particleMass = mass / Math.max(1, this.nParticles);
+      const inv = particleMass > 0 ? 1 / particleMass : 0;
+      this.invMasses.fill(inv);
+      this.writeBuf(this.invMassBuf, this.invMasses);
+    }
   }
 
   exportPose(): SimPose {
@@ -1204,6 +1344,8 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.indexBuffer,
       this.stagingBuf,
       this.stagingBufB,
+      this.stagingVelBuf,
+      this.stagingVelBufB,
       this.seamLinePosBuf,
       this.seamLineNrmBuf,
       this.cellStartBuf,

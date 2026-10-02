@@ -8,7 +8,8 @@ import type {
   Vec2,
 } from '../project/types';
 import { formatLength } from '../project/types';
-import { uid } from '../project/createDefault';
+import { drawMeshSeamConnectors } from '../mesh/meshSeamDraw';
+import { circlePiece, rectPiece, uid } from '../project/createDefault';
 import {
   anchorsBounds,
   clonePatternPiece,
@@ -18,12 +19,26 @@ import {
   findNearestEdge,
   insertDartOnPiece,
   isSeamEdgeValid,
+  lerp,
   mirrorClonePatternPiece,
   pieceToPolyline,
+  pointInPolygon,
   pointOnEdgeAtT,
+  sameSeamBindingPair,
+  sameSeamEdgeTopology,
   sampleEdgeByPointIds,
+  sampleEdgeSpanByPointIds,
   segmentLengths,
 } from './geometry';
+import {
+  findBoundaryHits,
+  sampleCutterPath,
+  slicePiece,
+  snapAngleDegrees,
+  type CutterPath,
+} from './slice';
+import { parseSvgToPieces, scalePieces, type SvgImportResult } from './importSvg';
+import { buildManyToManySeams } from './multiSew';
 import { DEFAULT_SEAM_GAP_CM } from '../mesh/triangulate';
 import {
   AVATAR_OVERLAY_VIEWS,
@@ -39,7 +54,18 @@ export type PatternEditorCallbacks = {
 };
 
 /** Figma-aligned vector tools inside a pattern frame. */
-export type PatternTool = 'move' | 'pen' | 'dart' | 'sew' | 'bend';
+export type PatternTool =
+  | 'move'
+  | 'pen'
+  | 'rect'
+  | 'circle'
+  | 'knife'
+  | 'dart'
+  | 'sew'
+  | 'bend';
+
+export type KnifeMode = 'linear' | 'circle' | 'curve';
+export type SewMode = 'segment' | 'many';
 
 type HoverEdge = { pieceId: string; fromPointId: string; toPointId: string };
 
@@ -59,6 +85,17 @@ type DragKind =
   | { type: 'penCurve'; pieceId: string; pointId: string }
   | { type: 'pan'; startClient: Vec2; startView: { x: number; y: number } }
   | { type: 'marquee'; start: Vec2; current: Vec2; additive: boolean }
+  | {
+      type: 'drawShape';
+      shape: 'rect' | 'circle';
+      start: Vec2;
+      current: Vec2;
+      /** Shift locks rectangle to square; ignored for circle (always circular). */
+      lockAspect: boolean;
+    }
+  | { type: 'knifeLine'; start: Vec2; current: Vec2; shift: boolean }
+  | { type: 'knifeCircle'; center: Vec2; radius: number; shift: boolean }
+  | { type: 'knifeCurveHandles'; a: Vec2; b: Vec2; c0: Vec2; c1: Vec2 }
   | { type: 'moveSelection'; start: Vec2; snapshots: PointSnapshot[] }
   | {
       type: 'scaleSelection';
@@ -96,7 +133,7 @@ type SnapMidTarget = { at: Vec2; a: Vec2; b: Vec2 };
 
 /**
  * SVG pattern editor with Move / Pen / Bend tools (Figma-like) and
- * canvas-matching zoom (⌘/Ctrl-wheel) + pan (Alt-drag).
+ * middle-mouse pan + scroll-wheel zoom.
  */
 export class PatternEditor {
   private root: HTMLElement;
@@ -109,9 +146,29 @@ export class PatternEditor {
   private svg: SVGSVGElement;
   /** Separate layer so avatar tris aren't rebuilt on every pattern redraw. */
   private avatarSvg: SVGSVGElement;
+  private tipEl: HTMLDivElement | null = null;
+  private resizeObserver: ResizeObserver | null = null;
+  /** Last svg layout size used for chrome scaling (skip redundant redraws). */
+  private lastChromeLayout = { w: 0, h: 0 };
   private pattern: PatternDocument;
   private unit: UnitDisplay;
   private tool: PatternTool = 'move';
+  private knifeMode: KnifeMode = 'linear';
+  /** Curve knife: endpoints before handle edit. */
+  private knifeCurveA: Vec2 | null = null;
+  private knifeCurveB: Vec2 | null = null;
+  private knifeBtn: HTMLButtonElement;
+  private knifeFlyout: HTMLElement;
+  private knifeHoldTimer: ReturnType<typeof setTimeout> | null = null;
+  private knifeHoldOpened = false;
+  private knifeDocPointerDown: ((e: PointerEvent) => void) | null = null;
+  private sewMode: SewMode = 'segment';
+  private sewBtn: HTMLButtonElement;
+  private sewFlyout: HTMLElement;
+  private sewHoldTimer: ReturnType<typeof setTimeout> | null = null;
+  private sewHoldOpened = false;
+  private sewDocPointerDown: ((e: PointerEvent) => void) | null = null;
+  private sewBar: HTMLElement;
   /** Primary selected point (for point bar / single-point UI). */
   private selectedPointId: string | null = null;
   private selectedIds = new Set<string>();
@@ -145,9 +202,12 @@ export class PatternEditor {
   private avatarOffsetYInput: HTMLInputElement;
   /** See avatar through pattern fills (adjustable opacity). */
   private xrayOn = false;
+  /** Show dashed links between paired seam edges. */
+  private seamConnectorsOn = false;
   /** Pattern fill opacity while x-ray is on (0–1). */
   private xrayOpacity = 0.35;
   private xrayBtn: HTMLButtonElement;
+  private seamLinksBtn: HTMLButtonElement;
   private xrayBar: HTMLElement;
   private xrayOpacityInput: HTMLInputElement;
   private contextMenu: HTMLElement;
@@ -157,8 +217,15 @@ export class PatternEditor {
   private contextSeamId: string | null = null;
   /** First edge locked while sewing (MD segment sewing). */
   private pendingSeam: SeamEdgeRef | null = null;
+  /** Ordered edge groups for many-to-many sewing. */
+  private multiSewPhase: 'source' | 'target' = 'source';
+  private multiSewSource: SeamEdgeRef[] = [];
+  private multiSewTarget: SeamEdgeRef[] = [];
   /** Edge under the cursor while the sew tool is active. */
   private hoverEdge: HoverEdge | null = null;
+  private svgFileInput!: HTMLInputElement;
+  private importDialog: HTMLElement | null = null;
+  private pendingSvgImport: SvgImportResult | null = null;
 
   constructor(
     host: HTMLElement,
@@ -178,38 +245,81 @@ export class PatternEditor {
     this.toolbar.className = 'pattern-toolbar';
     this.toolbar.innerHTML = `
       <div class="pattern-toolbar-tools">
-        <button type="button" data-tool="move" title="Move (V) — marquee select, drag to move · corner scale (Shift = proportional) · side handles = H/V only">↖</button>
-        <button type="button" data-tool="pen" title="Pen (P) — click corners, click-drag curves, click first point to close">✎</button>
-        <button type="button" data-tool="dart" title="Dart — click an edge to add a 4 cm inward dart (V-notch)">
+        <button type="button" data-tool="move" data-tip="Move" aria-label="Move">↖</button>
+        <button type="button" data-tool="pen" data-tip="Pen" aria-label="Pen">✎</button>
+        <button type="button" data-tool="rect" data-tip="Rectangle" aria-label="Rectangle">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            <rect x="3" y="3.5" width="10" height="9" fill="none" stroke="currentColor" stroke-width="1.4" rx="0.5"/>
+          </svg>
+        </button>
+        <button type="button" data-tool="circle" data-tip="Circle" aria-label="Circle">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+            <circle cx="8" cy="8" r="5" fill="none" stroke="currentColor" stroke-width="1.4"/>
+          </svg>
+        </button>
+        <div class="pattern-tool-flyout" data-flyout="knife">
+          <button type="button" data-tool="knife" data-tip="Knife · Linear" aria-label="Knife" aria-haspopup="true" aria-expanded="false">
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3 13 L13 3"/>
+              <path fill="none" stroke="currentColor" stroke-width="1.2" d="M11.2 3.2 L13 3 L12.8 4.8"/>
+              <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.5 1.2" d="M4 8.5 L8.5 4"/>
+            </svg>
+          </button>
+          <div class="pattern-tool-flyout-menu" hidden role="menu">
+            <button type="button" role="menuitem" data-knife-mode="linear" data-tip="Linear knife">Linear</button>
+            <button type="button" role="menuitem" data-knife-mode="circle" data-tip="Circle knife">Circle</button>
+            <button type="button" role="menuitem" data-knife-mode="curve" data-tip="Curve knife">Curve</button>
+          </div>
+        </div>
+        <button type="button" data-tool="dart" data-tip="Dart" aria-label="Dart">
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
             <path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" d="M2.5 3.5 L8 13.5 L13.5 3.5"/>
             <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.5 1.2" d="M8 13.5 L8 5"/>
           </svg>
         </button>
-        <button type="button" data-tool="sew" title="Sew — click two edges to bind them as a seam (Marvelous Designer segment sewing)">
+        <div class="pattern-tool-flyout" data-flyout="sew">
+          <button type="button" data-tool="sew" data-tip="Sew · Segment" aria-label="Sew" aria-haspopup="true" aria-expanded="false">
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3 12.5 L12.5 3"/>
+              <path fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" d="M11 3.5 L13 3 L12.5 5"/>
+              <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.4 1.1" d="M4.5 5.5 L11.5 12.5"/>
+            </svg>
+          </button>
+          <div class="pattern-tool-flyout-menu" hidden role="menu">
+            <button type="button" role="menuitem" data-sew-mode="segment" data-tip="Segment sewing">Segment sewing</button>
+            <button type="button" role="menuitem" data-sew-mode="many" data-tip="Many-to-many sewing">Many-to-many</button>
+          </div>
+        </div>
+        <button type="button" data-tool="bend" data-tip="Bend" aria-label="Bend">∿</button>
+        <button type="button" data-act="import-svg" data-tip="Import SVG" aria-label="Import SVG">
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-            <path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3 12.5 L12.5 3"/>
-            <path fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" d="M11 3.5 L13 3 L12.5 5"/>
-            <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.4 1.1" d="M4.5 5.5 L11.5 12.5"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.3" d="M3.5 3.5h9v9h-9z"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M8 6.2v4.2M6.1 8.8 L8 11 L9.9 8.8"/>
           </svg>
         </button>
-        <button type="button" data-tool="bend" title="Bend — add/edit Bézier handles">∿</button>
       </div>
       <div class="pattern-toolbar-spacer" aria-hidden="true"></div>
-      <button type="button" data-opt="xray" class="pattern-xray-btn" title="X-ray — lower pattern opacity to see the avatar underneath">
+      <button type="button" data-opt="seam-links" class="pattern-seam-links-btn" data-tip="Seam links" aria-label="Seam links" aria-pressed="false">
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+          <circle cx="4.5" cy="5" r="1.4" fill="currentColor"/>
+          <circle cx="11.5" cy="11" r="1.4" fill="currentColor"/>
+          <path fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="2 1.5" stroke-linecap="round" d="M5.6 5.8 L10.4 10.2"/>
+        </svg>
+      </button>
+      <button type="button" data-opt="xray" class="pattern-xray-btn" data-tip="X-ray" aria-label="X-ray">
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
           <path fill="none" stroke="currentColor" stroke-width="1.3" d="M2.5 8c1.8-3.2 4-4.8 5.5-4.8S11.7 4.8 13.5 8c-1.8 3.2-4 4.8-5.5 4.8S4.3 11.2 2.5 8z"/>
           <circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/>
           <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.2 1" d="M3 11.5 L13 4.5"/>
         </svg>
       </button>
-      <button type="button" data-opt="avatar" class="pattern-avatar-btn" title="Toggle avatar reference (15% opacity, true scale)">
+      <button type="button" data-opt="avatar" class="pattern-avatar-btn" data-tip="Avatar" aria-label="Avatar">
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
           <circle cx="8" cy="4.2" r="2.2" fill="currentColor"/>
           <path fill="currentColor" d="M3.2 13.5c.4-2.8 2.2-4.2 4.8-4.2s4.4 1.4 4.8 4.2H3.2z"/>
         </svg>
       </button>
-      <button type="button" data-opt="snap" class="pattern-snap-btn active" title="Snap to geometry — align with points, edge midpoints, and midpoints between pairs (Ctrl holds to disable)">
+      <button type="button" data-opt="snap" class="pattern-snap-btn active" data-tip="Snap" aria-label="Snap">
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
           <path fill="currentColor" d="M3 2h4v1.5H4.5V6H3V2zm6 0h4v4h-1.5V3.5H9V2zM3 10h1.5v2.5H7V14H3v-4zm8.5 0H14v4h-4v-1.5h2.5V10z"/>
           <circle cx="8" cy="8" r="1.6" fill="currentColor"/>
@@ -217,10 +327,47 @@ export class PatternEditor {
       </button>
     `;
     this.root.appendChild(this.toolbar);
+    this.svgFileInput = document.createElement('input');
+    this.svgFileInput.type = 'file';
+    this.svgFileInput.accept = '.svg,image/svg+xml';
+    this.svgFileInput.hidden = true;
+    this.svgFileInput.addEventListener('change', () => {
+      const file = this.svgFileInput.files?.[0];
+      this.svgFileInput.value = '';
+      if (file) void this.beginSvgImport(file);
+    });
+    this.root.appendChild(this.svgFileInput);
+    this.bindToolbarTips();
     this.snapBtn = this.toolbar.querySelector('button[data-opt="snap"]') as HTMLButtonElement;
+    this.seamLinksBtn = this.toolbar.querySelector('button[data-opt="seam-links"]') as HTMLButtonElement;
     this.xrayBtn = this.toolbar.querySelector('button[data-opt="xray"]') as HTMLButtonElement;
     this.avatarToggleBtn = this.toolbar.querySelector('button[data-opt="avatar"]') as HTMLButtonElement;
+    this.knifeBtn = this.toolbar.querySelector('button[data-tool="knife"]') as HTMLButtonElement;
+    this.knifeFlyout = this.toolbar.querySelector(
+      '[data-flyout="knife"] .pattern-tool-flyout-menu'
+    ) as HTMLElement;
+    this.sewBtn = this.toolbar.querySelector('button[data-tool="sew"]') as HTMLButtonElement;
+    this.sewFlyout = this.toolbar.querySelector(
+      '[data-flyout="sew"] .pattern-tool-flyout-menu'
+    ) as HTMLElement;
+    this.bindKnifeFlyout();
+    this.bindSewFlyout();
     this.toolbar.addEventListener('click', (e) => {
+      const importBtn = (e.target as HTMLElement).closest(
+        'button[data-act="import-svg"]'
+      ) as HTMLButtonElement | null;
+      if (importBtn) {
+        e.preventDefault();
+        this.svgFileInput.click();
+        return;
+      }
+      const seamLinksBtn = (e.target as HTMLElement).closest(
+        'button[data-opt="seam-links"]'
+      ) as HTMLButtonElement | null;
+      if (seamLinksBtn) {
+        this.setSeamConnectorsEnabled(!this.seamConnectorsOn);
+        return;
+      }
       const xrayBtn = (e.target as HTMLElement).closest(
         'button[data-opt="xray"]'
       ) as HTMLButtonElement | null;
@@ -243,8 +390,34 @@ export class PatternEditor {
         this.redraw();
         return;
       }
+      const knifeModeBtn = (e.target as HTMLElement).closest(
+        'button[data-knife-mode]'
+      ) as HTMLButtonElement | null;
+      if (knifeModeBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.setKnifeMode(knifeModeBtn.dataset.knifeMode as KnifeMode);
+        this.setTool('knife');
+        this.hideKnifeFlyout();
+        return;
+      }
+      const sewModeBtn = (e.target as HTMLElement).closest(
+        'button[data-sew-mode]'
+      ) as HTMLButtonElement | null;
+      if (sewModeBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.setSewMode(sewModeBtn.dataset.sewMode as SewMode);
+        this.setTool('sew');
+        this.hideSewFlyout();
+        return;
+      }
       const btn = (e.target as HTMLElement).closest('button[data-tool]') as HTMLButtonElement | null;
       if (!btn) return;
+      // Flyout main buttons are handled by press/click bindings.
+      if (btn.dataset.tool === 'knife' || btn.dataset.tool === 'sew') return;
+      this.hideKnifeFlyout();
+      this.hideSewFlyout();
       this.setTool(btn.dataset.tool as PatternTool);
     });
 
@@ -268,6 +441,24 @@ export class PatternEditor {
     this.viewport = document.createElement('div');
     this.viewport.className = 'pattern-viewport';
     main.appendChild(this.viewport);
+
+    this.sewBar = document.createElement('div');
+    this.sewBar.className = 'pattern-sew-bar';
+    this.sewBar.hidden = true;
+    this.sewBar.innerHTML = `
+      <span data-sew-instruction></span>
+      <button type="button" data-sew-next></button>
+      <button type="button" data-sew-cancel aria-label="Cancel many-to-many sewing">Cancel</button>
+    `;
+    this.viewport.appendChild(this.sewBar);
+    this.sewBar.addEventListener('pointerdown', (e) => e.stopPropagation());
+    this.sewBar.querySelector('[data-sew-next]')?.addEventListener('click', () => {
+      this.advanceMultiSew();
+    });
+    this.sewBar.querySelector('[data-sew-cancel]')?.addEventListener('click', () => {
+      this.clearMultiSew();
+      this.redraw();
+    });
 
     this.xrayBar = document.createElement('div');
     this.xrayBar.className = 'pattern-xray-bar';
@@ -383,12 +574,14 @@ export class PatternEditor {
     this.svg.addEventListener('pointerup', (e) => this.onPointerUp(e));
     this.svg.addEventListener('pointercancel', (e) => this.onPointerUp(e));
     this.svg.addEventListener('contextmenu', (e) => this.onContextMenu(e));
+    this.svg.addEventListener('auxclick', (e) => {
+      if (e.button === 1) e.preventDefault();
+    });
     this.root.addEventListener('pointerdown', this.onRootPointerDown, true);
     document.addEventListener('keydown', this.onDocKeyDown, true);
     this.viewport.addEventListener(
       'wheel',
       (e) => {
-        if (!(e.metaKey || e.ctrlKey)) return;
         e.preventDefault();
         e.stopPropagation();
         this.zoomAt(e.clientX, e.clientY, e.deltaY > 0 ? 1.12 : 0.89);
@@ -400,6 +593,28 @@ export class PatternEditor {
     this.fitView();
     this.setTool('move');
     this.redraw();
+    this.bindViewportResize();
+    // Constructor often runs before flex layout assigns svg size; redraw once laid out.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => this.relayoutChrome());
+    });
+  }
+
+  /** Recompute screen-constant chrome after the viewport gets a real size. */
+  relayoutChrome(): void {
+    const w = this.svg.clientWidth;
+    const h = this.svg.clientHeight;
+    if (w < 2 || h < 2) return;
+    if (w === this.lastChromeLayout.w && h === this.lastChromeLayout.h) return;
+    this.lastChromeLayout = { w, h };
+    this.redraw();
+  }
+
+  private bindViewportResize(): void {
+    if (typeof ResizeObserver === 'undefined') return;
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = new ResizeObserver(() => this.relayoutChrome());
+    this.resizeObserver.observe(this.viewport);
   }
 
   private onRootPointerDown = (e: PointerEvent): void => {
@@ -410,12 +625,32 @@ export class PatternEditor {
 
   private onDocKeyDown = (e: KeyboardEvent): void => {
     if (e.key === 'Escape') {
+      if (this.importDialog) {
+        this.closeSvgImportDialog();
+        e.preventDefault();
+        return;
+      }
       if (this.pendingSeam) {
         this.pendingSeam = null;
         this.hoverEdge = null;
         this.redraw();
       }
+      if (this.multiSewSource.length > 0 || this.multiSewTarget.length > 0) {
+        this.clearMultiSew();
+        this.hoverEdge = null;
+        this.redraw();
+      }
+      if (this.tool === 'knife' && (this.knifeCurveA || this.knifeCurveB)) {
+        this.clearKnifeDraft();
+        this.syncKnifeToolbar();
+        this.redraw();
+      }
       this.hideContextMenu();
+      return;
+    }
+    if (e.key === 'Enter' && this.tool === 'sew' && this.sewMode === 'many') {
+      e.preventDefault();
+      this.advanceMultiSew();
       return;
     }
     if (e.key !== 'Delete' && e.key !== 'Backspace') return;
@@ -469,17 +704,237 @@ export class PatternEditor {
     if (tool !== 'sew') {
       this.pendingSeam = null;
       this.hoverEdge = null;
+      this.clearMultiSew();
+      this.hideSewFlyout();
     }
+    if (tool !== 'knife') {
+      this.clearKnifeDraft();
+      this.hideKnifeFlyout();
+    }
+    this.syncKnifeToolbar();
+    this.syncSewToolbar();
     for (const btn of Array.from(this.toolbar.querySelectorAll('button[data-tool]'))) {
       btn.classList.toggle('active', (btn as HTMLElement).dataset.tool === tool);
     }
     this.svg.style.cursor =
-      tool === 'pen' || tool === 'dart' || tool === 'sew'
+      tool === 'pen' ||
+      tool === 'dart' ||
+      tool === 'sew' ||
+      tool === 'rect' ||
+      tool === 'circle' ||
+      tool === 'knife'
         ? 'crosshair'
         : tool === 'bend'
           ? 'pointer'
           : 'default';
     this.redraw();
+  }
+
+  private bindKnifeFlyout(): void {
+    const HOLD_MS = 380;
+    this.knifeBtn.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.hideToolbarTip();
+      this.knifeHoldOpened = false;
+      this.knifeHoldTimer = setTimeout(() => {
+        this.knifeHoldTimer = null;
+        this.knifeHoldOpened = true;
+        this.showKnifeFlyout();
+      }, HOLD_MS);
+      const onUp = (ev: PointerEvent) => {
+        window.removeEventListener('pointerup', onUp, true);
+        window.removeEventListener('pointercancel', onUp, true);
+        if (this.knifeHoldTimer) {
+          clearTimeout(this.knifeHoldTimer);
+          this.knifeHoldTimer = null;
+        }
+        if (this.knifeHoldOpened) {
+          // Menu is open — selection happens via menu click; don't force linear.
+          return;
+        }
+        // Quick click → linear knife
+        if ((ev.target as Node | null) && this.knifeBtn.contains(ev.target as Node)) {
+          this.setKnifeMode('linear');
+          this.setTool('knife');
+        }
+      };
+      window.addEventListener('pointerup', onUp, true);
+      window.addEventListener('pointercancel', onUp, true);
+    });
+  }
+
+  private bindSewFlyout(): void {
+    const HOLD_MS = 380;
+    this.sewBtn.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.hideToolbarTip();
+      this.sewHoldOpened = false;
+      this.sewHoldTimer = setTimeout(() => {
+        this.sewHoldTimer = null;
+        this.sewHoldOpened = true;
+        this.showSewFlyout();
+      }, HOLD_MS);
+      const onUp = (ev: PointerEvent) => {
+        window.removeEventListener('pointerup', onUp, true);
+        window.removeEventListener('pointercancel', onUp, true);
+        if (this.sewHoldTimer) {
+          clearTimeout(this.sewHoldTimer);
+          this.sewHoldTimer = null;
+        }
+        if (this.sewHoldOpened) return;
+        if ((ev.target as Node | null) && this.sewBtn.contains(ev.target as Node)) {
+          this.setSewMode('segment');
+          this.setTool('sew');
+        }
+      };
+      window.addEventListener('pointerup', onUp, true);
+      window.addEventListener('pointercancel', onUp, true);
+    });
+  }
+
+  private showSewFlyout(): void {
+    this.sewFlyout.hidden = false;
+    this.sewBtn.setAttribute('aria-expanded', 'true');
+    this.syncSewToolbar();
+    if (!this.sewDocPointerDown) {
+      this.sewDocPointerDown = (e: PointerEvent) => {
+        const target = e.target as Node;
+        if (this.sewFlyout.contains(target) || this.sewBtn.contains(target)) return;
+        this.hideSewFlyout();
+      };
+      document.addEventListener('pointerdown', this.sewDocPointerDown, true);
+    }
+  }
+
+  private hideSewFlyout(): void {
+    this.sewFlyout.hidden = true;
+    this.sewBtn.setAttribute('aria-expanded', 'false');
+    if (this.sewDocPointerDown) {
+      document.removeEventListener('pointerdown', this.sewDocPointerDown, true);
+      this.sewDocPointerDown = null;
+    }
+  }
+
+  private setSewMode(mode: SewMode): void {
+    if (this.sewMode !== mode) {
+      this.pendingSeam = null;
+      this.clearMultiSew();
+    }
+    this.sewMode = mode;
+    this.syncSewToolbar();
+    this.redraw();
+  }
+
+  private syncSewToolbar(): void {
+    const tip = this.sewMode === 'many' ? 'Sew · Many-to-many' : 'Sew · Segment';
+    this.sewBtn.dataset.tip = tip;
+    this.sewBtn.setAttribute('aria-label', tip);
+    for (const btn of Array.from(this.sewFlyout.querySelectorAll('button[data-sew-mode]'))) {
+      const el = btn as HTMLButtonElement;
+      el.classList.toggle('is-active', el.dataset.sewMode === this.sewMode);
+    }
+    this.syncSewBar();
+  }
+
+  private showKnifeFlyout(): void {
+    this.knifeFlyout.hidden = false;
+    this.knifeBtn.setAttribute('aria-expanded', 'true');
+    this.syncKnifeToolbar();
+    if (!this.knifeDocPointerDown) {
+      this.knifeDocPointerDown = (e: PointerEvent) => {
+        const t = e.target as Node;
+        if (this.knifeFlyout.contains(t) || this.knifeBtn.contains(t)) return;
+        this.hideKnifeFlyout();
+      };
+      document.addEventListener('pointerdown', this.knifeDocPointerDown, true);
+    }
+  }
+
+  private hideKnifeFlyout(): void {
+    this.knifeFlyout.hidden = true;
+    this.knifeBtn.setAttribute('aria-expanded', 'false');
+    if (this.knifeDocPointerDown) {
+      document.removeEventListener('pointerdown', this.knifeDocPointerDown, true);
+      this.knifeDocPointerDown = null;
+    }
+  }
+
+  private setKnifeMode(mode: KnifeMode): void {
+    this.knifeMode = mode;
+    this.clearKnifeDraft();
+    this.syncKnifeToolbar();
+    this.redraw();
+  }
+
+  private clearKnifeDraft(): void {
+    this.knifeCurveA = null;
+    this.knifeCurveB = null;
+  }
+
+  private syncKnifeToolbar(): void {
+    const tips: Record<KnifeMode, string> = {
+      linear: 'Knife · Linear',
+      circle: 'Knife · Circle',
+      curve: 'Knife · Curve',
+    };
+    this.knifeBtn.dataset.tip = tips[this.knifeMode];
+    this.knifeBtn.setAttribute('aria-label', tips[this.knifeMode]);
+    for (const btn of Array.from(this.knifeFlyout.querySelectorAll('button[data-knife-mode]'))) {
+      const el = btn as HTMLButtonElement;
+      el.classList.toggle('is-active', el.dataset.knifeMode === this.knifeMode);
+    }
+  }
+
+  private ensureTipEl(): HTMLDivElement {
+    if (!this.tipEl) {
+      const el = document.createElement('div');
+      el.className = 'pattern-toolbar-tip';
+      el.hidden = true;
+      document.body.appendChild(el);
+      this.tipEl = el;
+    }
+    return this.tipEl;
+  }
+
+  private hideToolbarTip(): void {
+    if (this.tipEl) this.tipEl.hidden = true;
+  }
+
+  private showToolbarTip(anchor: HTMLElement): void {
+    const text = anchor.dataset.tip ?? '';
+    if (!text) return;
+    const tip = this.ensureTipEl();
+    tip.textContent = text;
+    tip.hidden = false;
+    tip.style.visibility = 'hidden';
+    tip.style.left = '0px';
+    tip.style.top = '0px';
+    const tw = tip.offsetWidth;
+    const th = tip.offsetHeight;
+    const r = anchor.getBoundingClientRect();
+    const pad = 6;
+    let left = r.right + pad;
+    if (left + tw > window.innerWidth - pad) left = Math.max(pad, r.left - tw - pad);
+    let top = r.top + r.height / 2 - th / 2;
+    top = Math.max(pad, Math.min(top, window.innerHeight - th - pad));
+    tip.style.left = `${left}px`;
+    tip.style.top = `${top}px`;
+    tip.style.visibility = 'visible';
+  }
+
+  private bindToolbarTips(): void {
+    this.toolbar.querySelectorAll('button[data-tip]').forEach((btn) => {
+      const el = btn as HTMLElement;
+      el.addEventListener('mouseenter', () => this.showToolbarTip(el));
+      el.addEventListener('mouseleave', () => this.hideToolbarTip());
+      el.addEventListener('focus', () => this.showToolbarTip(el));
+      el.addEventListener('blur', () => this.hideToolbarTip());
+    });
+    this.toolbar.addEventListener('pointerdown', () => this.hideToolbarTip());
   }
 
   private clearSelection(): void {
@@ -503,21 +958,25 @@ export class PatternEditor {
   }
 
   private fitView(): void {
-    const piece = this.activePiece();
-    if (!piece || piece.points.length === 0) {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    let found = false;
+    for (const piece of this.pattern.pieces) {
+      if (piece.points.length === 0) continue;
+      const poly = pieceToPolyline(piece.points, piece.closed);
+      for (const p of poly) {
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x);
+        maxY = Math.max(maxY, p.y);
+        found = true;
+      }
+    }
+    if (!found) {
       this.viewBox = { x: -5, y: -5, w: 60, h: 70 };
       return;
-    }
-    const poly = pieceToPolyline(piece.points, piece.closed);
-    let minX = Infinity,
-      minY = Infinity,
-      maxX = -Infinity,
-      maxY = -Infinity;
-    for (const p of poly) {
-      minX = Math.min(minX, p.x);
-      minY = Math.min(minY, p.y);
-      maxX = Math.max(maxX, p.x);
-      maxY = Math.max(maxY, p.y);
     }
     const pad = 8;
     this.viewBox = {
@@ -526,6 +985,148 @@ export class PatternEditor {
       w: Math.max(maxX - minX + pad * 2, 20),
       h: Math.max(maxY - minY + pad * 2, 20),
     };
+  }
+
+  private async beginSvgImport(file: File): Promise<void> {
+    let text: string;
+    try {
+      text = await file.text();
+    } catch {
+      this.showSvgImportDialog({
+        pieces: [],
+        widthCm: 0,
+        heightCm: 0,
+        cmPerUserUnit: 1,
+        warnings: [],
+        error: `Could not read “${file.name}”`,
+      });
+      return;
+    }
+    const result = parseSvgToPieces(text, { scale: 1 });
+    this.showSvgImportDialog(result, file.name);
+  }
+
+  private escapeHtml(s: string): string {
+    return s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  private closeSvgImportDialog(): void {
+    this.pendingSvgImport = null;
+    if (this.importDialog) {
+      this.importDialog.remove();
+      this.importDialog = null;
+    }
+  }
+
+  private showSvgImportDialog(result: SvgImportResult, fileName = 'SVG'): void {
+    this.closeSvgImportDialog();
+    this.pendingSvgImport = result;
+
+    const dlg = document.createElement('div');
+    dlg.className = 'pattern-import-dialog-root';
+    const canImport = result.pieces.length > 0 && !result.error;
+    const warnHtml =
+      result.warnings.length > 0
+        ? `<ul class="pattern-import-warnings">${result.warnings
+            .map((w) => `<li>${this.escapeHtml(w)}</li>`)
+            .join('')}</ul>`
+        : '';
+    const errHtml = result.error
+      ? `<p class="pattern-import-error">${this.escapeHtml(result.error)}</p>`
+      : '';
+    const sizeLabel =
+      result.widthCm > 0 && result.heightCm > 0
+        ? `${formatLength(result.widthCm, this.unit)} × ${formatLength(result.heightCm, this.unit)}`
+        : '—';
+
+    dlg.innerHTML = `
+      <div class="pattern-import-backdrop" data-import-dismiss>
+        <div class="pattern-import-dialog" role="dialog" aria-labelledby="patternImportTitle">
+          <div class="pattern-import-header">
+            <h3 id="patternImportTitle">Import SVG</h3>
+            <button type="button" class="pattern-import-close" data-import-close aria-label="Close">×</button>
+          </div>
+          <p class="muted pattern-import-file">${this.escapeHtml(fileName)}</p>
+          ${errHtml}
+          <div class="pattern-import-meta">
+            <div><span class="muted">Pieces</span><strong>${result.pieces.length}</strong></div>
+            <div><span class="muted">Detected size</span><strong data-import-size>${this.escapeHtml(sizeLabel)}</strong></div>
+          </div>
+          <label class="pattern-import-scale">
+            <span>Scale %</span>
+            <input type="number" data-import-scale min="1" max="10000" step="1" value="100" ${canImport ? '' : 'disabled'} />
+          </label>
+          <p class="muted pattern-import-scale-hint">100% keeps the physical SVG size (width/height units, or px @ 96 DPI).</p>
+          ${warnHtml}
+          <div class="pattern-import-actions">
+            <button type="button" data-import-cancel>Cancel</button>
+            <button type="button" class="primary" data-import-confirm ${canImport ? '' : 'disabled'}>Import</button>
+          </div>
+        </div>
+      </div>
+    `;
+    this.root.appendChild(dlg);
+    this.importDialog = dlg;
+
+    const scaleInput = dlg.querySelector('[data-import-scale]') as HTMLInputElement | null;
+    const sizeEl = dlg.querySelector('[data-import-size]') as HTMLElement | null;
+    const updateSizePreview = () => {
+      if (!sizeEl || !(result.widthCm > 0)) return;
+      const pct = Math.max(1, Number(scaleInput?.value) || 100);
+      const f = pct / 100;
+      sizeEl.textContent = `${formatLength(result.widthCm * f, this.unit)} × ${formatLength(result.heightCm * f, this.unit)}`;
+    };
+    scaleInput?.addEventListener('input', updateSizePreview);
+
+    const dismiss = () => this.closeSvgImportDialog();
+    const confirm = () => {
+      if (!canImport) return;
+      const pct = Math.max(1, Number(scaleInput?.value) || 100);
+      this.commitSvgImport(pct / 100);
+    };
+    dlg.querySelector('[data-import-dismiss]')?.addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) dismiss();
+    });
+    dlg.querySelector('[data-import-close]')?.addEventListener('click', dismiss);
+    dlg.querySelector('[data-import-cancel]')?.addEventListener('click', dismiss);
+    dlg.querySelector('[data-import-confirm]')?.addEventListener('click', confirm);
+    dlg.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && canImport) {
+        e.preventDefault();
+        confirm();
+      }
+    });
+    scaleInput?.focus();
+    scaleInput?.select();
+  }
+
+  private commitSvgImport(scaleFactor: number): void {
+    const pending = this.pendingSvgImport;
+    if (!pending || pending.pieces.length === 0) {
+      this.closeSvgImportDialog();
+      return;
+    }
+    const pieces =
+      Math.abs(scaleFactor - 1) < 1e-9
+        ? pending.pieces
+        : scalePieces(pending.pieces, scaleFactor);
+    this.closeSvgImportDialog();
+    this.markBeforeChange();
+    const ids: string[] = [];
+    for (const piece of pieces) {
+      this.pattern.pieces.push(piece);
+      for (const pt of piece.points) ids.push(pt.id);
+    }
+    this.selectedPieceId = pieces[0]?.id ?? this.selectedPieceId;
+    this.setSelection(ids);
+    this.fitView();
+    this.cbs.onChange();
+    this.endHistoryGesture();
+    this.redraw();
   }
 
   private zoomAt(clientX: number, clientY: number, factor: number): void {
@@ -548,6 +1149,13 @@ export class PatternEditor {
       this.xrayOpacityInput.value = String(Math.round(this.xrayOpacity * 100));
     }
     this.applyXrayStyles();
+  }
+
+  private setSeamConnectorsEnabled(on: boolean): void {
+    this.seamConnectorsOn = on;
+    this.seamLinksBtn.classList.toggle('active', on);
+    this.seamLinksBtn.setAttribute('aria-pressed', String(on));
+    this.redraw();
   }
 
   private applyXrayStyles(): void {
@@ -619,6 +1227,11 @@ export class PatternEditor {
     this.svg.setAttribute('viewBox', `${x} ${y} ${w} ${h}`);
     this.avatarSvg.setAttribute('viewBox', `${x} ${y} ${w} ${h}`);
     this.svg.innerHTML = '';
+    const layoutW = this.svg.clientWidth;
+    const layoutH = this.svg.clientHeight;
+    if (layoutW >= 2 && layoutH >= 2) {
+      this.lastChromeLayout = { w: layoutW, h: layoutH };
+    }
 
     const grid = document.createElementNS('http://www.w3.org/2000/svg', 'g');
     grid.setAttribute('class', 'pattern-grid');
@@ -662,6 +1275,20 @@ export class PatternEditor {
 
     if (this.drag?.type === 'marquee') {
       this.drawMarquee(this.drag.start, this.drag.current);
+    }
+
+    if (this.drag?.type === 'drawShape') {
+      this.drawShapePreview(this.drag);
+    }
+
+    if (
+      this.drag?.type === 'knifeLine' ||
+      this.drag?.type === 'knifeCircle' ||
+      this.drag?.type === 'knifeCurveHandles'
+    ) {
+      this.drawKnifePreview(this.drag);
+    } else if (this.tool === 'knife' && this.knifeMode === 'curve') {
+      this.drawKnifeCurveDraft();
     }
 
     this.updatePointBar();
@@ -805,6 +1432,296 @@ export class PatternEditor {
     );
     rect.setAttribute('pointer-events', 'none');
     this.svg.appendChild(rect);
+  }
+
+  private shapeBoxFromDrag(
+    start: Vec2,
+    current: Vec2,
+    lockAspect: boolean
+  ): { x: number; y: number; w: number; h: number } {
+    const sx = current.x >= start.x ? 1 : -1;
+    const sy = current.y >= start.y ? 1 : -1;
+    let w = Math.abs(current.x - start.x);
+    let h = Math.abs(current.y - start.y);
+    if (lockAspect) {
+      const s = Math.max(w, h);
+      w = s;
+      h = s;
+    }
+    return {
+      x: sx > 0 ? start.x : start.x - w,
+      y: sy > 0 ? start.y : start.y - h,
+      w,
+      h,
+    };
+  }
+
+  private drawShapePreview(drag: Extract<DragKind, { type: 'drawShape' }>): void {
+    const lock = drag.shape === 'circle' || drag.lockAspect;
+    const box = this.shapeBoxFromDrag(drag.start, drag.current, lock);
+    if (box.w < 1e-6 && box.h < 1e-6) return;
+    const sw = this.px(1.5);
+    if (drag.shape === 'rect') {
+      const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      rect.setAttribute('x', String(box.x));
+      rect.setAttribute('y', String(box.y));
+      rect.setAttribute('width', String(box.w));
+      rect.setAttribute('height', String(box.h));
+      rect.setAttribute('class', 'pattern-shape-preview');
+      rect.setAttribute('stroke-width', String(sw));
+      rect.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(rect);
+    } else {
+      const ell = document.createElementNS('http://www.w3.org/2000/svg', 'ellipse');
+      ell.setAttribute('cx', String(box.x + box.w / 2));
+      ell.setAttribute('cy', String(box.y + box.h / 2));
+      ell.setAttribute('rx', String(box.w / 2));
+      ell.setAttribute('ry', String(box.h / 2));
+      ell.setAttribute('class', 'pattern-shape-preview');
+      ell.setAttribute('stroke-width', String(sw));
+      ell.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(ell);
+    }
+  }
+
+  private finishDrawShape(drag: Extract<DragKind, { type: 'drawShape' }>): void {
+    const lock = drag.shape === 'circle' || drag.lockAspect;
+    const box = this.shapeBoxFromDrag(drag.start, drag.current, lock);
+    const minSize = Math.max(0.5, this.hitRadius() * 0.5);
+    if (box.w < minSize || box.h < minSize) {
+      this.endHistoryGesture();
+      return;
+    }
+    this.markBeforeChange();
+    const n = this.pattern.pieces.length + 1;
+    const piece =
+      drag.shape === 'rect'
+        ? rectPiece(`Rect ${n}`, box.w, box.h, { x: box.x, y: box.y })
+        : circlePiece(`Circle ${n}`, box.x + box.w / 2, box.y + box.h / 2, box.w / 2);
+    this.pattern.pieces.push(piece);
+    this.selectEntirePiece(piece);
+    this.cbs.onChange();
+    this.endHistoryGesture();
+  }
+
+  private knifeCutterFromDrag(
+    drag: Extract<
+      DragKind,
+      { type: 'knifeLine' | 'knifeCircle' | 'knifeCurveHandles' }
+    >
+  ): CutterPath | null {
+    if (drag.type === 'knifeLine') {
+      let b = drag.current;
+      if (drag.shift) {
+        const d = snapAngleDegrees(b.x - drag.start.x, b.y - drag.start.y, 30);
+        b = { x: drag.start.x + d.x, y: drag.start.y + d.y };
+      }
+      if (dist(drag.start, b) < 0.2) return null;
+      return { kind: 'line', a: drag.start, b };
+    }
+    if (drag.type === 'knifeCircle') {
+      let r = drag.radius;
+      if (drag.shift) r = Math.round(r * 2) / 2;
+      if (r < 0.25) return null;
+      return { kind: 'circle', center: drag.center, radius: r };
+    }
+    return {
+      kind: 'cubic',
+      a: drag.a,
+      c0: drag.c0,
+      c1: drag.c1,
+      b: drag.b,
+    };
+  }
+
+  private drawKnifePreview(
+    drag: Extract<
+      DragKind,
+      { type: 'knifeLine' | 'knifeCircle' | 'knifeCurveHandles' }
+    >
+  ): void {
+    const cutter = this.knifeCutterFromDrag(drag);
+    if (!cutter) return;
+    this.strokeCutter(cutter, true);
+  }
+
+  private drawKnifeCurveDraft(): void {
+    if (this.knifeCurveA) {
+      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      c.setAttribute('cx', String(this.knifeCurveA.x));
+      c.setAttribute('cy', String(this.knifeCurveA.y));
+      c.setAttribute('r', String(this.px(4)));
+      c.setAttribute('class', 'pattern-knife-point');
+      c.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(c);
+    }
+    if (this.knifeCurveA && this.knifeCurveB) {
+      this.strokeCutter(
+        {
+          kind: 'line',
+          a: this.knifeCurveA,
+          b: this.knifeCurveB,
+        },
+        false
+      );
+      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      c.setAttribute('cx', String(this.knifeCurveB.x));
+      c.setAttribute('cy', String(this.knifeCurveB.y));
+      c.setAttribute('r', String(this.px(4)));
+      c.setAttribute('class', 'pattern-knife-point');
+      c.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(c);
+    }
+  }
+
+  private strokeCutter(cutter: CutterPath, showHits: boolean): void {
+    const piece = showHits ? this.pieceForKnife(cutter) : null;
+    const hits = piece ? findBoundaryHits(piece, cutter) : [];
+
+    // For linear cuts, draw through the hit span so opposite-side crossings are obvious.
+    let pts = sampleCutterPath(cutter);
+    if (cutter.kind === 'line' && hits.length >= 2) {
+      const sorted = [...hits].sort((a, b) => a.along - b.along);
+      const a = sorted[0]!.point;
+      const b = sorted[sorted.length - 1]!.point;
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const pad = Math.max(2, len * 0.08);
+      pts = [
+        { x: a.x - (dx / len) * pad, y: a.y - (dy / len) * pad },
+        { x: b.x + (dx / len) * pad, y: b.y + (dy / len) * pad },
+      ];
+    }
+    if (pts.length < 2) return;
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    let d = `M ${pts[0]!.x} ${pts[0]!.y}`;
+    for (let i = 1; i < pts.length; i++) d += ` L ${pts[i]!.x} ${pts[i]!.y}`;
+    if (cutter.kind === 'circle') d += ' Z';
+    path.setAttribute('d', d);
+    path.setAttribute('class', 'pattern-knife-preview');
+    path.setAttribute('fill', cutter.kind === 'circle' ? 'rgba(196,92,38,0.06)' : 'none');
+    path.setAttribute('stroke-width', String(this.px(1.75)));
+    path.setAttribute('pointer-events', 'none');
+    this.svg.appendChild(path);
+
+    if (!showHits || !piece) return;
+    const validPair = this.knifeHasValidHitPair(piece, hits, cutter);
+    for (const h of hits) {
+      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      c.setAttribute('cx', String(h.point.x));
+      c.setAttribute('cy', String(h.point.y));
+      c.setAttribute('r', String(this.px(3.5)));
+      c.setAttribute('class', validPair ? 'pattern-knife-hit-ok' : 'pattern-knife-hit');
+      c.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(c);
+    }
+  }
+
+  private knifeHasValidHitPair(
+    piece: PatternPiece,
+    hits: ReturnType<typeof findBoundaryHits>,
+    cutter: CutterPath
+  ): boolean {
+    if (hits.length < 2) return false;
+    const poly = pieceToPolyline(piece.points, true);
+    const sorted = [...hits].sort((a, b) => a.along - b.along);
+    for (let i = 0; i < sorted.length; i++) {
+      for (let j = i + 1; j < sorted.length; j++) {
+        const mid = lerp(sorted[i]!.point, sorted[j]!.point, 0.5);
+        if (cutter.kind !== 'line' || pointInPolygon(mid, poly)) return true;
+      }
+    }
+    return false;
+  }
+
+  private pieceForKnife(cutter: CutterPath): PatternPiece | null {
+    const closed = this.pattern.pieces.filter((p) => p.closed && p.points.length >= 3);
+
+    // Prefer the piece the infinite cut actually crosses (works when drag
+    // endpoints sit outside opposite sides).
+    if (cutter.kind === 'line') {
+      for (const piece of closed) {
+        const hits = findBoundaryHits(piece, cutter);
+        if (hits.length < 2) continue;
+        const poly = pieceToPolyline(piece.points, true);
+        const sorted = [...hits].sort((a, b) => a.along - b.along);
+        for (let i = 0; i < sorted.length - 1; i++) {
+          const mid = lerp(sorted[i]!.point, sorted[i + 1]!.point, 0.5);
+          if (pointInPolygon(mid, poly)) return piece;
+        }
+      }
+    }
+
+    const probe =
+      cutter.kind === 'circle'
+        ? cutter.center
+        : lerp(
+            cutter.kind === 'line' ? cutter.a : cutter.a,
+            cutter.kind === 'line' ? cutter.b : cutter.b,
+            0.5
+          );
+    for (const piece of closed) {
+      if (pointInPolygon(probe, pieceToPolyline(piece.points, true))) return piece;
+    }
+    return this.activePiece()?.closed ? this.activePiece() : closed[0] ?? null;
+  }
+
+  private commitKnife(cutter: CutterPath): void {
+    const piece = this.pieceForKnife(cutter);
+    if (!piece) return;
+    this.markBeforeChange();
+    const result = slicePiece(piece, cutter, () => uid('id'));
+    if (!result.ok) {
+      this.endHistoryGesture();
+      return;
+    }
+    const [a, b] = result.pieces;
+    const idx = this.pattern.pieces.findIndex((p) => p.id === piece.id);
+    if (idx < 0) {
+      this.endHistoryGesture();
+      return;
+    }
+
+    const children = [
+      { piece: a, pointMap: result.pointIdMaps[0] },
+      { piece: b, pointMap: result.pointIdMaps[1] },
+    ] as const;
+    const remapEdge = (ref: SeamEdgeRef): SeamEdgeRef | null => {
+      if (ref.pieceId !== piece.id) return { ...ref };
+      for (const child of children) {
+        const fromPointId = child.pointMap.get(ref.fromPointId);
+        const toPointId = child.pointMap.get(ref.toPointId);
+        if (!fromPointId || !toPointId) continue;
+        // An untouched outline edge remains adjacent on exactly one child.
+        // A knife-crossed edge has a new cut point between its old endpoints,
+        // so it intentionally fails this test and its seam is removed.
+        if (edgeIndexForPointIds(child.piece, fromPointId, toPointId) === null) continue;
+        return {
+          ...ref,
+          pieceId: child.piece.id,
+          fromPointId,
+          toPointId,
+        };
+      }
+      return null;
+    };
+    const remappedSeams: SeamBinding[] = [];
+    for (const seam of this.pattern.seams) {
+      const seamA = remapEdge(seam.a);
+      const seamB = remapEdge(seam.b);
+      if (!seamA || !seamB) continue;
+      remappedSeams.push({ ...seam, a: seamA, b: seamB });
+    }
+
+    this.pattern.pieces.splice(idx, 1, a, b);
+    this.pattern.seams = remappedSeams;
+    this.selectedPieceId = a.id;
+    this.selectEntirePiece(a);
+    this.clearKnifeDraft();
+    this.syncKnifeToolbar();
+    this.cbs.onChange();
+    this.endHistoryGesture();
   }
 
   private drawSnapGuides(): void {
@@ -1230,14 +2147,19 @@ export class PatternEditor {
    */
   private px(cssPixels: number): number {
     const s = this.viewScale();
-    return s > 1e-6 ? cssPixels / s : cssPixels;
+    return cssPixels / s;
   }
 
   /** Layout CSS px per pattern unit (xMidYMid meet). */
   private viewScale(): number {
     const w = this.svg.clientWidth;
     const h = this.svg.clientHeight;
-    if (w < 1 || h < 1) return 1;
+    // Before flex layout settles, client size is 0 — assume a typical pattern
+    // viewport so we don't bake 1px≈1cm chrome (huge labels/handles).
+    if (w < 2 || h < 2) {
+      const assumed = 360;
+      return Math.min(assumed / this.viewBox.w, assumed / this.viewBox.h);
+    }
     return Math.min(w / this.viewBox.w, h / this.viewBox.h);
   }
 
@@ -1590,11 +2512,9 @@ export class PatternEditor {
   private onPointerDown(e: PointerEvent): void {
     this.root.focus({ preventScroll: true });
     if (e.button === 0) this.hideContextMenu();
-    if (e.button !== 0) return;
-    e.stopPropagation();
 
-    // Alt-drag pans the pattern view (same idea as board Alt-drag)
-    if (e.altKey) {
+    // Middle-mouse (or Alt-left) pans the pattern view
+    if (e.button === 1 || (e.button === 0 && e.altKey)) {
       this.drag = {
         type: 'pan',
         startClient: { x: e.clientX, y: e.clientY },
@@ -1602,8 +2522,12 @@ export class PatternEditor {
       };
       this.svg.setPointerCapture(e.pointerId);
       e.preventDefault();
+      e.stopPropagation();
       return;
     }
+
+    if (e.button !== 0) return;
+    e.stopPropagation();
 
     const target = e.target as SVGElement;
     const kind = target.dataset?.kind;
@@ -1613,6 +2537,25 @@ export class PatternEditor {
 
     if (this.tool === 'pen') {
       this.onPenDown(e, p);
+      return;
+    }
+
+    if (this.tool === 'rect' || this.tool === 'circle') {
+      this.drag = {
+        type: 'drawShape',
+        shape: this.tool,
+        start: p,
+        current: p,
+        lockAspect: e.shiftKey,
+      };
+      this.svg.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      this.redraw();
+      return;
+    }
+
+    if (this.tool === 'knife') {
+      this.onKnifeDown(e, p);
       return;
     }
 
@@ -1818,11 +2761,114 @@ export class PatternEditor {
   }
 
   private sameEdge(a: HoverEdge | SeamEdgeRef, b: HoverEdge | SeamEdgeRef): boolean {
-    return (
-      a.pieceId === b.pieceId &&
-      a.fromPointId === b.fromPointId &&
-      a.toPointId === b.toPointId
+    return sameSeamEdgeTopology(a, b);
+  }
+
+  private edgeUsedInExistingSeam(edge: SeamEdgeRef): boolean {
+    return this.pattern.seams.some((seam) => this.sameEdge(seam.a, edge) || this.sameEdge(seam.b, edge));
+  }
+
+  private edgeIn(edges: SeamEdgeRef[], edge: SeamEdgeRef): number {
+    return edges.findIndex((candidate) => this.sameEdge(candidate, edge));
+  }
+
+  private clearMultiSew(): void {
+    this.multiSewPhase = 'source';
+    this.multiSewSource = [];
+    this.multiSewTarget = [];
+    this.syncSewBar();
+  }
+
+  private syncSewBar(): void {
+    if (!this.sewBar) return;
+    const active = this.tool === 'sew' && this.sewMode === 'many';
+    this.sewBar.hidden = !active;
+    if (!active) return;
+    const instruction = this.sewBar.querySelector('[data-sew-instruction]') as HTMLElement;
+    const next = this.sewBar.querySelector('[data-sew-next]') as HTMLButtonElement;
+    if (this.multiSewPhase === 'source') {
+      instruction.textContent = `Side A: select edges (${this.multiSewSource.length})`;
+      next.textContent = 'Next side';
+      next.disabled = this.multiSewSource.length === 0;
+    } else {
+      instruction.textContent = `Side B: select edges (${this.multiSewTarget.length})`;
+      next.textContent = 'Create seams';
+      next.disabled = this.multiSewTarget.length === 0;
+    }
+  }
+
+  private advanceMultiSew(): void {
+    if (this.tool !== 'sew' || this.sewMode !== 'many') return;
+    if (this.multiSewPhase === 'source') {
+      if (this.multiSewSource.length === 0) return;
+      this.multiSewPhase = 'target';
+      this.hoverEdge = null;
+      this.syncSewBar();
+      this.redraw();
+      return;
+    }
+    if (this.multiSewTarget.length === 0) return;
+
+    const candidates = buildManyToManySeams(
+      this.multiSewSource,
+      this.multiSewTarget,
+      this.pattern.pieces
     );
+    const additions = candidates.filter(
+      (candidate) =>
+        !this.pattern.seams.some((seam) =>
+          sameSeamBindingPair(seam.a, seam.b, candidate.a, candidate.b)
+        )
+    );
+    if (additions.length > 0) {
+      this.markBeforeChange();
+      this.pattern.seams.push(
+        ...additions.map(({ a, b }) => ({
+          id: uid('seam'),
+          a,
+          b,
+          restGapCm: DEFAULT_SEAM_GAP_CM,
+        }))
+      );
+      this.cbs.onChange();
+      this.endHistoryGesture();
+      this.clearMultiSew();
+      this.hoverEdge = null;
+      this.redraw();
+      return;
+    }
+
+    const instruction = this.sewBar.querySelector('[data-sew-instruction]') as HTMLElement;
+    instruction.textContent =
+      candidates.length === 0
+        ? 'Could not match selected edges'
+        : 'All matched seams already exist';
+    this.syncSewBar();
+    this.redraw();
+    return;
+  }
+
+  private onManySewDown(edge: SeamEdgeRef, pieceId: string): void {
+    if (this.multiSewPhase === 'source') {
+      const index = this.edgeIn(this.multiSewSource, edge);
+      if (index >= 0) this.multiSewSource.splice(index, 1);
+      else {
+        if (this.edgeUsedInExistingSeam(edge)) return;
+        this.multiSewSource.push(edge);
+      }
+    } else {
+      // An edge cannot belong to both sides of one many-to-many operation.
+      if (this.edgeIn(this.multiSewSource, edge) >= 0) return;
+      const index = this.edgeIn(this.multiSewTarget, edge);
+      if (index >= 0) this.multiSewTarget.splice(index, 1);
+      else {
+        if (this.edgeUsedInExistingSeam(edge)) return;
+        this.multiSewTarget.push(edge);
+      }
+    }
+    this.selectedPieceId = pieceId;
+    this.syncSewBar();
+    this.redraw();
   }
 
   private onSewDown(p: Vec2): void {
@@ -1837,7 +2883,13 @@ export class PatternEditor {
       t1: 1,
     };
 
+    if (this.sewMode === 'many') {
+      this.onManySewDown(edge, hit.piece.id);
+      return;
+    }
+
     if (!this.pendingSeam) {
+      if (this.edgeUsedInExistingSeam(edge)) return;
       this.pendingSeam = edge;
       this.selectedPieceId = hit.piece.id;
       this.redraw();
@@ -1921,12 +2973,25 @@ export class PatternEditor {
   }
 
   private drawSeams(): void {
+    if (this.seamConnectorsOn) {
+      drawMeshSeamConnectors(this.svg, this.pattern, {
+        className: 'pattern-seam-connector',
+        strokeWidth: this.px(1.2),
+      });
+    }
+
     // Hover / pending previews
     if (this.hoverEdge) {
       this.drawSeamEdgeStroke(this.hoverEdge, 'pattern-seam-hover', true);
     }
     if (this.pendingSeam) {
       this.drawSeamEdgeStroke(this.pendingSeam, 'pattern-seam-pending', true);
+    }
+    for (const edge of this.multiSewSource) {
+      this.drawSeamEdgeStroke(edge, 'pattern-seam-pending pattern-seam-multi-source', true);
+    }
+    for (const edge of this.multiSewTarget) {
+      this.drawSeamEdgeStroke(edge, 'pattern-seam-pending pattern-seam-multi-target', true);
     }
 
     for (const seam of this.pattern.seams) {
@@ -1967,7 +3032,23 @@ export class PatternEditor {
   ): void {
     const piece = this.pattern.pieces.find((x) => x.id === ref.pieceId);
     if (!piece) return;
-    const samples = sampleEdgeByPointIds(piece, ref.fromPointId, ref.toPointId, 20);
+    let samples: Vec2[] | null = null;
+    if ('t0' in ref && 't1' in ref) {
+      const span = ref as SeamEdgeRef;
+      const isPartial =
+        Math.abs(span.t0 - span.t1) > 1e-5 && !(span.t0 === 0 && span.t1 === 1);
+      if (isPartial) {
+        samples = sampleEdgeSpanByPointIds(
+          piece,
+          ref.fromPointId,
+          ref.toPointId,
+          span.t0,
+          span.t1,
+          20
+        );
+      }
+    }
+    samples ??= sampleEdgeByPointIds(piece, ref.fromPointId, ref.toPointId, 20);
     if (!samples || samples.length < 2) return;
 
     // Direction from t0→t1 when present (SeamEdgeRef); default forward
@@ -2235,6 +3316,54 @@ export class PatternEditor {
       return;
     }
 
+    if (this.drag.type === 'drawShape') {
+      this.drag.current = p;
+      this.drag.lockAspect = e.shiftKey;
+      this.redraw();
+      return;
+    }
+
+    if (this.drag.type === 'knifeLine') {
+      this.drag.current = p;
+      this.drag.shift = e.shiftKey;
+      this.redraw();
+      return;
+    }
+
+    if (this.drag.type === 'knifeCircle') {
+      if (e.shiftKey) {
+        // Shift: edit radius from fixed center (snap to 0.5 cm).
+        this.drag.radius = dist(this.drag.center, p);
+        this.drag.shift = true;
+      } else if (this.drag.radius < 0.25) {
+        // Establish radius on the first free drag.
+        this.drag.radius = dist(this.drag.center, p);
+        this.drag.shift = false;
+      } else {
+        // Free drag repositions the circle (keeps radius).
+        this.drag.center = p;
+        this.drag.shift = false;
+      }
+      this.redraw();
+      return;
+    }
+
+    if (this.drag.type === 'knifeCurveHandles') {
+      const mid = lerp(this.drag.a, this.drag.b, 0.5);
+      const ox = (p.x - mid.x) * 1.25;
+      const oy = (p.y - mid.y) * 1.25;
+      this.drag.c0 = {
+        x: this.drag.a.x + (this.drag.b.x - this.drag.a.x) / 3 + ox,
+        y: this.drag.a.y + (this.drag.b.y - this.drag.a.y) / 3 + oy,
+      };
+      this.drag.c1 = {
+        x: this.drag.a.x + ((this.drag.b.x - this.drag.a.x) * 2) / 3 + ox,
+        y: this.drag.a.y + ((this.drag.b.y - this.drag.a.y) * 2) / 3 + oy,
+      };
+      this.redraw();
+      return;
+    }
+
     if (this.drag.type === 'moveSelection') {
       const d = this.drag;
       const rawDx = p.x - d.start.x;
@@ -2344,7 +3473,79 @@ export class PatternEditor {
       return;
     }
 
+    if (finished.type === 'drawShape') {
+      this.finishDrawShape(finished);
+      this.redraw();
+      return;
+    }
+
+    if (
+      finished.type === 'knifeLine' ||
+      finished.type === 'knifeCircle' ||
+      finished.type === 'knifeCurveHandles'
+    ) {
+      const cutter = this.knifeCutterFromDrag(finished);
+      if (cutter) this.commitKnife(cutter);
+      this.redraw();
+      return;
+    }
+
     this.endHistoryGesture();
+    this.redraw();
+  }
+
+  private onKnifeDown(e: PointerEvent, p: Vec2): void {
+    if (this.knifeMode === 'linear') {
+      this.drag = {
+        type: 'knifeLine',
+        start: p,
+        current: p,
+        shift: e.shiftKey,
+      };
+      this.svg.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      this.redraw();
+      return;
+    }
+
+    if (this.knifeMode === 'circle') {
+      this.drag = {
+        type: 'knifeCircle',
+        center: p,
+        radius: 0,
+        shift: e.shiftKey,
+      };
+      this.svg.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      this.redraw();
+      return;
+    }
+
+    // Curve: click A, click B, then drag handles
+    if (!this.knifeCurveA) {
+      this.knifeCurveA = { ...p };
+      this.knifeCurveB = null;
+      this.syncKnifeToolbar();
+      this.redraw();
+      return;
+    }
+    if (!this.knifeCurveB) {
+      this.knifeCurveB = { ...p };
+      this.syncKnifeToolbar();
+      this.redraw();
+      return;
+    }
+    const a = this.knifeCurveA;
+    const b = this.knifeCurveB;
+    this.drag = {
+      type: 'knifeCurveHandles',
+      a,
+      b,
+      c0: lerp(a, b, 1 / 3),
+      c1: lerp(a, b, 2 / 3),
+    };
+    this.svg.setPointerCapture(e.pointerId);
+    e.preventDefault();
     this.redraw();
   }
 

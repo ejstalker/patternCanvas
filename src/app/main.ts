@@ -5,4 +5,4 @@ if (!root) {
   throw new Error('#app root missing');
 }
 
-new StudioApp(root);
+void StudioApp.create(root);

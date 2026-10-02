@@ -227,12 +227,12 @@ export class Particle {
     }
 
     /**
-     * Set contact grip in [0,1] (higher = less sliding). Internally stored as
-     * tangential velocity retain ≈ 1 − grip.
+     * Set contact grip in [0, 2] (higher = less sliding). Internally stored as
+     * tangential velocity retain = max(0, 1 − grip × 0.95).
      */
     setContactFriction(friction: number): void {
-        const g = Math.min(1, Math.max(0, friction));
-        this.contactFrictionRetain = 1 - g * 0.95;
+        const g = Math.min(2, Math.max(0, friction));
+        this.contactFrictionRetain = Math.max(0, 1 - g * 0.95);
     }
 
     getContactFrictionRetain(): number {

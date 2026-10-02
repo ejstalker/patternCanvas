@@ -1,4 +1,5 @@
 import type { mat4, vec3 } from 'gl-matrix';
+import type { SdfVolume } from '../mesh/sdfVolume';
 import type { SimParams, SimPose } from '../project/types';
 
 export type DrapeEngineKind = 'cpu-mass-spring' | 'gpu-xpbd';
@@ -11,6 +12,8 @@ export interface ClothCollider {
   getNormalBuffer(): GPUBuffer;
   getIndexBuffer(): GPUBuffer;
   getIndexCount(): number;
+  /** Optional SDF volume for GPU XPBD mesh collision (kind 4). */
+  getSdfVolume?(): SdfVolume | null;
 }
 
 export interface ClothFloor {
