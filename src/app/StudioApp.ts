@@ -11,6 +11,7 @@ import {
   DEFAULT_MESH_FRAME_HEIGHT,
 } from '../project/createDefault';
 import {
+  cloneSimCamera,
   getDefaultSimCamera,
   migrateLegacySimCamera,
   setDefaultSimCamera,
@@ -29,6 +30,7 @@ import type {
   TextAnnotationNode,
   Transform3dNode,
   MeshAlgorithm,
+  SimCameraState,
 } from '../project/types';
 import { PatternEditor } from '../pattern/PatternEditor';
 import { MeshPreview } from '../mesh/MeshPreview';
@@ -76,6 +78,12 @@ type WireDrag = WireSource & {
   pointerId: number;
   x: number;
   y: number;
+};
+
+/** Live camera states captured so undo/redo can preserve the current view. */
+type CameraSnapshot = {
+  transforms: Map<string, SimCameraState>;
+  sims: Map<string, SimCameraState>;
 };
 
 function ensureVisibleConnections(project: ProjectDocument): ProjectDocument {
@@ -310,25 +318,32 @@ export class StudioApp {
 
   private performUndo(): void {
     if (!this.undoStack.canUndo) return;
+    // Camera moves/zooms are view state, not document edits — keep them across undo.
+    const cameras = this.captureLiveCameras();
     this.snapshotProjectForHistory();
     const prev = this.undoStack.undo(this.project);
     this.updateHistoryButtons();
     if (!prev) return;
     this.markDirty(true);
-    void this.restoreHistoryProject(prev, `Undo (${this.undoStack.size} left)`);
+    void this.restoreHistoryProject(prev, `Undo (${this.undoStack.size} left)`, cameras);
   }
 
   private performRedo(): void {
     if (!this.undoStack.canRedo) return;
+    const cameras = this.captureLiveCameras();
     this.snapshotProjectForHistory();
     const next = this.undoStack.redo(this.project);
     this.updateHistoryButtons();
     if (!next) return;
     this.markDirty(true);
-    void this.restoreHistoryProject(next, `Redo (${this.undoStack.redoSize} left)`);
+    void this.restoreHistoryProject(next, `Redo (${this.undoStack.redoSize} left)`, cameras);
   }
 
-  private async restoreHistoryProject(project: ProjectDocument, status: string): Promise<void> {
+  private async restoreHistoryProject(
+    project: ProjectDocument,
+    status: string,
+    cameras?: CameraSnapshot
+  ): Promise<void> {
     const expandedId = this.expandedNodeId;
     const prevSelectedNodeId = this.selectedNodeId;
     const prevTransformPieceId = this.transformInspectorPieceId;
@@ -337,6 +352,9 @@ export class StudioApp {
     this.restoringUndo = true;
     try {
       this.project = this.prepareLoadedProject(project);
+      // Overwrite the snapshot's cameras with the view the user is currently on
+      // so undo/redo never moves or zooms the viewport.
+      if (cameras) this.applyLiveCameras(cameras);
       void setActiveProjectId(this.project.id);
       this.selectedNodeId =
         prevSelectedNodeId &&
@@ -360,6 +378,13 @@ export class StudioApp {
         if (this.hasMissingViewportRuntimes()) {
           await this.initGpuAndSims();
         }
+      }
+
+      // Re-assert the preserved view after runtimes synced: their load path runs
+      // legacy camera migration which must not shift the user's current view.
+      if (cameras) {
+        this.applyLiveCameras(cameras);
+        this.applyLiveCamerasToRuntimes(cameras);
       }
 
       this.restoreTransformInspectorSelection();
@@ -2159,7 +2184,11 @@ export class StudioApp {
         host,
         this.device,
         sim,
-        getDefaultSimCamera(this.project)
+        getDefaultSimCamera(this.project),
+        {
+          onApplyPatternEdit: (patternId, edited) =>
+            this.applyPatternPointEdit(patternId, edited),
+        }
       );
       await runtime.initRenderer();
       if (!stillCurrent()) {
@@ -2413,6 +2442,31 @@ export class StudioApp {
     this.renderInspector();
   }
 
+  /**
+   * Commit a point edit made in the drape viewport's overlay: snapshot for undo,
+   * swap in the edited pieces (point IDs are preserved so seams stay valid), then
+   * remesh every dependent mesh — which rebuilds the transforms and the drape.
+   */
+  private applyPatternPointEdit(patternId: string, edited: PatternDocument): void {
+    const target = this.project.patterns.find((p) => p.id === patternId);
+    if (!target) return;
+    this.pushUndo();
+    target.pieces = edited.pieces;
+    for (const node of this.project.canvas.nodes) {
+      if (node.type !== 'patternFrame' || node.patternId !== patternId) continue;
+      this.editors.get(node.id)?.setPattern(target);
+    }
+    const meshes = this.project.meshes.filter((m) => m.patternId === patternId);
+    for (const mesh of meshes) {
+      this.remesh(mesh.id, { recordUndo: false });
+    }
+    this.setStatus(
+      meshes.length
+        ? `Pattern point edit applied — remeshed ${meshes.length} mesh${meshes.length === 1 ? '' : 'es'}`
+        : 'Pattern point edit applied'
+    );
+  }
+
   private invalidateMeshesForPattern(patternId: string): void {
     const pattern = this.project.patterns.find((p) => p.id === patternId);
     for (const mesh of this.project.meshes) {
@@ -2456,6 +2510,53 @@ export class StudioApp {
       sim.dropped = true;
     }
     syncDefaultCameraFromDrapeA(this.project);
+  }
+
+  /**
+   * Capture the current live camera for every mounted viewport. Camera moves and
+   * zooms are view state, so this is used to keep the user's view fixed while
+   * undo/redo restores the document.
+   */
+  private captureLiveCameras(): CameraSnapshot {
+    const transforms = new Map<string, SimCameraState>();
+    const sims = new Map<string, SimCameraState>();
+    for (const transform of this.project.transforms) {
+      const rt = this.transformRuntimes.get(transform.id);
+      if (!rt?.cloth) continue;
+      rt.captureCamera(transform);
+      transforms.set(transform.id, cloneSimCamera(transform.camera));
+    }
+    for (const sim of this.project.sims) {
+      const rt = this.simRuntimes.get(sim.id);
+      if (!rt?.cloth) continue;
+      rt.captureCamera(sim);
+      sims.set(sim.id, cloneSimCamera(sim.camera));
+    }
+    return { transforms, sims };
+  }
+
+  /** Restore the captured cameras onto a freshly loaded history snapshot. */
+  private applyLiveCameras(snapshot: CameraSnapshot): void {
+    for (const transform of this.project.transforms) {
+      const cam = snapshot.transforms.get(transform.id);
+      if (cam) transform.camera = cloneSimCamera(cam);
+    }
+    for (const sim of this.project.sims) {
+      const cam = snapshot.sims.get(sim.id);
+      if (cam) sim.camera = cloneSimCamera(cam);
+    }
+  }
+
+  /** Push the preserved cameras onto live runtimes verbatim (no migration). */
+  private applyLiveCamerasToRuntimes(snapshot: CameraSnapshot): void {
+    for (const transform of this.project.transforms) {
+      const cam = snapshot.transforms.get(transform.id);
+      if (cam) this.transformRuntimes.get(transform.id)?.setCameraState(cam);
+    }
+    for (const sim of this.project.sims) {
+      const cam = snapshot.sims.get(sim.id);
+      if (cam) this.simRuntimes.get(sim.id)?.setCameraState(cam);
+    }
   }
 
   private persistSimStates(): void {
@@ -2863,7 +2964,7 @@ export class StudioApp {
     this.hideInspectorTip();
     const node = this.project.canvas.nodes.find((n) => n.id === this.selectedNodeId);
     if (!node) {
-      this.inspector.innerHTML = `<h3>Inspector</h3><p class="muted">Drag an output port to a compatible input to reconnect nodes. Middle-drag (or Alt-drag) board to pan · scroll wheel to zoom.<br/>Transform 3D: arrange pieces before draping — no simulation. Drag fabric to move · empty drag to orbit · Shift-drag to raise/lower orbit · Move/Rotate toggle · R = 90° local X · wheel zoom.<br/>Sim: drag fabric to move · Play to simulate drape.</p>`;
+      this.inspector.innerHTML = `<h3>Inspector</h3><p class="muted">Drag an output port to a compatible input to reconnect nodes. Middle-drag (or Alt-drag) board to pan · scroll wheel to zoom.<br/>Transform 3D: arrange pieces before draping — no simulation. Drag fabric to move · Shift-click pieces to multi-select (drag or rotate the group around their shared pivot) · empty drag to orbit · Shift-drag empty space to raise/lower orbit · Move/Rotate toggle · R = 90° local X · Snap to quadrant reveals the two 2 × 8 grids: click a piece, then click a cell to centre it there · wheel zoom.<br/>Sim: drag fabric to move · Shift-click to multi-select · Play to simulate drape · Draw pattern points shows the pattern's anchor points on the fabric — click one to edit it in a small overlay (Cancel/Apply above it; Apply remeshes and rebuilds the drape).</p>`;
       return;
     }
 

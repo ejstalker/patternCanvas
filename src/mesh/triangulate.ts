@@ -56,6 +56,13 @@ export function patternToPolygon(pattern: PatternDocument | undefined): Vec2[] {
   return patternToPolygons(pattern)[0] ?? FALLBACK_POLYGON;
 }
 
+/**
+ * Points closer than this (cm) are treated as coincident when deduping. Kept
+ * deliberately tiny: a larger radius merges the two long edges of a narrow
+ * strip and collapses it into a line.
+ */
+const COINCIDENT_EPS = 1e-3;
+
 function sampleBoundary(poly: Vec2[], spacingCm: number): Vec2[] {
   if (poly.length < 2) return [...poly];
   const spacing = Math.max(0.5, spacingCm);
@@ -75,15 +82,19 @@ function sampleBoundary(poly: Vec2[], spacingCm: number): Vec2[] {
       out.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
     }
   }
-  return dedupePoints(out, spacing * 0.25);
+  return dedupePoints(out, COINCIDENT_EPS);
 }
 
-function sampleInteriorGrid(poly: Vec2[], spacingCm: number): Vec2[] {
+/**
+ * Interior sample grid. `insetCm` defaults to 35% of spacing (so boundary
+ * samples own the edge) but callers pass a smaller inset for narrow pieces so
+ * at least one interior row survives across the width.
+ */
+function sampleInteriorGrid(poly: Vec2[], spacingCm: number, insetCm?: number): Vec2[] {
   const { min, max } = boundsOf(poly);
-  const spacing = Math.max(0.75, spacingCm);
+  const spacing = Math.max(0.25, spacingCm);
   const out: Vec2[] = [];
-  // Inset slightly so boundary samples own the edge
-  const inset = spacing * 0.35;
+  const inset = Math.max(0, insetCm ?? spacing * 0.35);
   for (let y = min.y + inset; y <= max.y - inset; y += spacing) {
     for (let x = min.x + inset; x <= max.x - inset; x += spacing) {
       const p = { x, y };
@@ -102,9 +113,75 @@ function dedupePoints(points: Vec2[], minDist: number): Vec2[] {
   return out;
 }
 
+function distanceToSegment(p: Vec2, a: Vec2, b: Vec2): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq < 1e-12) return dist(p, a);
+  let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(p.x - (a.x + dx * t), p.y - (a.y + dy * t));
+}
+
+/** Shortest distance from `p` to the closed polyline `poly`. */
+function distanceToPolyline(poly: Vec2[], p: Vec2): number {
+  let best = Infinity;
+  const n = poly.length;
+  for (let i = 0; i < n; i++) {
+    const d = distanceToSegment(p, poly[i], poly[(i + 1) % n]);
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+/**
+ * Approximate inscribed radius (half the widest "thickness") of a polygon, by
+ * sampling a coarse grid and keeping the point furthest from any edge.
+ * Used to keep thin strips meshed with interior rows.
+ */
+function estimateHalfThickness(poly: Vec2[]): number {
+  if (poly.length < 3) return 0;
+  const { min, max } = boundsOf(poly);
+  const w = max.x - min.x;
+  const h = max.y - min.y;
+  const span = Math.max(w, h);
+  const minDim = Math.min(w, h);
+  if (!(span > 1e-6) || !(minDim > 1e-6)) return 0;
+  // Sample finer than the narrow dimension so long thin strips aren't stepped
+  // over, but keep the total sample count bounded for large pieces.
+  let step = Math.max(0.25, Math.min(minDim / 4, span / 64));
+  const maxSamples = 4096;
+  if ((w / step + 1) * (h / step + 1) > maxSamples) {
+    step = Math.sqrt((w * h) / maxSamples);
+  }
+  step = Math.max(step, 0.05);
+  let best = 0;
+  for (let y = min.y; y <= max.y; y += step) {
+    for (let x = min.x; x <= max.x; x += step) {
+      const p = { x, y };
+      if (!pointInPolygon(p, poly)) continue;
+      const d = distanceToPolyline(poly, p);
+      if (d > best) best = d;
+    }
+  }
+  return best;
+}
+
 function triangleCentroid(a: Vec2, b: Vec2, c: Vec2): Vec2 {
   return { x: (a.x + b.x + c.x) / 3, y: (a.y + b.y + c.y) / 3 };
 }
+
+/** Twice the signed area of triangle abc. */
+function triangleArea2(a: Vec2, b: Vec2, c: Vec2): number {
+  return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+/**
+ * Below this `|2·area|` (cm²) a triangle is treated as degenerate. Deliberately
+ * tiny — a sliver filter keyed to aspect ratio would delete the legitimate thin
+ * triangles that make up a narrow strip.
+ */
+const DEGENERATE_AREA2 = 1e-9;
 
 function uniqueEdges(triangles: number[]): Array<[number, number]> {
   const seen = new Set<string>();
@@ -114,6 +191,7 @@ function uniqueEdges(triangles: number[]): Array<[number, number]> {
     for (let e = 0; e < 3; e++) {
       const a = tri[e];
       const b = tri[(e + 1) % 3];
+      if (a === b) continue;
       const key = a < b ? `${a}_${b}` : `${b}_${a}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -121,6 +199,45 @@ function uniqueEdges(triangles: number[]): Array<[number, number]> {
     }
   }
   return edges;
+}
+
+/**
+ * Drop vertices that no triangle references (they'd become unconstrained,
+ * free-floating particles / phantom mass) and rebuild aligned arrays.
+ */
+function compactMeshGeometry(mesh: MeshGeometry): MeshGeometry {
+  const used = new Uint8Array(mesh.vertices.length);
+  for (const idx of mesh.triangles) {
+    if (idx >= 0 && idx < used.length) used[idx] = 1;
+  }
+  let allUsed = true;
+  for (let i = 0; i < used.length; i++) {
+    if (!used[i]) {
+      allUsed = false;
+      break;
+    }
+  }
+  if (allUsed) return mesh;
+
+  const remap = new Int32Array(mesh.vertices.length).fill(-1);
+  const vertices: Vec2[] = [];
+  const origIndex: number[] = [];
+  for (let i = 0; i < mesh.vertices.length; i++) {
+    if (!used[i]) continue;
+    remap[i] = vertices.length;
+    vertices.push(mesh.vertices[i]);
+    origIndex.push(i);
+  }
+
+  return {
+    vertices,
+    triangles: mesh.triangles.map((i) => remap[i]),
+    edges: uniqueEdges(mesh.triangles.map((i) => remap[i])),
+    vertexPieceIds: mesh.vertexPieceIds
+      ? origIndex.map((oi) => mesh.vertexPieceIds![oi])
+      : undefined,
+    boundary: mesh.boundary ? origIndex.map((oi) => mesh.boundary![oi]) : undefined,
+  };
 }
 
 function delaunayFilter(points: Vec2[], poly: Vec2[]): MeshGeometry {
@@ -138,8 +255,12 @@ function delaunayFilter(points: Vec2[], poly: Vec2[]): MeshGeometry {
     const i0 = del.triangles[i];
     const i1 = del.triangles[i + 1];
     const i2 = del.triangles[i + 2];
+    if (i0 === i1 || i1 === i2 || i0 === i2) continue;
     const c = triangleCentroid(points[i0], points[i1], points[i2]);
     if (!pointInPolygon(c, poly)) continue;
+    // Delaunator emits near-collinear slivers for thin strips; keep only
+    // (near-)non-degenerate triangles so they don't become zero-length springs.
+    if (Math.abs(triangleArea2(points[i0], points[i1], points[i2])) < DEGENERATE_AREA2) continue;
     triangles.push(i0, i1, i2);
   }
   return {
@@ -161,25 +282,12 @@ function triangulateStructuredGrid(poly: Vec2[], targetEdgeCm: number): MeshGeom
 
   const gridToVert = new Int32Array(cols * rows).fill(-1);
   const vertices: Vec2[] = [];
-
   for (let j = 0; j < rows; j++) {
     for (let i = 0; i < cols; i++) {
       const p = { x: min.x + i * stepX, y: min.y + j * stepY };
       if (!pointInPolygon(p, poly)) continue;
       gridToVert[j * cols + i] = vertices.length;
       vertices.push(p);
-    }
-  }
-
-  // Fallback full rect if polygon cull emptied the grid
-  if (vertices.length < 4) {
-    vertices.length = 0;
-    gridToVert.fill(-1);
-    for (let j = 0; j < rows; j++) {
-      for (let i = 0; i < cols; i++) {
-        gridToVert[j * cols + i] = vertices.length;
-        vertices.push({ x: min.x + i * stepX, y: min.y + j * stepY });
-      }
     }
   }
 
@@ -200,14 +308,46 @@ function triangulateStructuredGrid(poly: Vec2[], targetEdgeCm: number): MeshGeom
     }
   }
 
+  // Narrow/diagonal pieces can cull the whole grid. Filling the bounding box
+  // (old behaviour) meshed a rectangle instead of the piece — fall back to a
+  // boundary-driven Delaunay mesh that actually follows the outline.
+  if (vertices.length < 4 || triangles.length < 6) {
+    return triangulateDelaunay(poly, {
+      algorithm: 'delaunay',
+      targetEdgeCm,
+      boundarySpacingCm: Math.max(0.5, Math.min(2, targetEdgeCm * 0.5)),
+      lloydIterations: 0,
+    });
+  }
+
   return { vertices, triangles, edges: uniqueEdges(triangles) };
 }
 
 function triangulateDelaunay(poly: Vec2[], settings: MeshSettings): MeshGeometry {
   const boundary = sampleBoundary(poly, settings.boundarySpacingCm);
-  const interior = sampleInteriorGrid(poly, settings.targetEdgeCm);
-  const points = dedupePoints([...boundary, ...interior], Math.min(settings.targetEdgeCm, settings.boundarySpacingCm) * 0.2);
+  const half = estimateHalfThickness(poly);
+  const { spacing, inset } = adaptiveInteriorSampling(half, settings.targetEdgeCm);
+  const interior = sampleInteriorGrid(poly, spacing, inset).filter(
+    (p) => !boundary.some((b) => dist(b, p) < inset)
+  );
+  const points = dedupePoints([...boundary, ...interior], COINCIDENT_EPS);
   return delaunayFilter(points, poly);
+}
+
+/**
+ * Interior grid spacing/inset that guarantees at least one row of interior
+ * vertices across a narrow piece. Thin strips otherwise get zero interior
+ * points and are left as a single row of triangles.
+ */
+function adaptiveInteriorSampling(
+  halfThickness: number,
+  targetEdgeCm: number
+): { spacing: number; inset: number } {
+  const base = Math.max(0.75, targetEdgeCm);
+  const narrow = halfThickness > 1e-6 && halfThickness * 2 < base;
+  const spacing = narrow ? Math.max(0.3, halfThickness * 0.9) : base;
+  const inset = Math.min(base * 0.35, Math.max(0.02, halfThickness * 0.35));
+  return { spacing, inset };
 }
 
 /** Lloyd relaxation on interior points, then Delaunay — more even triangles. */
@@ -251,15 +391,20 @@ function triangulateCentroidal(poly: Vec2[], settings: MeshSettings): MeshGeomet
 
 export function triangulate(poly: Vec2[], settings: MeshSettings): MeshGeometry {
   const polygon = poly.length >= 3 ? poly : patternToPolygon(undefined);
+  let mesh: MeshGeometry;
   switch (settings.algorithm as MeshAlgorithm) {
     case 'structuredGrid':
-      return triangulateStructuredGrid(polygon, settings.targetEdgeCm);
+      mesh = triangulateStructuredGrid(polygon, settings.targetEdgeCm);
+      break;
     case 'centroidal':
-      return triangulateCentroidal(polygon, settings);
+      mesh = triangulateCentroidal(polygon, settings);
+      break;
     case 'delaunay':
     default:
-      return triangulateDelaunay(polygon, settings);
+      mesh = triangulateDelaunay(polygon, settings);
+      break;
   }
+  return compactMeshGeometry(mesh);
 }
 
 /** Merge multiple independent mesh islands (one per pattern piece) into one MeshGeometry. */
@@ -566,8 +711,17 @@ function triangulatePieceSeamAware(
     return mesh;
   }
 
-  const interior = sampleInteriorGrid(poly, settings.targetEdgeCm).filter(
-    (p) => !forcedPos.some((b) => dist(b, p) < settings.boundarySpacingCm * 0.35)
+  // Narrow pieces need a smaller inset (and sometimes spacing) or they end up
+  // with no interior vertices at all.
+  const half = estimateHalfThickness(poly);
+  const { spacing: interiorSpacing, inset } = adaptiveInteriorSampling(
+    half,
+    settings.targetEdgeCm
+  );
+  // Strictly smaller than the inset so freshly generated interior points survive.
+  const exclude = Math.min(settings.boundarySpacingCm * 0.35, Math.max(0.02, inset * 0.8));
+  const interior = sampleInteriorGrid(poly, interiorSpacing, inset).filter(
+    (p) => !forcedPos.some((b) => dist(b, p) < exclude)
   );
   let points = [...forcedPos, ...interior];
   let mesh = delaunayFilter(points, poly);
@@ -607,7 +761,7 @@ function triangulatePieceSeamAware(
   mesh.vertexPieceIds = mesh.vertices.map(() => piece.id);
   // No nearest-edge fallback: only forced samples tag the boundary (exact seam counts).
   mesh.boundary = tagFromForcedSamples(piece, mesh.vertices, forced, tol, false);
-  return mesh;
+  return compactMeshGeometry(mesh);
 }
 
 /**

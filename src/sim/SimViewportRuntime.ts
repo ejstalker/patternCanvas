@@ -1,4 +1,4 @@
-import { vec3 } from 'gl-matrix';
+import { vec3, quat } from 'gl-matrix';
 import { Renderer } from '../Renderer';
 import { Camera } from '../Camera';
 import vertexShaderCode from '../shaders/cloth.vert.wgsl?raw';
@@ -21,12 +21,30 @@ import {
 } from './MoveGizmo';
 import { loadAvatarBody } from './avatarAsset';
 import type { AvatarBody } from '../mesh/AvatarBody';
+import { SelectionOverlay } from './SelectionOverlay';
 import { DEFAULT_MESH_SETTINGS, triangulatePattern } from '../mesh/triangulate';
+import {
+  buildIncidentTriangles,
+  buildPatternPointMarkers,
+  computeVertexNormal,
+  markerFacesCamera,
+  type IncidentTriangles,
+  type PatternPointMarker,
+} from './patternPointMarkers';
+import { PatternPointOverlay } from './PatternPointOverlay';
 import {
   migrateLegacySimCamera,
   setDefaultSimCamera,
 } from './cameraDefaults';
 import type { MeshGeometry, PatternDocument, SimCameraState, SimInstance, SimParams } from '../project/types';
+
+export type SimViewportRuntimeOptions = {
+  /**
+   * Called when the user applies an edit made in the pattern-point overlay.
+   * The host is responsible for committing it (undo snapshot, remesh, rebuild).
+   */
+  onApplyPatternEdit?: (patternId: string, edited: PatternDocument) => void;
+};
 
 export type SharedGpu = {
   device: GPUDevice;
@@ -74,8 +92,29 @@ export class SimViewportRuntime {
   private device: GPUDevice;
   private viewGnomon: ViewportGnomon | null = null;
   private moveGizmo: MoveGizmo | null = null;
+  private selectionOverlay: SelectionOverlay | null = null;
   private transformToggle: HTMLButtonElement | null = null;
+  /** "Draw pattern points" toggle + its marker layer and mini editor. */
+  private pointsToggle: HTMLButtonElement | null = null;
+  private pointsLayer: HTMLDivElement | null = null;
+  private pointOverlay: PatternPointOverlay | null = null;
+  private patternPointsEnabled = false;
+  private pointMarkers: PatternPointMarker[] = [];
+  private pointMarkerEls: HTMLButtonElement[] = [];
+  private incidentTriangles: IncidentTriangles | null = null;
+  private readonly markerNormal = new Float32Array(3);
+  /**
+   * Orientation fix-up so "outward" means the side that faced up when the panels
+   * were laid flat — the mesh winding alone can point either way.
+   */
+  private markerNormalSign = 1;
+  /** Mesh + pattern the current cloth was built from, for the point overlay. */
+  private mesh: MeshGeometry | null = null;
+  private pattern: PatternDocument | null = null;
+  /** Primary (last-clicked) piece — drives the gizmo's local-axis ops. */
   private selectedPieceId: string | null = null;
+  /** Full multi-selection; may contain several pieces for group transforms. */
+  private selectedPieceIds: Set<string> = new Set();
   private transformMode: TransformMode = 'translate';
   private strainMapEnabled = false;
   private nav: NavMode = 'none';
@@ -83,12 +122,15 @@ export class SimViewportRuntime {
   private lastY = 0;
   private pointerMoved = false;
   private lastAxisSnap: AxisId | null = null;
+  /** Group pivot (mean of selected centroids) captured at drag start. */
+  private dragPivot: vec3 = vec3.create();
   private gizmoAxis: MoveAxis | null = null;
   private lastPlaneHit: vec3 | null = null;
   private dragPlanePoint: vec3 = vec3.create();
   private dragPlaneNormal: vec3 = vec3.fromValues(0, 1, 0);
   private sim: SimInstance;
   private defaultCamera: SimCameraState;
+  private options: SimViewportRuntimeOptions;
 
   constructor(
     simId: string,
@@ -96,7 +138,8 @@ export class SimViewportRuntime {
     host: HTMLElement,
     device: GPUDevice,
     sim: SimInstance,
-    defaultCamera: SimCameraState
+    defaultCamera: SimCameraState,
+    options: SimViewportRuntimeOptions = {}
   ) {
     this.simId = simId;
     this.sim = sim;
@@ -104,6 +147,7 @@ export class SimViewportRuntime {
     this.canvas = canvas;
     this.host = host;
     this.device = device;
+    this.options = options;
     this.camera = new Camera();
     this.applyCamera(sim);
   }
@@ -128,6 +172,19 @@ export class SimViewportRuntime {
     this.camera.setPanZ(sim.camera.target[2]);
   }
 
+  /**
+   * Apply a camera state verbatim, skipping legacy migration / re-framing.
+   * Used to preserve the user's exact view when undo/redo restores a snapshot.
+   */
+  setCameraState(camera: SimCameraState): void {
+    this.camera.setDistance(camera.distance);
+    this.camera.setAzimuth((camera.azimuth * 180) / Math.PI);
+    this.camera.setIncline((camera.elevation * 180) / Math.PI);
+    this.camera.setPanX(camera.target[0]);
+    this.camera.setPanY(camera.target[1]);
+    this.camera.setPanZ(camera.target[2]);
+  }
+
   captureCamera(sim: SimInstance): void {
     sim.camera.distance = this.camera.getDistance();
     sim.camera.azimuth = (this.camera.getAzimuth() * Math.PI) / 180;
@@ -148,9 +205,184 @@ export class SimViewportRuntime {
     }
     this.applyCamera(this.sim);
     this.mountViewGnomon();
+    this.selectionOverlay = new SelectionOverlay(this.host);
     this.mountMoveGizmo();
     this.mountTransformToggle();
+    this.mountPointsLayer();
+    this.mountPointsToggle();
     this.bindPointer();
+  }
+
+  /**
+   * DOM layer that carries the pattern-point markers. Sits above the canvas but
+   * only the markers themselves accept pointer events.
+   */
+  private mountPointsLayer(): void {
+    this.pointsLayer?.remove();
+    this.pointOverlay?.destroy();
+    const layer = document.createElement('div');
+    layer.className = 'pattern-point-layer';
+    layer.style.display = 'none';
+    this.host.appendChild(layer);
+    this.pointsLayer = layer;
+    this.pointMarkerEls = [];
+    this.pointOverlay = new PatternPointOverlay(this.host, {
+      onApply: (edited) => this.commitPatternPointEdit(edited),
+      onCancel: () => {
+        /* markers stay visible; nothing to roll back */
+      },
+    });
+  }
+
+  private mountPointsToggle(): void {
+    this.pointsToggle?.remove();
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'sim-points-toggle';
+    button.textContent = 'Draw pattern points';
+    button.addEventListener('pointerdown', (e) => e.stopPropagation());
+    button.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.setPatternPointsEnabled(!this.patternPointsEnabled);
+    });
+    this.host.appendChild(button);
+    this.pointsToggle = button;
+    this.setPatternPointsEnabled(this.patternPointsEnabled);
+  }
+
+  isPatternPointsEnabled(): boolean {
+    return this.patternPointsEnabled;
+  }
+
+  setPatternPointsEnabled(enabled: boolean): void {
+    this.patternPointsEnabled = enabled;
+    if (this.pointsToggle) {
+      this.pointsToggle.classList.toggle('is-on', enabled);
+      this.pointsToggle.setAttribute('aria-pressed', String(enabled));
+      this.pointsToggle.title = enabled
+        ? 'Pattern points shown — click one to edit that point in the small overlay'
+        : 'Show pattern point handles on the fabric (click one to edit it)';
+    }
+    if (this.pointsLayer) this.pointsLayer.style.display = enabled ? 'block' : 'none';
+    if (!enabled) {
+      this.pointOverlay?.close();
+      this.removePointMarkerEls();
+    } else {
+      this.buildPointMarkerEls();
+      this.refreshPointMarkers();
+    }
+  }
+
+  /** Map each pattern anchor to its nearest cloth vertex and index its triangles. */
+  private computePointMarkers(): void {
+    this.pointMarkers = buildPatternPointMarkers(this.mesh, this.pattern);
+    const indices = this.mesh?.triangles ?? null;
+    const vertexCount = this.mesh?.vertices.length ?? 0;
+    this.incidentTriangles = indices?.length
+      ? buildIncidentTriangles(indices, vertexCount)
+      : null;
+  }
+
+  /**
+   * Decide which way counts as "outward" by voting on the rest pose, which is
+   * always the flat layout (pattern up = +Y). Must run before `applyPose()`.
+   */
+  private computeMarkerNormalSign(): void {
+    this.markerNormalSign = 1;
+    const incident = this.incidentTriangles;
+    const indices = this.mesh?.triangles ?? null;
+    const positions = this.cloth?.getPositionsSnapshot?.() ?? null;
+    if (!incident || !indices || !positions || !this.pointMarkers.length) return;
+    let up = 0;
+    let down = 0;
+    for (const marker of this.pointMarkers) {
+      if (!computeVertexNormal(positions, indices, incident, marker.vertexIndex, this.markerNormal)) {
+        continue;
+      }
+      if (this.markerNormal[1] > 0.05) up++;
+      else if (this.markerNormal[1] < -0.05) down++;
+    }
+    if (down > up) this.markerNormalSign = -1;
+  }
+
+  private removePointMarkerEls(): void {
+    for (const el of this.pointMarkerEls) el.remove();
+    this.pointMarkerEls = [];
+  }
+
+  private buildPointMarkerEls(): void {
+    this.removePointMarkerEls();
+    if (!this.patternPointsEnabled || !this.pointsLayer || !this.pointMarkers.length) return;
+    this.pointMarkerEls = this.pointMarkers.map((marker, i) => {
+      const el = document.createElement('button');
+      el.type = 'button';
+      el.className = 'pattern-point-marker';
+      el.title = 'Edit this pattern point';
+      el.dataset.markerIndex = String(i);
+      el.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.openPointEditor(i);
+      });
+      this.pointsLayer!.appendChild(el);
+      return el;
+    });
+  }
+
+  private openPointEditor(index: number): void {
+    const marker = this.pointMarkers[index];
+    if (!marker || !this.pattern || !this.pointOverlay) return;
+    this.pointOverlay.open(this.pattern, marker.pointId);
+  }
+
+  private commitPatternPointEdit(edited: PatternDocument): void {
+    // The overlay closed itself; keep the live pattern reference pristine until
+    // the host has taken its undo snapshot and remeshed.
+    this.options.onApplyPatternEdit?.(edited.id, edited);
+  }
+
+  /** Project the markers and hide the ones facing away from the camera. */
+  private refreshPointMarkers(): void {
+    if (!this.patternPointsEnabled || !this.pointMarkerEls.length) return;
+    const positions = this.cloth?.getPositionsSnapshot?.() ?? null;
+    const indices = this.mesh?.triangles ?? null;
+    const incident = this.incidentTriangles;
+    const eye = this.camera.getEyePosition();
+    for (let i = 0; i < this.pointMarkers.length; i++) {
+      const el = this.pointMarkerEls[i];
+      const marker = this.pointMarkers[i];
+      if (!el || !marker) continue;
+      if (!positions || !indices || !incident) {
+        el.style.display = 'none';
+        continue;
+      }
+      if (!markerFacesCamera(
+        positions,
+        indices,
+        incident,
+        marker.vertexIndex,
+        eye,
+        this.markerNormal,
+        this.markerNormalSign
+      )) {
+        el.style.display = 'none';
+        continue;
+      }
+      const p = vec3.fromValues(
+        positions[marker.vertexIndex * 3] ?? 0,
+        positions[marker.vertexIndex * 3 + 1] ?? 0,
+        positions[marker.vertexIndex * 3 + 2] ?? 0
+      );
+      const px = worldToCanvasPx(p, this.camera, this.canvas);
+      if (!px || px.behind || !Number.isFinite(px.x) || !Number.isFinite(px.y)) {
+        el.style.display = 'none';
+        continue;
+      }
+      el.style.display = 'block';
+      el.style.left = `${px.x}px`;
+      el.style.top = `${px.y}px`;
+    }
   }
 
   private mountTransformToggle(): void {
@@ -177,8 +409,8 @@ export class SimViewportRuntime {
       this.transformToggle.classList.toggle('is-rotate', rotating);
       this.transformToggle.textContent = rotating ? 'Rotate' : 'Move';
       this.transformToggle.title = rotating
-        ? 'Rotation mode — drag a gizmo axis to rotate the selected piece'
-        : 'Move mode — drag the selected piece or a gizmo axis to translate';
+        ? 'Rotation mode — drag a gizmo axis to rotate the selection around the group pivot'
+        : 'Move mode — drag the selection or a gizmo axis to translate · Shift-click to multi-select';
       this.transformToggle.setAttribute('aria-pressed', String(rotating));
     }
     this.syncMoveGizmo();
@@ -209,13 +441,14 @@ export class SimViewportRuntime {
     this.moveGizmo?.destroy();
     this.moveGizmo = new MoveGizmo(this.host, {
       onDragStart: (axis, clientX, clientY) => {
-        if (!this.cloth || !this.selectedPieceId) return;
+        if (!this.cloth || this.selectedPieceIds.size === 0) return;
         this.nav = 'gizmo';
         this.gizmoAxis = axis;
         this.cloth.setDragging(true);
         this.camera.update();
-        const c = this.cloth.getCentroid(this.selectedPieceId);
+        const c = this.selectionPivot();
         vec3.copy(this.dragPlanePoint, c);
+        vec3.copy(this.dragPivot, c);
         if (this.transformMode === 'rotate') return;
         if (axis === 'y') {
           const az = (this.camera.getAzimuth() * Math.PI) / 180;
@@ -238,11 +471,11 @@ export class SimViewportRuntime {
         this.lastPlaneHit = this.hitPlane(clientX, clientY) ?? vec3.clone(c);
       },
       onDrag: (_axis, _dx, _dy, clientX, clientY) => {
-        if (!this.cloth || !this.gizmoAxis || !this.selectedPieceId) return;
+        if (!this.cloth || !this.gizmoAxis || this.selectedPieceIds.size === 0) return;
         if (this.transformMode === 'rotate') {
           const axis = this.rotationAxis(this.gizmoAxis);
           const angle = (_dx - _dy) * 0.012;
-          this.cloth.rotateBy(axis, angle, this.selectedPieceId);
+          this.rotateSelectionAroundPivot(axis, angle, vec3.clone(this.dragPivot));
           this.syncMoveGizmo();
           return;
         }
@@ -261,9 +494,9 @@ export class SimViewportRuntime {
             delta[0] = 0;
             delta[1] = 0;
           }
-          this.cloth.translateBy(delta, this.selectedPieceId);
+          this.translateSelection(delta);
           this.lastPlaneHit = hit;
-          vec3.copy(this.dragPlanePoint, this.cloth.getCentroid(this.selectedPieceId));
+          vec3.copy(this.dragPlanePoint, this.selectionPivot());
         }
         this.syncMoveGizmo();
       },
@@ -292,23 +525,115 @@ export class SimViewportRuntime {
   }
 
   private setPieceSelected(pieceId: string | null): void {
-    this.selectedPieceId = pieceId;
-    this.moveGizmo?.setVisible(pieceId !== null);
+    this.setPieceSelection(pieceId ? [pieceId] : [], pieceId);
+  }
+
+  /** Shift-click behaviour: add the piece to / remove it from the selection. */
+  private togglePieceSelected(pieceId: string): void {
+    if (this.selectedPieceIds.has(pieceId)) {
+      const remaining = [...this.selectedPieceIds].filter((id) => id !== pieceId);
+      const primary =
+        this.selectedPieceId === pieceId
+          ? (remaining[remaining.length - 1] ?? null)
+          : this.selectedPieceId;
+      this.setPieceSelection(remaining, primary);
+    } else {
+      this.setPieceSelection([...this.selectedPieceIds, pieceId], pieceId);
+    }
+  }
+
+  private setPieceSelection(ids: string[], primary: string | null): void {
+    this.selectedPieceIds = new Set(ids);
+    this.selectedPieceId = primary;
     this.syncMoveGizmo();
-    this.canvas.style.cursor = pieceId ? 'default' : 'grab';
+    this.canvas.style.cursor = this.selectedPieceIds.size > 0 ? 'default' : 'grab';
+  }
+
+  getSelectedPieceId(): string | null {
+    return this.selectedPieceId;
+  }
+
+  /** All currently selected piece ids (multi-select aware). */
+  getSelectedPieceIds(): string[] {
+    return [...this.selectedPieceIds];
+  }
+
+  isPieceSelected(pieceId: string): boolean {
+    return this.selectedPieceIds.has(pieceId);
+  }
+
+  /** Mean of the selected pieces' centroids — the shared transform pivot. */
+  private selectionPivot(): vec3 {
+    const pivot = vec3.create();
+    if (!this.cloth || this.selectedPieceIds.size === 0) return pivot;
+    for (const id of this.selectedPieceIds) {
+      vec3.add(pivot, pivot, this.cloth.getCentroid(id));
+    }
+    vec3.scale(pivot, pivot, 1 / this.selectedPieceIds.size);
+    return pivot;
+  }
+
+  /** Translate every selected piece by the same world-space delta. */
+  private translateSelection(delta: vec3): void {
+    if (!this.cloth || this.selectedPieceIds.size === 0) return;
+    for (const id of this.selectedPieceIds) {
+      this.cloth.translateBy(delta, id);
+    }
+  }
+
+  /**
+   * Rotate every selected piece rigidly around a shared world-space pivot:
+   * reorient each piece about its own centroid, then orbit that centroid around
+   * the pivot. A single selected piece (pivot === its centroid) degrades to a
+   * plain in-place rotation.
+   */
+  private rotateSelectionAroundPivot(axis: vec3, radians: number, pivot: vec3): void {
+    if (!this.cloth || this.selectedPieceIds.size === 0) return;
+    if (!Number.isFinite(radians) || Math.abs(radians) < 1e-8) return;
+    const normalized = vec3.clone(axis);
+    if (vec3.squaredLength(normalized) < 1e-8) return;
+    vec3.normalize(normalized, normalized);
+    const rotation = quat.create();
+    quat.setAxisAngle(rotation, normalized, radians);
+    const rel = vec3.create();
+    const target = vec3.create();
+    const delta = vec3.create();
+    for (const id of this.selectedPieceIds) {
+      const before = this.cloth.getCentroid(id);
+      this.cloth.rotateBy(normalized, radians, id);
+      vec3.sub(rel, before, pivot);
+      vec3.transformQuat(rel, rel, rotation);
+      vec3.add(target, pivot, rel);
+      vec3.sub(delta, target, before);
+      this.cloth.translateBy(delta, id);
+    }
   }
 
   private syncMoveGizmo(): void {
-    if (!this.moveGizmo || !this.cloth || !this.selectedPieceId) return;
+    if (!this.moveGizmo) return;
+    if (!this.cloth || this.selectedPieceIds.size === 0) {
+      this.moveGizmo.setVisible(false);
+      this.selectionOverlay?.sync([], null);
+      return;
+    }
     this.camera.update();
-    const c = this.cloth.getCentroid(this.selectedPieceId);
-    const px = worldToCanvasPx(c, this.camera, this.canvas);
-    if (!px || px.behind) {
+
+    const markers: Array<{ id: string; x: number; y: number }> = [];
+    for (const id of this.selectedPieceIds) {
+      const c = this.cloth.getCentroid(id);
+      const px = worldToCanvasPx(c, this.camera, this.canvas);
+      if (px && !px.behind) markers.push({ id, x: px.x, y: px.y });
+    }
+    const pivot = this.selectionPivot();
+    const pivotPx = worldToCanvasPx(pivot, this.camera, this.canvas);
+    this.selectionOverlay?.sync(markers, pivotPx && !pivotPx.behind ? pivotPx : null);
+
+    if (!pivotPx || pivotPx.behind) {
       this.moveGizmo.setVisible(false);
       return;
     }
     this.moveGizmo.setVisible(true);
-    this.moveGizmo.setScreenPosition(px.x, px.y);
+    this.moveGizmo.setScreenPosition(pivotPx.x, pivotPx.y);
     this.moveGizmo.updateAxisLayout(this.camera);
   }
 
@@ -347,11 +672,13 @@ export class SimViewportRuntime {
     pattern?: PatternDocument | null
   ): void {
     if (!this.avatarBody) return;
+    this.mesh = mesh && mesh.vertices.length >= 3 ? mesh : null;
+    this.pattern = pattern ?? null;
+    this.pointOverlay?.close();
     this.cloth?.destroy();
-    const geom =
-      mesh && mesh.vertices.length >= 3 && mesh.triangles.length >= 3
-        ? mesh
-        : triangulatePattern(undefined, DEFAULT_MESH_SETTINGS);
+    const usable = !!(mesh && mesh.vertices.length >= 3 && mesh.triangles.length >= 3);
+    this.mesh = usable ? mesh! : null;
+    const geom = usable ? mesh! : triangulatePattern(undefined, DEFAULT_MESH_SETTINGS);
     this.cloth = createClothSimulator(
       resolveEngineKind(params),
       geom,
@@ -360,11 +687,17 @@ export class SimViewportRuntime {
       this.avatarBody,
       pattern ?? undefined
     );
+    // Markers and their outward orientation must be sampled from the rest pose,
+    // before any saved drape is applied on top.
+    this.computePointMarkers();
+    this.computeMarkerNormalSign();
     if (pose && pose.positions.length >= 12) {
       this.cloth.applyPose(pose);
     }
     this.cloth.setStrainMapEnabled?.(this.strainMapEnabled);
     this.setPieceSelected(null);
+    this.buildPointMarkerEls();
+    this.refreshPointMarkers();
   }
 
   setStrainMapEnabled(enabled: boolean): void {
@@ -435,18 +768,33 @@ export class SimViewportRuntime {
       } else if (e.button === 2) {
         this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
       } else if (e.button === 0) {
-        // LMB on fabric → select that pattern piece and transform only it.
+        // LMB on fabric → select that pattern piece (shift toggles the group).
         const hit = this.pickCloth(e.clientX, e.clientY);
         if (hit && this.cloth) {
-          this.setPieceSelected(hit.pieceId);
-          this.beginClothDrag(e.clientX, e.clientY);
+          if (e.shiftKey) {
+            // Shift-click toggles membership; never starts a drag so pieces
+            // aren't nudged while building a multi-selection.
+            this.togglePieceSelected(hit.pieceId);
+            this.nav = 'none';
+          } else {
+            // Clicking a piece that's already part of a group keeps the group
+            // and moves/rotates all of it together.
+            if (!this.selectedPieceIds.has(hit.pieceId)) {
+              this.setPieceSelected(hit.pieceId);
+            }
+            this.beginClothDrag(e.clientX, e.clientY);
+          }
         } else {
           this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
         }
       } else {
         return;
       }
-
+this.nav === 'none'
+                ? this.selectedPieceIds.size > 0
+                  ? 'default'
+                  : 'grab'
+                : 
       this.pointerMoved = false;
       this.lastX = e.clientX;
       this.lastY = e.clientY;
@@ -472,13 +820,18 @@ export class SimViewportRuntime {
       if (this.nav === 'cloth') {
         this.lastX = e.clientX;
         this.lastY = e.clientY;
-        if (this.transformMode === 'rotate' && this.cloth && this.selectedPieceId) {
-          // Direct drag is a simple trackball: horizontal movement rotates
-          // around world Y; vertical movement rotates around camera-right.
-          this.cloth.rotateBy(vec3.fromValues(0, 1, 0), dx * 0.01, this.selectedPieceId);
+        if (this.transformMode === 'rotate' && this.cloth && this.selectedPieceIds.size > 0) {
+          // Direct drag is a simple trackball: horizontal movement rotates the
+          // whole selection around world Y (through the group pivot); vertical
+          // movement uses camera-right.
+          const yawAxis = vec3.fromValues(0, 1, 0);
+          const yaw = dx * 0.01;
           const az = (this.camera.getAzimuth() * Math.PI) / 180;
           const cameraRight = vec3.fromValues(Math.cos(az), 0, -Math.sin(az));
-          this.cloth.rotateBy(cameraRight, dy * 0.01, this.selectedPieceId);
+          const pitch = dy * 0.01;
+          const pivot = vec3.clone(this.dragPivot);
+          this.rotateSelectionAroundPivot(yawAxis, yaw, pivot);
+          this.rotateSelectionAroundPivot(cameraRight, pitch, pivot);
           this.syncMoveGizmo();
           return;
         }
@@ -487,10 +840,10 @@ export class SimViewportRuntime {
         if (hit && this.lastPlaneHit && this.cloth) {
           const delta = vec3.create();
           vec3.sub(delta, hit, this.lastPlaneHit);
-          if (!this.selectedPieceId) return;
-          this.cloth.translateBy(delta, this.selectedPieceId);
+          if (this.selectedPieceIds.size === 0) return;
+          this.translateSelection(delta);
           this.lastPlaneHit = hit;
-          vec3.copy(this.dragPlanePoint, this.cloth.getCentroid(this.selectedPieceId));
+          vec3.copy(this.dragPlanePoint, this.selectionPivot());
         }
         this.syncMoveGizmo();
         return;
@@ -547,10 +900,10 @@ export class SimViewportRuntime {
       }
 
       if (wasOrbitClick) {
-        // Empty click — deselect the current pattern piece.
+        // Empty click — clear the whole selection.
         this.setPieceSelected(null);
       }
-      this.canvas.style.cursor = this.selectedPieceId ? 'default' : 'grab';
+      this.canvas.style.cursor = this.selectedPieceIds.size > 0 ? 'default' : 'grab';
     };
     this.canvas.addEventListener('pointerup', endDrag);
     this.canvas.addEventListener('pointercancel', endDrag);
@@ -571,13 +924,14 @@ export class SimViewportRuntime {
 
   /** Start free-dragging the cloth on a camera-facing plane (same as gizmo free axis). */
   private beginClothDrag(clientX: number, clientY: number): void {
-    if (!this.cloth || !this.selectedPieceId) return;
+    if (!this.cloth || this.selectedPieceIds.size === 0) return;
     this.nav = 'cloth';
     this.gizmoAxis = 'free';
     this.cloth.setDragging(true);
     this.camera.update();
-    const c = this.cloth.getCentroid(this.selectedPieceId);
+    const c = this.selectionPivot();
     vec3.copy(this.dragPlanePoint, c);
+    vec3.copy(this.dragPivot, c);
     const az = (this.camera.getAzimuth() * Math.PI) / 180;
     const inc = (this.camera.getIncline() * Math.PI) / 180;
     vec3.set(
@@ -619,6 +973,7 @@ export class SimViewportRuntime {
     this.camera.update();
     this.renderer.render(this.cloth, this.camera);
     this.syncMoveGizmo();
+    this.refreshPointMarkers();
   }
 
   renderPaused(): void {
@@ -628,6 +983,7 @@ export class SimViewportRuntime {
     this.camera.update();
     this.renderer.render(this.cloth, this.camera);
     this.syncMoveGizmo();
+    this.refreshPointMarkers();
   }
 
   async snapshotDataUrl(): Promise<string> {

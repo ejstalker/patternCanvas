@@ -29,9 +29,12 @@ struct Obstacle {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read_write> positions: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> velocities: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read> invMasses: array<f32>;
+// x = inverse mass, y = mean incident edge length (per-particle contact margin).
+@group(0) @binding(3) var<storage, read> massEdge: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> obstacles: array<Obstacle>;
 @group(0) @binding(5) var meshSdf: texture_3d<f32>;
+
+const BASE_COLLISION_MARGIN: f32 = 0.05;
 
 struct DN { d: f32, n: vec3<f32> }
 struct PV { p: vec3<f32>, v: vec3<f32> }
@@ -142,10 +145,17 @@ fn sdf_sample(o: Obstacle, p: vec3<f32>) -> DN {
   return DN(1e6, vec3<f32>(0.0, 1.0, 0.0));
 }
 
-fn resolve_contact(p_in: vec3<f32>, v_in: vec3<f32>, d: f32, n_in: vec3<f32>) -> PV {
+fn resolve_contact(
+  p_in: vec3<f32>,
+  v_in: vec3<f32>,
+  d: f32,
+  n_in: vec3<f32>,
+  margin: f32,
+  maxPush: f32
+) -> PV {
   var p = p_in;
   var v = v_in;
-  let depth = params.margin - d;
+  let depth = margin - d;
   if (depth <= 0.0) {
     return PV(p, v);
   }
@@ -156,7 +166,7 @@ fn resolve_contact(p_in: vec3<f32>, v_in: vec3<f32>, d: f32, n_in: vec3<f32>) ->
   } else {
     nrm = nrm / nlen;
   }
-  p = p + nrm * min(depth, params.maxPush);
+  p = p + nrm * min(depth, maxPush);
 
   let vn = dot(v, nrm);
   if (vn < 0.0) {
@@ -173,13 +183,19 @@ fn resolve_contact(p_in: vec3<f32>, v_in: vec3<f32>, d: f32, n_in: vec3<f32>) ->
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= params.n) { return; }
-  if (invMasses[i] <= 0.0) { return; }
+  if (massEdge[i].x <= 0.0) { return; }
 
   var p = positions[i].xyz;
   var v = velocities[i].xyz;
 
+  // Per-particle margin (matches SdfVolume.resolveParticle) so thin strips whose
+  // cross-width edges are short aren't floated off the body by a global average.
+  let edge = massEdge[i].y;
+  let margin = max(BASE_COLLISION_MARGIN, edge * 0.35);
+  let maxPush = max(margin * 2.0, edge * 1.5);
+
   {
-    let r = resolve_contact(p, v, p.y - params.floorY, vec3<f32>(0.0, 1.0, 0.0));
+    let r = resolve_contact(p, v, p.y - params.floorY, vec3<f32>(0.0, 1.0, 0.0), margin, maxPush);
     p = r.p;
     v = r.v;
   }
@@ -189,7 +205,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p_body = rot_to_body(o, p - o.center.xyz);
     let dn = sdf_sample(o, p_body);
     let n_world = rot_to_world(o, dn.n);
-    let r = resolve_contact(p, v, dn.d, n_world);
+    let r = resolve_contact(p, v, dn.d, n_world, margin, maxPush);
     p = r.p;
     v = r.v;
   }

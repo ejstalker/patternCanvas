@@ -93,6 +93,8 @@ export class PatternCloth {
   private floor: Ground;
   private floorY: number;
   private avgEdgeLength = 0.4;
+  /** Per-particle mean incident edge length (world units) for collision margin. */
+  private edgeLengths: Float32Array = new Float32Array(0);
   private initialPositions: vec3[] = [];
   private dragging = false;
   private prevT = 0;
@@ -104,6 +106,8 @@ export class PatternCloth {
   private normalBuffer: GPUBuffer | null = null;
   private colorBuffer: GPUBuffer | null = null;
   private indexBuffer: GPUBuffer | null = null;
+  /** Flat (xyz interleaved) copy of the latest particle positions for CPU overlays. */
+  private flatPositions = new Float32Array(0);
   private seamLinePositionBuffer: GPUBuffer | null = null;
   private seamLineNormalBuffer: GPUBuffer | null = null;
   private seamLineVertexCount = 0;
@@ -163,6 +167,7 @@ export class PatternCloth {
     const topo = buildClothTopology(mesh, mass, this.pattern, { layoutY: 4.0 });
     this.vertexPieceIds = [...topo.vertexPieceIds];
     this.avgEdgeLength = topo.avgEdgeLength;
+    this.edgeLengths = new Float32Array(topo.edgeLengths);
     this.particleMass = topo.particleMass;
     const up = vec3.fromValues(0, 1, 0);
 
@@ -173,7 +178,7 @@ export class PatternCloth {
         topo.positions[i * 3 + 2]
       );
       const p = new Particle(pos, vec3.clone(up), this.particleMass, this.gravityAcce, this.floorY);
-      p.setEdgeLength(this.avgEdgeLength);
+      p.setEdgeLength(topo.edgeLengths[i] ?? this.avgEdgeLength);
       p.setFixed(false);
       this.particles.push(p);
       this.positions.push(vec3.clone(pos));
@@ -265,6 +270,8 @@ export class PatternCloth {
       nrmData[i * 3 + 1] = this.normals[i][1];
       nrmData[i * 3 + 2] = this.normals[i][2];
     }
+    // Available immediately after construction (before the first `update()`).
+    this.flatPositions = posData;
     this.positionBuffer = this.device.createBuffer({
       size: posData.byteLength,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
@@ -360,6 +367,7 @@ export class PatternCloth {
       posData.set(this.positions[i], i * 3);
       nrmData.set(this.normals[i], i * 3);
     }
+    this.flatPositions = posData;
     this.device.queue.writeBuffer(this.positionBuffer!, 0, posData);
     this.device.queue.writeBuffer(this.normalBuffer!, 0, nrmData);
     this.syncStrainColors(false, posData);
@@ -615,11 +623,12 @@ export class PatternCloth {
         }
       }
 
-      for (const p of this.particles) {
+      for (let pi = 0; pi < this.particles.length; pi++) {
+        const p = this.particles[pi];
         if (velRetain < 1) p.scaleVelocity(velRetain);
         p.clampSpeed(this.maxSpeed);
         p.groundCollision();
-        this.avatar.resolveParticle(p, this.avgEdgeLength);
+        this.avatar.resolveParticle(p, this.edgeLengths[pi] ?? this.avgEdgeLength);
       }
     }
     this.syncBuffers();
@@ -722,6 +731,10 @@ export class PatternCloth {
 
   getPositionBuffer(): GPUBuffer {
     return this.positionBuffer!;
+  }
+
+  getPositionsSnapshot(): Float32Array | null {
+    return this.flatPositions.length ? this.flatPositions : null;
   }
 
   getNormalBuffer(): GPUBuffer {

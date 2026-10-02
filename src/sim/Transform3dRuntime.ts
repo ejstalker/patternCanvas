@@ -24,6 +24,15 @@ import type { AvatarBody } from '../mesh/AvatarBody';
 import { DEFAULT_MESH_SETTINGS, triangulatePattern } from '../mesh/triangulate';
 import { migrateLegacySimCamera } from './cameraDefaults';
 import { createViewportRenderer } from './SimViewportRuntime';
+import { SelectionOverlay } from './SelectionOverlay';
+import { keepPieceTransforms } from './pieceTransforms';
+import {
+  buildQuadrantLayout,
+  pickQuadrant,
+  quadrantCellCenter,
+  quadrantCellVertices,
+  type QuadrantLayout,
+} from './quadrantGrid';
 import { FALLBACK_PIECE_ID } from './meshTopology';
 import { DEFAULT_TRANSFORM_PIECE_ROTATION_DEG } from './transformDefaults';
 import type {
@@ -85,70 +94,6 @@ function applyPiecePlacement(cloth: ClothSimulator, pieceId: string, t: PieceTra
   cloth.setPieceCentroid(pieceId, t.position);
 }
 
-function clonePieceTransform(t: PieceTransform3d): PieceTransform3d {
-  return {
-    position: [...t.position] as [number, number, number],
-    rotationDeg: [...t.rotationDeg] as [number, number, number],
-    rotationQuat: t.rotationQuat
-      ? ([...t.rotationQuat] as [number, number, number, number])
-      : undefined,
-  };
-}
-
-/**
- * Keep placements for live piece ids. Also migrate legacy `__cloth__` keys that
- * were used when the mesh lacked per-vertex piece ownership — otherwise remesh
- * drops every saved transform and snaps back to the flat layout.
- */
-function keepPieceTransforms(
-  pieceTransforms: Record<string, PieceTransform3d>,
-  liveIds: string[],
-  cloth: ClothSimulator
-): Record<string, PieceTransform3d> {
-  const live = new Set(liveIds);
-  const kept: Record<string, PieceTransform3d> = {};
-  for (const [pieceId, t] of Object.entries(pieceTransforms)) {
-    if (!live.has(pieceId) || pieceId === FALLBACK_PIECE_ID) continue;
-    kept[pieceId] = clonePieceTransform(t);
-  }
-
-  const fallback = pieceTransforms[FALLBACK_PIECE_ID];
-  if (!fallback || live.has(FALLBACK_PIECE_ID)) return kept;
-  if (Object.keys(kept).length > 0) return kept;
-
-  if (liveIds.length === 1) {
-    kept[liveIds[0]] = clonePieceTransform(fallback);
-    return kept;
-  }
-
-  // Whole-cloth arrangement → distribute the same rotation and group translation
-  // across pieces (rest layout is already the post-remesh flat pose).
-  let cx = 0;
-  let cy = 0;
-  let cz = 0;
-  for (const id of liveIds) {
-    const c = cloth.getPieceCentroidTuple(id);
-    cx += c[0];
-    cy += c[1];
-    cz += c[2];
-  }
-  const n = Math.max(liveIds.length, 1);
-  const dx = fallback.position[0] - cx / n;
-  const dy = fallback.position[1] - cy / n;
-  const dz = fallback.position[2] - cz / n;
-  for (const id of liveIds) {
-    const c = cloth.getPieceCentroidTuple(id);
-    kept[id] = {
-      position: [c[0] + dx, c[1] + dy, c[2] + dz],
-      rotationDeg: [...fallback.rotationDeg] as [number, number, number],
-      rotationQuat: fallback.rotationQuat
-        ? ([...fallback.rotationQuat] as [number, number, number, number])
-        : undefined,
-    };
-  }
-  return kept;
-}
-
 type NavMode = 'none' | 'orbit' | 'pan' | 'orbitHeight' | 'gizmo' | 'cloth';
 
 export type Transform3dRuntimeOptions = {
@@ -169,14 +114,30 @@ export class Transform3dRuntime {
   private device: GPUDevice;
   private viewGnomon: ViewportGnomon | null = null;
   private moveGizmo: MoveGizmo | null = null;
+  private selectionOverlay: SelectionOverlay | null = null;
   private transformToggle: HTMLButtonElement | null = null;
+  private snapToggle: HTMLButtonElement | null = null;
+  /** Quadrant snap tool: shows the grids and centres pieces on click. */
+  private snapToQuadrantEnabled = false;
+  private quadrantLayout: QuadrantLayout = buildQuadrantLayout();
+  private hoveredQuadrant: number | null = null;
+  /** Cell picked on pointerdown; committed on click (not on drag). */
+  private pendingQuadrantSnap: number | null = null;
+  private hoverClientX = 0;
+  private hoverClientY = 0;
+  private hoverValid = false;
+  /** Primary (last-clicked) piece — drives the inspector and local-axis ops. */
   private selectedPieceId: string | null = null;
+  /** Full multi-selection; may contain several pieces for group transforms. */
+  private selectedPieceIds: Set<string> = new Set();
   private transformMode: TransformMode = 'translate';
   private nav: NavMode = 'none';
   private lastX = 0;
   private lastY = 0;
   private pointerMoved = false;
   private lastAxisSnap: AxisId | null = null;
+  /** Group pivot (mean of selected centroids) captured at drag start. */
+  private dragPivot: vec3 = vec3.create();
   private gizmoAxis: MoveAxis | null = null;
   private lastPlaneHit: vec3 | null = null;
   private dragPlanePoint: vec3 = vec3.create();
@@ -218,6 +179,15 @@ export class Transform3dRuntime {
     return this.selectedPieceId;
   }
 
+  /** All currently selected piece ids (multi-select aware). */
+  getSelectedPieceIds(): string[] {
+    return [...this.selectedPieceIds];
+  }
+
+  isPieceSelected(pieceId: string): boolean {
+    return this.selectedPieceIds.has(pieceId);
+  }
+
   setSelectedPieceId(pieceId: string | null): void {
     this.setPieceSelected(pieceId);
   }
@@ -252,6 +222,20 @@ export class Transform3dRuntime {
     transform.camera.target = [this.camera.getPanX(), this.camera.getPanY(), this.camera.getPanZ()];
   }
 
+  /**
+   * Apply a camera state verbatim, skipping legacy migration / re-framing.
+   * Used to preserve the user's exact view when undo/redo restores a snapshot.
+   */
+  setCameraState(camera: SimCameraState): void {
+    this.camera.setDistance(camera.distance);
+    this.camera.setAzimuth((camera.azimuth * 180) / Math.PI);
+    this.camera.setIncline((camera.elevation * 180) / Math.PI);
+    this.camera.setPanX(camera.target[0]);
+    this.camera.setPanY(camera.target[1]);
+    this.camera.setPanZ(camera.target[2]);
+    this.syncMoveGizmo();
+  }
+
   private markBeforePoseChange(): void {
     if (this.poseHistoryArmed) return;
     this.poseHistoryArmed = true;
@@ -273,6 +257,12 @@ export class Transform3dRuntime {
   private syncPieceTransformsFromCloth(): void {
     if (!this.cloth) return;
     const liveIds = new Set(this.getPieceIds());
+    // A cloth without per-piece ownership (legacy mesh whose vertices all map to
+    // the fallback id) can't describe individual pieces. Leave existing
+    // placements alone rather than wiping every real piece id.
+    const hasPieceOwnership = [...liveIds].some((id) => id !== FALLBACK_PIECE_ID);
+    if (!hasPieceOwnership) return;
+
     for (const pieceId of liveIds) {
       const existing = this.transform.pieceTransforms[pieceId];
       const q = resolvePieceQuat(
@@ -291,42 +281,6 @@ export class Transform3dRuntime {
     for (const pieceId of Object.keys(this.transform.pieceTransforms)) {
       if (!liveIds.has(pieceId)) delete this.transform.pieceTransforms[pieceId];
     }
-  }
-
-  /** Record an incremental local-axis rotation so remesh can restore orientation. */
-  private accumulatePieceLocalRotation(
-    pieceId: string,
-    localAxis: vec3,
-    radians: number
-  ): void {
-    if (!this.cloth || Math.abs(radians) < 1e-8) return;
-    const existing = this.transform.pieceTransforms[pieceId];
-    const current = quat.fromValues(
-      ...resolvePieceQuat(
-        existing ?? {
-          position: this.cloth.getPieceCentroidTuple(pieceId),
-          rotationDeg: [0, 0, 0],
-        }
-      )
-    );
-    const delta = quat.create();
-    const normalizedLocal = vec3.clone(localAxis);
-    if (vec3.squaredLength(normalizedLocal) < 1e-8) return;
-    vec3.normalize(normalizedLocal, normalizedLocal);
-    quat.setAxisAngle(delta, normalizedLocal, radians);
-    quat.multiply(current, current, delta);
-    quat.normalize(current, current);
-    const rotationQuat: [number, number, number, number] = [
-      current[0],
-      current[1],
-      current[2],
-      current[3],
-    ];
-    this.transform.pieceTransforms[pieceId] = {
-      position: this.cloth.getPieceCentroidTuple(pieceId),
-      rotationDeg: quatToEulerDeg(rotationQuat),
-      rotationQuat,
-    };
   }
 
   private pieceLocalAxisInWorld(pieceId: string, localAxis: vec3): vec3 | null {
@@ -433,22 +387,124 @@ export class Transform3dRuntime {
     migrateLegacySimCamera(this.transform.camera, this.defaultCamera);
     this.applyCamera(this.transform);
     this.mountViewGnomon();
+    this.selectionOverlay = new SelectionOverlay(this.host);
     this.mountMoveGizmo();
     this.mountTransformToggle();
+    this.mountSnapToggle();
     this.bindPointer();
     this.bindKeyboard();
   }
 
-  /** Rotate the selected piece by 90° around its local X axis. */
+  /** Tool button that reveals the quadrant grids (sits under the Move/Rotate toggle). */
+  private mountSnapToggle(): void {
+    this.snapToggle?.remove();
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'sim-snap-toggle';
+    button.textContent = 'Snap to quadrant';
+    button.title =
+      'Snap to quadrant — show the 2 × 8 grids, click a piece then click a cell to centre it there';
+    button.setAttribute('aria-pressed', 'false');
+    button.addEventListener('pointerdown', (e) => e.stopPropagation());
+    button.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.setSnapToQuadrant(!this.snapToQuadrantEnabled);
+    });
+    this.host.appendChild(button);
+    this.snapToggle = button;
+    this.syncSnapToggle();
+  }
+
+  setSnapToQuadrant(enabled: boolean): void {
+    this.snapToQuadrantEnabled = enabled;
+    this.hoveredQuadrant = null;
+    this.pendingQuadrantSnap = null;
+    this.syncSnapToggle();
+    this.pushQuadrantOverlay();
+    this.canvas.style.cursor = enabled
+      ? 'crosshair'
+      : this.selectedPieceIds.size > 0
+        ? 'default'
+        : 'grab';
+  }
+
+  isSnapToQuadrantEnabled(): boolean {
+    return this.snapToQuadrantEnabled;
+  }
+
+  private syncSnapToggle(): void {
+    if (!this.snapToggle) return;
+    this.snapToggle.classList.toggle('is-active', this.snapToQuadrantEnabled);
+    this.snapToggle.setAttribute('aria-pressed', String(this.snapToQuadrantEnabled));
+  }
+
+  private pushQuadrantOverlay(): void {
+    if (!this.renderer) return;
+    if (!this.snapToQuadrantEnabled) {
+      this.renderer.setGridOverlay(null);
+      return;
+    }
+    this.renderer.setGridOverlay({
+      cells: this.quadrantLayout.cells,
+      highlight:
+        this.hoveredQuadrant == null
+          ? null
+          : quadrantCellVertices(this.quadrantLayout, this.hoveredQuadrant),
+    });
+  }
+
+  /** Recompute which grid cell is under the pointer (uses the last pointer position). */
+  private refreshQuadrantHover(): void {
+    if (!this.snapToQuadrantEnabled) return;
+    let next: number | null = null;
+    if (this.hoverValid && this.cloth) {
+      this.camera.update();
+      const ray = unprojectRay(
+        this.hoverClientX,
+        this.hoverClientY,
+        this.canvas,
+        this.camera.getViewProjectMtx()
+      );
+      const hit = ray ? pickQuadrant(this.quadrantLayout, ray.origin, ray.dir) : null;
+      next = hit ? hit.index : null;
+    }
+    if (next !== this.hoveredQuadrant) {
+      this.hoveredQuadrant = next;
+      this.pushQuadrantOverlay();
+    }
+  }
+
+  /** Centre the current selection on a quadrant cell. */
+  private snapSelectionToQuadrant(index: number): void {
+    if (!this.cloth || this.selectedPieceIds.size === 0) return;
+    const center = quadrantCellCenter(this.quadrantLayout, index);
+    if (!center) return;
+    this.markBeforePoseChange();
+    const pivot = this.selectionPivot();
+    this.translateSelection(
+      vec3.fromValues(center[0] - pivot[0], center[1] - pivot[1], center[2] - pivot[2])
+    );
+    this.persistArrangement();
+    this.syncMoveGizmo();
+  }
+
+  /**
+   * Rotate the selection 90° around the primary piece's local X axis. For a
+   * multi-selection the whole group orbits the shared pivot around that axis.
+   */
   rotateSelectedPieceQuarterTurn(): void {
-    if (!this.cloth || !this.selectedPieceId) return;
+    if (!this.cloth || this.selectedPieceIds.size === 0) return;
+    const primary = this.selectedPieceId ?? [...this.selectedPieceIds][0];
     const localX = vec3.fromValues(1, 0, 0);
-    const axis = this.pieceLocalAxisInWorld(this.selectedPieceId, localX);
+    const axis = this.pieceLocalAxisInWorld(primary, localX);
     if (!axis) return;
     const quarter = Math.PI / 2;
     this.markBeforePoseChange();
-    this.cloth.rotateBy(axis, quarter, this.selectedPieceId);
-    this.accumulatePieceLocalRotation(this.selectedPieceId, localX, quarter);
+    this.rotateSelectionAroundPivot(axis, quarter, this.selectionPivot());
+    for (const id of this.selectedPieceIds) {
+      this.accumulatePieceRotation(id, axis, quarter);
+    }
     this.persistArrangement();
     this.syncMoveGizmo();
   }
@@ -466,7 +522,7 @@ export class Transform3dRuntime {
       ) {
         return;
       }
-      if (!this.cloth || !this.selectedPieceId) return;
+      if (!this.cloth || this.selectedPieceIds.size === 0) return;
       e.preventDefault();
       e.stopPropagation();
       this.rotateSelectedPieceQuarterTurn();
@@ -497,8 +553,8 @@ export class Transform3dRuntime {
       this.transformToggle.classList.toggle('is-rotate', rotating);
       this.transformToggle.textContent = rotating ? 'Rotate' : 'Move';
       this.transformToggle.title = rotating
-        ? 'Rotation mode — drag a gizmo axis to rotate the selected piece · R = 90° on local X'
-        : 'Move mode — drag the selected piece or a gizmo axis to translate · R = 90° on local X';
+        ? 'Rotation mode — drag a gizmo axis to rotate the selection around the group pivot · R = 90° on local X'
+        : 'Move mode — drag the selection or a gizmo axis to translate · Shift-click to multi-select · R = 90° on local X';
       this.transformToggle.setAttribute('aria-pressed', String(rotating));
     }
     this.syncMoveGizmo();
@@ -529,14 +585,15 @@ export class Transform3dRuntime {
     this.moveGizmo?.destroy();
     this.moveGizmo = new MoveGizmo(this.host, {
       onDragStart: (axis, clientX, clientY) => {
-        if (!this.cloth || !this.selectedPieceId) return;
+        if (!this.cloth || this.selectedPieceIds.size === 0) return;
         this.markBeforePoseChange();
         this.nav = 'gizmo';
         this.gizmoAxis = axis;
         this.cloth.setDragging(true);
         this.camera.update();
-        const c = this.cloth.getCentroid(this.selectedPieceId);
+        const c = this.selectionPivot();
         vec3.copy(this.dragPlanePoint, c);
+        vec3.copy(this.dragPivot, c);
         if (this.transformMode === 'rotate') return;
         if (axis === 'y') {
           const az = (this.camera.getAzimuth() * Math.PI) / 180;
@@ -559,12 +616,14 @@ export class Transform3dRuntime {
         this.lastPlaneHit = this.hitPlane(clientX, clientY) ?? vec3.clone(c);
       },
       onDrag: (_axis, _dx, _dy, clientX, clientY) => {
-        if (!this.cloth || !this.gizmoAxis || !this.selectedPieceId) return;
+        if (!this.cloth || !this.gizmoAxis || this.selectedPieceIds.size === 0) return;
         if (this.transformMode === 'rotate') {
           const axis = this.rotationAxis(this.gizmoAxis);
           const angle = (_dx - _dy) * 0.012;
-          this.cloth.rotateBy(axis, angle, this.selectedPieceId);
-          this.accumulatePieceRotation(this.selectedPieceId, axis, angle);
+          this.rotateSelectionAroundPivot(axis, angle, vec3.clone(this.dragPivot));
+          for (const id of this.selectedPieceIds) {
+            this.accumulatePieceRotation(id, axis, angle);
+          }
           this.syncMoveGizmo();
           return;
         }
@@ -583,9 +642,9 @@ export class Transform3dRuntime {
             delta[0] = 0;
             delta[1] = 0;
           }
-          this.cloth.translateBy(delta, this.selectedPieceId);
+          this.translateSelection(delta);
           this.lastPlaneHit = hit;
-          vec3.copy(this.dragPlanePoint, this.cloth.getCentroid(this.selectedPieceId));
+          vec3.copy(this.dragPlanePoint, this.selectionPivot());
         }
         this.syncMoveGizmo();
       },
@@ -615,24 +674,108 @@ export class Transform3dRuntime {
   }
 
   private setPieceSelected(pieceId: string | null): void {
-    this.selectedPieceId = pieceId;
-    this.moveGizmo?.setVisible(pieceId !== null);
+    this.setPieceSelection(pieceId ? [pieceId] : [], pieceId);
+  }
+
+  /** Shift-click behaviour: add the piece to / remove it from the selection. */
+  private togglePieceSelected(pieceId: string): void {
+    if (this.selectedPieceIds.has(pieceId)) {
+      const remaining = [...this.selectedPieceIds].filter((id) => id !== pieceId);
+      const primary =
+        this.selectedPieceId === pieceId ? (remaining[remaining.length - 1] ?? null) : this.selectedPieceId;
+      this.setPieceSelection(remaining, primary);
+    } else {
+      this.setPieceSelection([...this.selectedPieceIds, pieceId], pieceId);
+    }
+  }
+
+  private setPieceSelection(ids: string[], primary: string | null): void {
+    this.selectedPieceIds = new Set(ids);
+    this.selectedPieceId = primary;
     this.syncMoveGizmo();
-    this.canvas.style.cursor = pieceId ? 'default' : 'grab';
-    this.onSelectionChange?.(pieceId);
+    this.canvas.style.cursor = this.snapToQuadrantEnabled
+      ? 'crosshair'
+      : this.selectedPieceIds.size > 0
+        ? 'default'
+        : 'grab';
+    this.onSelectionChange?.(primary);
+  }
+
+  /** Mean of the selected pieces' centroids — the shared transform pivot. */
+  private selectionPivot(): vec3 {
+    const pivot = vec3.create();
+    if (!this.cloth || this.selectedPieceIds.size === 0) return pivot;
+    for (const id of this.selectedPieceIds) {
+      vec3.add(pivot, pivot, this.cloth.getCentroid(id));
+    }
+    vec3.scale(pivot, pivot, 1 / this.selectedPieceIds.size);
+    return pivot;
+  }
+
+  /** Translate every selected piece by the same world-space delta. */
+  private translateSelection(delta: vec3): void {
+    if (!this.cloth || this.selectedPieceIds.size === 0) return;
+    for (const id of this.selectedPieceIds) {
+      this.cloth.translateBy(delta, id);
+    }
+  }
+
+  /**
+   * Rotate every selected piece rigidly around a shared world-space pivot:
+   * reorient each piece about its own centroid, then orbit that centroid around
+   * the pivot. A single selected piece (pivot === its centroid) degrades to a
+   * plain in-place rotation.
+   */
+  private rotateSelectionAroundPivot(axis: vec3, radians: number, pivot: vec3): void {
+    if (!this.cloth || this.selectedPieceIds.size === 0) return;
+    if (!Number.isFinite(radians) || Math.abs(radians) < 1e-8) return;
+    const normalized = vec3.clone(axis);
+    if (vec3.squaredLength(normalized) < 1e-8) return;
+    vec3.normalize(normalized, normalized);
+    const rotation = quat.create();
+    quat.setAxisAngle(rotation, normalized, radians);
+    const rel = vec3.create();
+    const target = vec3.create();
+    const delta = vec3.create();
+    for (const id of this.selectedPieceIds) {
+      const before = this.cloth.getCentroid(id);
+      this.cloth.rotateBy(normalized, radians, id);
+      vec3.sub(rel, before, pivot);
+      vec3.transformQuat(rel, rel, rotation);
+      vec3.add(target, pivot, rel);
+      vec3.sub(delta, target, before);
+      this.cloth.translateBy(delta, id);
+    }
   }
 
   private syncMoveGizmo(): void {
-    if (!this.moveGizmo || !this.cloth || !this.selectedPieceId) return;
+    if (!this.moveGizmo) return;
+    if (!this.cloth || this.selectedPieceIds.size === 0) {
+      this.moveGizmo.setVisible(false);
+      this.selectionOverlay?.sync([], null);
+      return;
+    }
     this.camera.update();
-    const c = this.cloth.getCentroid(this.selectedPieceId);
-    const px = worldToCanvasPx(c, this.camera, this.canvas);
-    if (!px || px.behind) {
+
+    const markers: Array<{ id: string; x: number; y: number }> = [];
+    for (const id of this.selectedPieceIds) {
+      const c = this.cloth.getCentroid(id);
+      const px = worldToCanvasPx(c, this.camera, this.canvas);
+      if (px && !px.behind) markers.push({ id, x: px.x, y: px.y });
+    }
+    const pivot = this.selectionPivot();
+    const pivotPx = worldToCanvasPx(pivot, this.camera, this.canvas);
+    this.selectionOverlay?.sync(
+      markers,
+      pivotPx && !pivotPx.behind ? pivotPx : null
+    );
+
+    if (!pivotPx || pivotPx.behind) {
       this.moveGizmo.setVisible(false);
       return;
     }
     this.moveGizmo.setVisible(true);
-    this.moveGizmo.setScreenPosition(px.x, px.y);
+    this.moveGizmo.setScreenPosition(pivotPx.x, pivotPx.y);
     this.moveGizmo.updateAxisLayout(this.camera);
   }
 
@@ -686,9 +829,15 @@ export class Transform3dRuntime {
     );
 
     const liveIds = this.getPieceIds();
-    // Keep caller-provided placements for pieces that still exist (remesh / add piece).
-    // Remap legacy `__cloth__` keys when the new mesh has real pattern piece ids.
-    const kept = keepPieceTransforms(pieceTransforms, liveIds, this.cloth);
+    // Retain placements by durable piece id across remesh / add / delete. Pieces
+    // replaced by new ids (a knife cut) inherit via `pattern.pieceSuccessors`,
+    // and legacy `__cloth__` keys are migrated when the new mesh has real ids.
+    const kept = keepPieceTransforms(
+      pieceTransforms,
+      liveIds,
+      this.cloth,
+      pattern?.pieceSuccessors
+    );
     this.transform.pieceTransforms = kept;
 
     const poseMatchesTopology =
@@ -726,8 +875,25 @@ export class Transform3dRuntime {
         const ray = unprojectRay(e.clientX, e.clientY, this.canvas, this.camera.getViewProjectMtx());
         const hit = ray && this.cloth ? this.cloth.raycast(ray.origin, ray.dir) : null;
         if (hit && this.cloth) {
-          this.setPieceSelected(hit.pieceId);
-          this.beginClothDrag(e.clientX, e.clientY);
+          if (e.shiftKey) {
+            // Shift-click toggles membership; never starts a drag so pieces
+            // aren't nudged while building a multi-selection.
+            this.togglePieceSelected(hit.pieceId);
+            this.nav = 'none';
+          } else {
+            // Clicking a piece that's already part of a group keeps the group
+            // and moves/rotates all of it together.
+            if (!this.selectedPieceIds.has(hit.pieceId)) {
+              this.setPieceSelected(hit.pieceId);
+            }
+            this.beginClothDrag(e.clientX, e.clientY);
+          }
+        } else if (this.snapToQuadrantEnabled && this.selectedPieceIds.size > 0 && ray) {
+          // Quadrant tool with a selection: a click centres it on the hovered
+          // cell; a drag still orbits (resolved on pointerup via pointerMoved).
+          const target = pickQuadrant(this.quadrantLayout, ray.origin, ray.dir);
+          this.pendingQuadrantSnap = target ? target.index : null;
+          this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
         } else {
           this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
         }
@@ -746,13 +912,33 @@ export class Transform3dRuntime {
             ? 'ns-resize'
             : this.nav === 'cloth'
               ? 'move'
-              : 'grabbing';
+              : this.nav === 'none'
+                ? this.snapToQuadrantEnabled
+                  ? 'crosshair'
+                  : this.selectedPieceIds.size > 0
+                    ? 'default'
+                    : 'grab'
+                : 'grabbing';
       this.canvas.setPointerCapture(e.pointerId);
       e.preventDefault();
       e.stopPropagation();
     });
 
+    this.canvas.addEventListener('pointerleave', () => {
+      this.hoverValid = false;
+      if (this.hoveredQuadrant != null) {
+        this.hoveredQuadrant = null;
+        this.pushQuadrantOverlay();
+      }
+    });
+
     this.canvas.addEventListener('pointermove', (e) => {
+      if (this.snapToQuadrantEnabled) {
+        this.hoverClientX = e.clientX;
+        this.hoverClientY = e.clientY;
+        this.hoverValid = true;
+        if (this.nav === 'none') this.refreshQuadrantHover();
+      }
       if (this.nav === 'none' || this.nav === 'gizmo') return;
       const dx = e.clientX - this.lastX;
       const dy = e.clientY - this.lastY;
@@ -761,16 +947,21 @@ export class Transform3dRuntime {
       if (this.nav === 'cloth') {
         this.lastX = e.clientX;
         this.lastY = e.clientY;
-        if (this.transformMode === 'rotate' && this.cloth && this.selectedPieceId) {
+        if (this.transformMode === 'rotate' && this.cloth && this.selectedPieceIds.size > 0) {
           const yawAxis = vec3.fromValues(0, 1, 0);
           const yaw = dx * 0.01;
-          this.cloth.rotateBy(yawAxis, yaw, this.selectedPieceId);
-          this.accumulatePieceRotation(this.selectedPieceId, yawAxis, yaw);
           const az = (this.camera.getAzimuth() * Math.PI) / 180;
           const cameraRight = vec3.fromValues(Math.cos(az), 0, -Math.sin(az));
           const pitch = dy * 0.01;
-          this.cloth.rotateBy(cameraRight, pitch, this.selectedPieceId);
-          this.accumulatePieceRotation(this.selectedPieceId, cameraRight, pitch);
+          const pivot = vec3.clone(this.dragPivot);
+          this.rotateSelectionAroundPivot(yawAxis, yaw, pivot);
+          for (const id of this.selectedPieceIds) {
+            this.accumulatePieceRotation(id, yawAxis, yaw);
+          }
+          this.rotateSelectionAroundPivot(cameraRight, pitch, pivot);
+          for (const id of this.selectedPieceIds) {
+            this.accumulatePieceRotation(id, cameraRight, pitch);
+          }
           this.syncMoveGizmo();
           return;
         }
@@ -779,10 +970,10 @@ export class Transform3dRuntime {
         if (hit && this.lastPlaneHit && this.cloth) {
           const delta = vec3.create();
           vec3.sub(delta, hit, this.lastPlaneHit);
-          if (!this.selectedPieceId) return;
-          this.cloth.translateBy(delta, this.selectedPieceId);
+          if (this.selectedPieceIds.size === 0) return;
+          this.translateSelection(delta);
           this.lastPlaneHit = hit;
-          vec3.copy(this.dragPlanePoint, this.cloth.getCentroid(this.selectedPieceId));
+          vec3.copy(this.dragPlanePoint, this.selectionPivot());
         }
         this.syncMoveGizmo();
         return;
@@ -822,6 +1013,8 @@ export class Transform3dRuntime {
     const endDrag = (e: PointerEvent) => {
       const wasOrbitClick = this.nav === 'orbit' && (e.button === 0 || e.button === -1) && !this.pointerMoved;
       const wasCloth = this.nav === 'cloth';
+      const pendingSnap = this.pendingQuadrantSnap;
+      this.pendingQuadrantSnap = null;
       const movedCamera = this.nav === 'orbit' || this.nav === 'orbitHeight' || this.nav === 'pan';
       if (wasCloth) {
         this.cloth?.setDragging(false);
@@ -839,10 +1032,17 @@ export class Transform3dRuntime {
         /* ignore */
       }
 
-      if (wasOrbitClick) {
+      if (pendingSnap != null && !this.pointerMoved) {
+        // Quadrant click (not a drag) — centre the selection on that cell.
+        this.snapSelectionToQuadrant(pendingSnap);
+      } else if (wasOrbitClick) {
         this.setPieceSelected(null);
       }
-      this.canvas.style.cursor = this.selectedPieceId ? 'default' : 'grab';
+      this.canvas.style.cursor = this.snapToQuadrantEnabled
+        ? 'crosshair'
+        : this.selectedPieceIds.size > 0
+          ? 'default'
+          : 'grab';
     };
     this.canvas.addEventListener('pointerup', endDrag);
     this.canvas.addEventListener('pointercancel', endDrag);
@@ -862,14 +1062,15 @@ export class Transform3dRuntime {
   }
 
   private beginClothDrag(clientX: number, clientY: number): void {
-    if (!this.cloth || !this.selectedPieceId) return;
+    if (!this.cloth || this.selectedPieceIds.size === 0) return;
     this.markBeforePoseChange();
     this.nav = 'cloth';
     this.gizmoAxis = 'free';
     this.cloth.setDragging(true);
     this.camera.update();
-    const c = this.cloth.getCentroid(this.selectedPieceId);
+    const c = this.selectionPivot();
     vec3.copy(this.dragPlanePoint, c);
+    vec3.copy(this.dragPivot, c);
     const az = (this.camera.getAzimuth() * Math.PI) / 180;
     const inc = (this.camera.getIncline() * Math.PI) / 180;
     vec3.set(
@@ -904,6 +1105,8 @@ export class Transform3dRuntime {
     this.resize();
     this.cloth.update(false);
     this.camera.update();
+    // Keep the quadrant highlight in sync as the camera orbits/zooms.
+    if (this.snapToQuadrantEnabled) this.refreshQuadrantHover();
     this.renderer.render(this.cloth, this.camera);
     this.syncMoveGizmo();
   }

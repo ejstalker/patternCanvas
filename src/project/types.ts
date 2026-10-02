@@ -61,6 +61,13 @@ export type PatternDocument = {
   name: string;
   pieces: PatternPiece[];
   seams: SeamBinding[];
+  /**
+   * Lineage for pieces that were replaced by new ids (e.g. a knife cut):
+   * removed piece id → the ids that took its place. Downstream Transform 3D
+   * nodes use this to carry the piece's arrangement onto its successors instead
+   * of resetting them. Optional — older documents simply have no lineage.
+   */
+  pieceSuccessors?: Record<string, string[]>;
 };
 
 export type MeshAlgorithm = 'structuredGrid' | 'delaunay' | 'centroidal';

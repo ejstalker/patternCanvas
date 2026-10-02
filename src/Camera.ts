@@ -16,6 +16,8 @@ export class Camera {
     private orthographic: boolean = false;
 
     private viewProjectMtx: mat4 = mat4.create();
+    /** World-space eye position (updated on every `update()`). */
+    private eye: vec3 = vec3.create();
 
     constructor() {
         this.reset();
@@ -33,6 +35,8 @@ export class Camera {
         const worldFinal = mat4.create();
         mat4.copy(worldFinal, worldRotated);
         mat4.translate(worldFinal, worldFinal, [-this.panX, -this.panY, -this.panZ]);
+        // worldFinal is the camera's world transform; its translation is the eye.
+        vec3.set(this.eye, worldFinal[12], worldFinal[13], worldFinal[14]);
 
         const view = inverse(worldFinal);
 
@@ -158,6 +162,11 @@ export class Camera {
         const worldPerPixel =
             (2 * this.distance * Math.tan((this.fov * Math.PI) / 360)) / Math.max(viewportHeight, 1);
         this.panY -= dyPx * worldPerPixel;
+    }
+
+    /** World-space camera position (valid after `update()`). */
+    getEyePosition(): vec3 {
+        return vec3.clone(this.eye);
     }
 
     getViewProjectMtx(): mat4 {

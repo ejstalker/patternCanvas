@@ -9,6 +9,7 @@ import type {
 } from '../project/types';
 import { formatLength } from '../project/types';
 import { drawMeshSeamConnectors } from '../mesh/meshSeamDraw';
+import { recordPieceSuccessors } from '../sim/pieceTransforms';
 import { circlePiece, rectPiece, uid } from '../project/createDefault';
 import {
   anchorsBounds,
@@ -1682,6 +1683,13 @@ export class PatternEditor {
       this.endHistoryGesture();
       return;
     }
+    // The two halves get fresh ids; record the lineage so downstream Transform 3D
+    // nodes hand the original arrangement down instead of resetting to default.
+    this.pattern.pieceSuccessors = recordPieceSuccessors(
+      this.pattern.pieceSuccessors,
+      piece.id,
+      [a.id, b.id]
+    );
 
     const children = [
       { piece: a, pointMap: result.pointIdMaps[0] },

@@ -56,6 +56,8 @@ export interface ClothSimulator extends ClothRenderExtras {
   translateBy(delta: vec3, pieceId?: string): void;
   rotateBy(axis: vec3, radians: number, pieceId: string): void;
   setDragging(dragging: boolean): void;
+  /** Latest particle positions (xyz interleaved, world units) for overlays, or null. */
+  getPositionsSnapshot?(): Float32Array | null;
 
   getModelMatrix(): mat4;
   getPositionBuffer(): GPUBuffer;

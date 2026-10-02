@@ -1,8 +1,20 @@
+// XPBD distance constraint with an accumulated Lagrange multiplier.
+//
+// Uses the true XPBD update Δλ = (−C − α̃λ) / (w₁+w₂+α̃) with α̃ = α/h², so
+// `compliance` is timestep-independent (the previous form multiplied C by a raw
+// softness fraction, which made stiffness drift with substep count).
+//
+// λ is reset to 0 at the start of every substep (reset_lambdas.wgsl).
+
 struct Params {
   offset: u32,
   count: u32,
   compliance: f32,
   nParticles: u32,
+  invH2: f32,
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -10,6 +22,7 @@ struct Params {
 @group(0) @binding(2) var<storage, read> invMasses: array<f32>;
 @group(0) @binding(3) var<storage, read> stretchIndices: array<u32>;
 @group(0) @binding(4) var<storage, read> stretchRest: array<f32>;
+@group(0) @binding(5) var<storage, read_write> lambdas: array<f32>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -33,13 +46,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let distance = length(diff);
   if (distance < 1e-8) { return; }
 
+  let nrm = diff / distance;
   let C = distance - expected;
-  if (abs(C) < 1e-8) { return; }
 
   // Color-class Gauss–Seidel: no shared vertices within a dispatch → safe stores.
-  let nrm = diff / distance;
-  let alpha = clamp(params.compliance, 0.0, 1.0);
-  let corr = nrm * ((C / wSum) * (1.0 - alpha));
-  predicted[idx1] = vec4<f32>(p1 - corr * w1, 0.0);
-  predicted[idx2] = vec4<f32>(p2 + corr * w2, 0.0);
+  let alphaTilde = max(params.compliance, 0.0) * params.invH2;
+  let lambda = lambdas[id];
+  let dLambda = (-C - alphaTilde * lambda) / (wSum + alphaTilde);
+  lambdas[id] = lambda + dLambda;
+
+  predicted[idx1] = vec4<f32>(p1 + nrm * (w1 * dLambda), 0.0);
+  predicted[idx2] = vec4<f32>(p2 - nrm * (w2 * dLambda), 0.0);
 }

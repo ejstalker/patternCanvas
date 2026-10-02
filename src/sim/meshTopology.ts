@@ -33,6 +33,8 @@ export type ClothTopology = {
   initialPositions: Float32Array;
   inverseMasses: Float32Array;
   radii: Float32Array;
+  /** Mean incident edge length per particle (world units) — drives collision margin. */
+  edgeLengths: Float32Array;
   indices: Uint32Array;
   vertexPieceIds: string[];
   stretch: StretchConstraint[];
@@ -221,6 +223,7 @@ export function buildClothTopology(
   const initialPositions = new Float32Array(n * 3);
   const inverseMasses = new Float32Array(n);
   const radii = new Float32Array(n);
+  const edgeLengths = new Float32Array(n);
   const particleMass = mass / Math.max(n, 1);
   const invMass = particleMass > 0 ? 1 / particleMass : 0;
 
@@ -230,7 +233,6 @@ export function buildClothTopology(
       Math.hypot(vertices[a].x - vertices[b].x, vertices[a].y - vertices[b].y) * CM_TO_WORLD;
   }
   const avgEdgeLength = edges.length > 0 ? avgEdge / edges.length : 0.4;
-  const radius = avgEdgeLength * diameterScalar * 0.5;
 
   for (let i = 0; i < n; i++) {
     const p = vertices[i];
@@ -246,7 +248,32 @@ export function buildClothTopology(
     initialPositions[i * 3 + 1] = y;
     initialPositions[i * 3 + 2] = z;
     inverseMasses[i] = invMass;
-    radii[i] = radius;
+  }
+
+  // Per-particle local edge length. A global average is wrong for strips that
+  // mix long along-axis edges with very short cross-width edges, and it makes
+  // the collision margin float or sink the strip.
+  {
+    const localSum = new Float32Array(n);
+    const localCount = new Float32Array(n);
+    const dist3 = (a: number, b: number): number =>
+      Math.hypot(
+        positions[a * 3] - positions[b * 3],
+        positions[a * 3 + 1] - positions[b * 3 + 1],
+        positions[a * 3 + 2] - positions[b * 3 + 2]
+      );
+    for (const [a, b] of edges) {
+      const len = dist3(a, b);
+      localSum[a] += len;
+      localCount[a] += 1;
+      localSum[b] += len;
+      localCount[b] += 1;
+    }
+    for (let i = 0; i < n; i++) {
+      const localAvg = localCount[i] > 0 ? localSum[i] / localCount[i] : avgEdgeLength;
+      edgeLengths[i] = localAvg;
+      radii[i] = localAvg * diameterScalar * 0.5;
+    }
   }
 
   const stretch: StretchConstraint[] = [];
@@ -302,6 +329,7 @@ export function buildClothTopology(
     initialPositions,
     inverseMasses,
     radii,
+    edgeLengths,
     indices: new Uint32Array(triangles),
     vertexPieceIds: pieceIds,
     stretch,

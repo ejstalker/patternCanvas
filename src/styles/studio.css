@@ -1399,6 +1399,163 @@ body {
   color: #f1cf65;
 }
 
+/* Quadrant snap tool — sits directly under the Move/Rotate toggle. */
+.sim-snap-toggle {
+  position: absolute;
+  top: 36px;
+  left: 8px;
+  z-index: 6;
+  padding: 4px 9px;
+  border-radius: 4px;
+  border: 1px solid rgba(242, 235, 227, 0.25);
+  background: rgba(28, 26, 23, 0.82);
+  color: #f2ebe3;
+  cursor: pointer;
+  font: 11px var(--mono);
+  white-space: nowrap;
+  user-select: none;
+}
+
+.sim-snap-toggle:hover {
+  border-color: var(--accent);
+}
+
+.sim-snap-toggle.is-active {
+  border-color: #d4a017;
+  background: rgba(212, 160, 23, 0.18);
+  color: #f1cf65;
+}
+
+/* "Draw pattern points" — sits to the right of the Move/Rotate toggle. */
+.sim-points-toggle {
+  position: absolute;
+  top: 8px;
+  left: 78px;
+  z-index: 6;
+  padding: 4px 9px;
+  border-radius: 4px;
+  border: 1px solid rgba(242, 235, 227, 0.25);
+  background: rgba(28, 26, 23, 0.82);
+  color: #f2ebe3;
+  cursor: pointer;
+  font: 11px var(--mono);
+  white-space: nowrap;
+  user-select: none;
+}
+
+.sim-points-toggle:hover {
+  border-color: var(--accent);
+}
+
+.sim-points-toggle.is-on {
+  border-color: #d4a017;
+  background: rgba(212, 160, 23, 0.18);
+  color: #f1cf65;
+}
+
+/* Marker layer: transparent to pointer events except on the markers themselves. */
+.pattern-point-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  overflow: hidden;
+  pointer-events: none;
+  user-select: none;
+}
+
+.pattern-point-marker {
+  position: absolute;
+  width: 13px;
+  height: 13px;
+  margin: -6.5px 0 0 -6.5px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1.5px solid #2f2408;
+  background: rgba(255, 209, 102, 0.95);
+  box-shadow: 0 0 5px rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
+  cursor: pointer;
+  display: block;
+}
+
+.pattern-point-marker:hover {
+  background: #ffd166;
+  border-color: #f1cf65;
+  width: 16px;
+  height: 16px;
+  margin: -8px 0 0 -8px;
+}
+
+/* Mini pattern editor pinned to the bottom-left of the drape viewport. */
+.pattern-point-overlay {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  z-index: 8;
+  border-radius: 6px;
+  border: 1px solid rgba(242, 235, 227, 0.22);
+  background: rgba(24, 22, 19, 0.94);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+  user-select: none;
+}
+
+.pattern-point-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-bottom: 1px solid rgba(242, 235, 227, 0.14);
+}
+
+.pattern-point-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 10px var(--mono);
+  color: rgba(242, 235, 227, 0.72);
+}
+
+.pattern-point-btn {
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid rgba(242, 235, 227, 0.28);
+  background: rgba(255, 255, 255, 0.06);
+  color: #f2ebe3;
+  cursor: pointer;
+  font: 10px var(--mono);
+}
+
+.pattern-point-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.pattern-point-btn.primary {
+  border-color: rgba(212, 160, 23, 0.7);
+  color: #f1cf65;
+}
+
+.pattern-point-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.pattern-point-svg {
+  display: block;
+  background: rgba(255, 255, 255, 0.035);
+  touch-action: none;
+}
+
+.pattern-point-piece {
+  stroke: rgba(242, 235, 227, 0.55);
+}
+
+.pattern-point-anchor:hover {
+  fill: #ffd166;
+}
+
 .viewport-gnomon {
   position: absolute;
   top: 8px;
@@ -1450,6 +1607,39 @@ body {
 
 .move-gizmo.is-rotate .move-gizmo-axis:hover circle {
   fill: rgba(212, 160, 23, 0.2);
+}
+
+.selection-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  overflow: hidden;
+  pointer-events: none;
+  user-select: none;
+}
+
+.selection-marker {
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  margin-left: -11px;
+  margin-top: -11px;
+  border-radius: 50%;
+  border: 1.5px dashed rgba(212, 160, 23, 0.9);
+  background: rgba(212, 160, 23, 0.14);
+  box-shadow: 0 0 6px rgba(212, 160, 23, 0.35);
+}
+
+.selection-overlay-pivot {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  margin-left: -7px;
+  margin-top: -7px;
+  border-radius: 50%;
+  border: 2px solid rgba(242, 235, 227, 0.95);
+  background: rgba(28, 26, 23, 0.65);
+  box-shadow: 0 0 8px rgba(0, 0, 0, 0.5);
 }
 
 

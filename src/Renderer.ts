@@ -7,9 +7,20 @@ import { Ground } from './Ground';
 import { Camera } from './Camera';
 import floorVertexShaderCode from './shaders/floor.vert.wgsl?raw';
 import floorFragmentShaderCode from './shaders/floor.frag.wgsl?raw';
+import gridVertexShaderCode from './shaders/grid.vert.wgsl?raw';
+import gridFragmentShaderCode from './shaders/grid.frag.wgsl?raw';
 import { inchesToOrbitWorld } from './sim/cameraDefaults';
 
 export type RenderableCloth = Cloth | SimpleCloth | ClothSimulator;
+
+/**
+ * Flat alpha-blended quad overlay (the quadrant snap grid). Vertices are
+ * triangle-list xyz triples in world space.
+ */
+export type QuadOverlay = {
+  cells: Float32Array;
+  highlight?: Float32Array | null;
+};
 
 export class Renderer {
     private device: GPUDevice;
@@ -25,6 +36,15 @@ export class Renderer {
     private floorPipeline: GPURenderPipeline | null = null;
     private wireframePipeline: GPURenderPipeline | null = null;
     private linePipeline: GPURenderPipeline | null = null;
+    /** Alpha-blended quad overlay (quadrant snap grid). */
+    private gridPipeline: GPURenderPipeline | null = null;
+    private gridUniformBuffer: GPUBuffer | null = null;
+    private gridBindGroup: GPUBindGroup | null = null;
+    private gridCellBuffer: GPUBuffer | null = null;
+    private gridHighlightBuffer: GPUBuffer | null = null;
+    private gridCellVertexCount = 0;
+    private gridHighlightVertexCount = 0;
+    private gridOverlay: QuadOverlay | null = null;
     /** Cloth model + viewProj — do not overwrite mid-frame after cloth draw is encoded. */
     private uniformBuffer: GPUBuffer | null = null;
     /** Sphere collider model matrix. */
@@ -95,6 +115,11 @@ export class Renderer {
         });
         this.overlayUniformBuffer = this.device.createBuffer({
             size: 128,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        // viewProj (64) + color (16)
+        this.gridUniformBuffer = this.device.createBuffer({
+            size: 80,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
@@ -302,6 +327,119 @@ export class Renderer {
                 format: 'depth24plus',
             },
         });
+
+        // Alpha-blended flat quads for the quadrant snap grid.
+        const gridVertexShader = this.device.createShaderModule({ code: gridVertexShaderCode });
+        const gridFragmentShader = this.device.createShaderModule({ code: gridFragmentShaderCode });
+        this.gridPipeline = this.device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: gridVertexShader,
+                entryPoint: 'main',
+                buffers: [
+                    {
+                        arrayStride: 12,
+                        attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }],
+                    },
+                ],
+            },
+            fragment: {
+                module: gridFragmentShader,
+                entryPoint: 'main',
+                targets: [
+                    {
+                        format: this.format,
+                        blend: {
+                            color: {
+                                srcFactor: 'src-alpha',
+                                dstFactor: 'one-minus-src-alpha',
+                                operation: 'add',
+                            },
+                            // Keep the canvas opaque (clear alpha is 1).
+                            alpha: {
+                                srcFactor: 'one',
+                                dstFactor: 'one-minus-src-alpha',
+                                operation: 'add',
+                            },
+                        },
+                    },
+                ],
+            },
+            primitive: {
+                topology: 'triangle-list',
+                cullMode: 'none',
+            },
+            depthStencil: {
+                depthWriteEnabled: false,
+                depthCompare: 'less-equal',
+                format: 'depth24plus',
+            },
+        });
+        this.gridBindGroup = this.device.createBindGroup({
+            layout: this.gridPipeline.getBindGroupLayout(0),
+            entries: [{ binding: 0, resource: { buffer: this.gridUniformBuffer! } }],
+        });
+    }
+
+    /** Set (or clear) the flat quad overlay drawn with the scene. */
+    setGridOverlay(overlay: QuadOverlay | null): void {
+        this.gridOverlay = overlay;
+        if (!overlay) {
+            this.gridCellVertexCount = 0;
+            this.gridHighlightVertexCount = 0;
+            return;
+        }
+        this.gridCellBuffer = this.writeOverlayBuffer(
+            this.gridCellBuffer,
+            overlay.cells
+        );
+        this.gridCellVertexCount = Math.floor(overlay.cells.length / 3);
+        if (overlay.highlight && overlay.highlight.length > 0) {
+            this.gridHighlightBuffer = this.writeOverlayBuffer(
+                this.gridHighlightBuffer,
+                overlay.highlight
+            );
+            this.gridHighlightVertexCount = Math.floor(overlay.highlight.length / 3);
+        } else {
+            this.gridHighlightVertexCount = 0;
+        }
+    }
+
+    /** Reuse a vertex buffer when it is large enough, otherwise reallocate. */
+    private writeOverlayBuffer(current: GPUBuffer | null, data: Float32Array): GPUBuffer {
+        let buffer = current;
+        if (!buffer || buffer.size < data.byteLength) {
+            buffer?.destroy();
+            buffer = this.device.createBuffer({
+                size: Math.max(data.byteLength, 12),
+                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+                label: 'grid-overlay',
+            });
+        }
+        // Copy into an ArrayBuffer-backed view so the typings accept it as
+        // GPUAllowSharedBufferSource (matches XpbdGpuEngine.gpuData).
+        const bytes = new Uint8Array(data.byteLength);
+        bytes.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+        this.device.queue.writeBuffer(buffer, 0, bytes);
+        return buffer;
+    }
+
+    private drawGridOverlay(
+        pass: GPURenderPassEncoder,
+        viewProj: mat4,
+        buffer: GPUBuffer | null,
+        vertexCount: number,
+        color: [number, number, number, number]
+    ): void {
+        if (!buffer || vertexCount <= 0 || !this.gridPipeline || !this.gridUniformBuffer) return;
+        const data = new Float32Array(20);
+        data.set(mat4ToArray(viewProj), 0);
+        data.set(color, 16);
+        this.device.queue.writeBuffer(this.gridUniformBuffer, 0, data);
+        pass.setPipeline(this.gridPipeline);
+        if (this.gridBindGroup) pass.setBindGroup(0, this.gridBindGroup);
+        pass.setVertexBuffer(0, buffer);
+        pass.draw(vertexCount);
     }
 
     resize(width: number, height: number): void {
@@ -662,6 +800,24 @@ export class Renderer {
             pass.setVertexBuffer(1, seamNrm);
             pass.draw(seamCount);
           }
+        }
+
+        // Quadrant snap grid — faint base cells, brighter hovered cell.
+        if (this.gridOverlay) {
+          this.drawGridOverlay(
+            pass,
+            viewProj,
+            this.gridCellBuffer,
+            this.gridCellVertexCount,
+            [0.78, 0.82, 0.9, 0.25]
+          );
+          this.drawGridOverlay(
+            pass,
+            viewProj,
+            this.gridHighlightBuffer,
+            this.gridHighlightVertexCount,
+            [0.83, 0.63, 0.09, 0.55]
+          );
         }
 
         pass.end();
