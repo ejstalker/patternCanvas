@@ -49,7 +49,8 @@ export type MetaKey =
   | 'activeProjectId'
   | 'storageVersion'
   | 'migratedFromLocalStorage'
-  | 'measurementSets';
+  | 'measurementSets'
+  | 'avatars';
 
 export async function getMeta(key: MetaKey): Promise<string | null> {
   const db = await openDb();
@@ -68,6 +69,31 @@ export async function setMeta(key: MetaKey, value: string): Promise<void> {
   const db = await openDb();
   const tx = db.transaction(IDB_STORES.meta, 'readwrite');
   tx.objectStore(IDB_STORES.meta).put({ key, value });
+  await txDone(tx);
+}
+
+/** Write a single asset record (used for global, non-project assets such as avatar SDFs). */
+export async function putAsset(record: AssetRecord): Promise<void> {
+  const db = await openDb();
+  const tx = db.transaction(IDB_STORES.assets, 'readwrite');
+  tx.objectStore(IDB_STORES.assets).put(record);
+  await txDone(tx);
+}
+
+export async function getAsset(id: string): Promise<AssetRecord | null> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORES.assets, 'readonly');
+    const req = tx.objectStore(IDB_STORES.assets).get(id);
+    req.onsuccess = () => resolve((req.result as AssetRecord) ?? null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function deleteAsset(id: string): Promise<void> {
+  const db = await openDb();
+  const tx = db.transaction(IDB_STORES.assets, 'readwrite');
+  tx.objectStore(IDB_STORES.assets).delete(id);
   await txDone(tx);
 }
 

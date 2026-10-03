@@ -38,7 +38,14 @@ import type {
 import { PatternEditor } from '../pattern/PatternEditor';
 import { generateBlockPieces } from '../pattern/blocks/generate';
 import { getBlockDefinition } from '../pattern/blocks/registry';
-import { MeasurementModal } from './MeasurementModal';
+import {
+  AvatarModal,
+  type AvatarGenerationOptions,
+  type AvatarPreviewElements,
+  type AvatarReport,
+} from './AvatarModal';
+import { AvatarPreview } from '../avatar/AvatarPreview';
+import { buildMeasurementRulers } from '../avatar/rulerOverlay';
 import { cachedMeasurementLibrary, loadMeasurementLibrary } from '../persistence/measurementLibrary';
 import { MeshPreview } from '../mesh/MeshPreview';
 import { createSharedGpu, SimViewportRuntime } from '../sim/SimViewportRuntime';
@@ -86,6 +93,9 @@ import {
 } from '../sim/avatarAsset';
 import { resetAvatarOverlayCache } from '../pattern/avatarPatternOverlay';
 import { DEFAULT_SDF_RESOLUTION } from '../mesh/sdfBake';
+import { buildAvatarMeshes, createAvatarBodyFromAvatar } from '../avatar/avatarService';
+import { updateAvatar } from '../persistence/avatarLibrary';
+import type { Avatar } from '../project/avatars';
 
 const WORLD_TO_CM = 10;
 
@@ -152,8 +162,11 @@ export class StudioApp {
   private selectedNodeId: string | null = null;
   /** Fixed-position tip host (escapes inspector overflow clipping). */
   private inspectorTipEl: HTMLDivElement | null = null;
-  /** Body-measurement library dialog, when open. */
-  private measurementModal: MeasurementModal | null = null;
+  /** Avatar editor dialog, when open. */
+  private avatarModal: AvatarModal | null = null;
+  private avatarPreview: AvatarPreview | null = null;
+  private avatarPreviewCanvas: HTMLCanvasElement | null = null;
+  private avatarRulersVisible = true;
   private panning = false;
   private panLast = { x: 0, y: 0 };
   private draggingNode: { id: string; ox: number; oy: number } | null = null;
@@ -817,30 +830,139 @@ export class StudioApp {
     if (this.restoringUndo) return;
     this.avatarLoadAbort?.abort();
     this.avatarLoadAbort = null;
-    // Flushes any pending measurement write before the dialog is torn down.
-    this.measurementModal?.close();
-    this.measurementModal = null;
+    // Flushes any pending write before the dialog is torn down.
+    this.avatarModal?.close();
+    this.avatarModal = null;
+    this.avatarPreview?.destroy();
+    this.avatarPreview = null;
+    this.avatarPreviewCanvas = null;
     this.modalRoot.hidden = true;
     this.modalRoot.innerHTML = '';
   }
 
-  private openMeasurementModal(): void {
+  private openAvatarEditor(): void {
     this.modalRoot.hidden = false;
-    const modal = new MeasurementModal(this.modalRoot, {
+    const modal = new AvatarModal(this.modalRoot, {
       onClose: () => this.closeModal(),
       onChange: (library) => {
         const active = library.sets.find((s) => s.id === library.activeId) ?? library.sets[0];
         this.setStatus(
           active
-            ? `Measurements · ${active.name} (${library.sets.length} ${library.sets.length === 1 ? 'person' : 'people'})`
-            : 'Measurements updated'
+            ? `Avatars · ${active.name} (${library.sets.length} ${library.sets.length === 1 ? 'avatar' : 'avatars'})`
+            : 'Avatars updated'
         );
         // Rulers are sized and labelled from these numbers — repaint them.
         this.refreshRulerLibraries();
       },
+      onGenerate: (avatar, setStatus, options) => this.generateAvatarFor(avatar, setStatus, options),
+      onPreview: (avatar, elements, setStatus) => this.previewAvatarFor(avatar, elements, setStatus),
+      onPreviewDispose: (canvas) => this.disposeAvatarPreview(canvas),
+      onShowRulers: (show) => {
+        this.avatarRulersVisible = show;
+        this.avatarPreview?.setShowRulers(show);
+      },
+      onHighlightField: (field) => this.avatarPreview?.setHighlightField(field),
     });
-    this.measurementModal = modal;
+    this.avatarModal = modal;
     void modal.open();
+  }
+
+  private disposeAvatarPreview(canvas: HTMLCanvasElement): void {
+    if (this.avatarPreviewCanvas !== canvas) return;
+    this.avatarPreview?.destroy();
+    this.avatarPreview = null;
+    this.avatarPreviewCanvas = null;
+  }
+
+  /** Render the 3D preview + measurement rulers (no sim changes). */
+  private async previewAvatarFor(
+    avatar: Avatar,
+    elements: AvatarPreviewElements,
+    setStatus: (text: string) => void
+  ): Promise<AvatarReport | null> {
+    try {
+      if (!this.device) {
+        setStatus('Starting WebGPU…');
+        const gpu = await createSharedGpu();
+        this.device = gpu.device;
+      }
+      if (this.avatarPreviewCanvas !== elements.canvas || !this.avatarPreview) {
+        this.avatarPreview?.destroy();
+        this.avatarPreview = new AvatarPreview(elements.canvas, elements.overlay, this.device);
+        this.avatarPreviewCanvas = elements.canvas;
+        this.avatarPreview.setShowRulers(this.avatarRulersVisible);
+      }
+      setStatus('');
+      const mesh = await buildAvatarMeshes(avatar);
+      this.avatarPreview.setMesh(mesh.render.positions, mesh.render.indices);
+      this.avatarPreview.setRulers(
+        buildMeasurementRulers(
+          mesh.positions,
+          mesh.measured,
+          new Set(mesh.driven),
+          avatar.unit,
+          mesh.rulerPolylines
+        )
+      );
+      return {
+        heightCm: mesh.heightCm,
+        measured: mesh.measured,
+        saturated: mesh.saturated,
+        driven: mesh.driven,
+      };
+    } catch (err) {
+      setStatus(`Preview failed: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Generate a 3D body for `avatar` from its measurements and push it into every
+   * sim / transform viewport. Returns a report for the editor.
+   */
+  private async generateAvatarFor(
+    avatar: Avatar,
+    setStatus: (text: string) => void,
+    options: AvatarGenerationOptions
+  ): Promise<AvatarReport | null> {
+    try {
+      if (!this.device) {
+        setStatus('Starting WebGPU…');
+        const gpu = await createSharedGpu();
+        this.device = gpu.device;
+      }
+
+      setStatus('Generating body…');
+      const { body, mesh } = await createAvatarBodyFromAvatar(this.device, avatar, {
+        sdfResolution: options.sdfResolution,
+        onProgress: (value) => setStatus(`Baking collision SDF… ${Math.round(value * 100)}%`),
+      });
+
+      for (const rt of this.simRuntimes.values()) rt.setAvatarBody(body);
+      for (const rt of this.transformRuntimes.values()) rt.setAvatarBody(body);
+      resetAvatarOverlayCache();
+      for (const ed of this.editors.values()) ed.reloadAvatarOverlay();
+
+      await updateAvatar(avatar.id, {
+        kind: '3d',
+        model: { cacheKey: mesh.cacheKey },
+        ...(options.sdfResolution ? { sdfResolution: options.sdfResolution } : {}),
+      });
+
+      this.setStatus(`Generated avatar “${avatar.name}” — ${mesh.heightCm.toFixed(0)} cm`);
+      return {
+        heightCm: mesh.heightCm,
+        measured: mesh.measured,
+        saturated: mesh.saturated,
+        driven: mesh.driven,
+        applied: true,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setStatus(`Generation failed: ${message}`);
+      this.setStatus(`Avatar generation failed: ${message}`);
+      return null;
+    }
   }
 
   /** Re-label every open pattern editor after the measurement library changes. */
@@ -1352,7 +1474,7 @@ export class StudioApp {
       <button type="button" data-act="redo" disabled title="Nothing to redo" aria-label="Redo"><i data-lucide="redo-2" aria-hidden="true"></i><span>Redo</span></button>
       <div class="toolbar-sep"></div>
       <button type="button" data-act="loadAvatar"><i data-lucide="user-round" aria-hidden="true"></i><span>Load avatar model</span></button>
-      <button type="button" data-act="measurements" title="Body measurement sets for the people you draft for"><i data-lucide="clipboard-list" aria-hidden="true"></i><span>Measurements</span></button>
+      <button type="button" data-act="avatars" title="Avatars: measurements + generated 3D models"><i data-lucide="clipboard-list" aria-hidden="true"></i><span>Avatars</span></button>
       <div class="toolbar-sep"></div>
       <button type="button" data-act="unit" title="Display units"><i data-lucide="ruler" aria-hidden="true"></i><span>Units</span></button>
       <div class="toolbar-sep"></div>
@@ -1416,7 +1538,8 @@ export class StudioApp {
         this.openAvatarModal();
         break;
       case 'measurements':
-        this.openMeasurementModal();
+      case 'avatars':
+        this.openAvatarEditor();
         break;
       case 'unit':
         this.pushUndo();

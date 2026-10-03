@@ -89,6 +89,20 @@ export class AvatarBody {
     return body;
   }
 
+  /** Build directly from a generated mesh (no OBJ parse). Same units as `fromObjMesh`. */
+  static fromRawMesh(
+    positions: Float32Array,
+    indices: Uint32Array,
+    unitToWorld: number,
+    device: GPUDevice,
+    options?: { skipSpatialGrid?: boolean }
+  ): AvatarBody {
+    const body = new AvatarBody();
+    body.buildFromMesh({ positions, indices }, unitToWorld, options?.skipSpatialGrid ?? false);
+    body.createBuffers(device);
+    return body;
+  }
+
   /** Build triangle spatial index when not using SDF collision. */
   buildCollisionGridIfNeeded(): void {
     if (this.sdfVolume || this.grid.size > 0 || this.collisionTris.length === 0) return;

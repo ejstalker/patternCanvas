@@ -1492,6 +1492,14 @@ body {
   cursor: move;
 }
 
+/* Over generated geometry the box is a marker, not a grip: the block carries its
+   own move gesture and has no editable points, so the box must not swallow the
+   click that starts it. */
+.pattern-selection-box.is-indicator {
+  pointer-events: none;
+  cursor: default;
+}
+
 .pattern-scale-handle {
   fill: var(--bg);
   stroke: #6ea8fe;
@@ -1710,12 +1718,61 @@ body {
   gap: 3px;
 }
 
+/* Inspector sections fold shut. The header is a real disclosure button — the
+   caret is a CSS triangle rather than markup so there is nothing to keep in sync
+   with the state, and the rotation is the only thing that changes. */
 .pattern-block-group {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
   margin-top: 3px;
+}
+
+.pattern-block-group-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  padding: 2px 4px;
+  border: none;
+  border-radius: 4px;
+  background: none;
   color: var(--muted);
   font: 600 9.5px var(--font);
   letter-spacing: 0.08em;
   text-transform: uppercase;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pattern-block-group-head:hover {
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
+  color: var(--ink);
+}
+
+.pattern-block-group-caret {
+  flex-shrink: 0;
+  width: 0;
+  height: 0;
+  border-left: 4px solid currentColor;
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  transform: rotate(90deg);
+  transition: transform 0.12s ease;
+}
+
+.pattern-block-group.is-collapsed .pattern-block-group-caret {
+  transform: none;
+}
+
+.pattern-block-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.pattern-block-group.is-collapsed .pattern-block-group-body {
+  display: none;
 }
 
 .pattern-block-var {
@@ -2836,12 +2893,334 @@ body {
   padding: 4px 20px 16px;
 }
 
-.measure-group h4 {
-  margin: 16px 0 8px;
+.measure-field-row {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.measure-auto,
+.measure-auto-spacer {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+}
+
+.measure-auto {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.measure-auto:hover {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.measure-auto.is-on {
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.measure-field.is-auto input {
+  background: transparent;
+  border-style: dashed;
+  color: var(--muted);
+}
+
+/* ---------------------------------------------------------------------------
+ * Avatar editor — 3D viewport above, measurement fields beside it.
+ * ------------------------------------------------------------------------- */
+
+.measure-modal.avatar-modal {
+  width: min(1400px, 96vw);
+}
+
+.avatar-split {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(320px, 46%) 1fr;
+}
+
+.avatar-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  padding: 12px 16px 16px;
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.avatar-view-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.avatar-view-head select {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--ink);
+  padding: 5px 6px;
+  font: inherit;
+  font-size: 13px;
+}
+
+.avatar-3d-rulers {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.avatar-3d-slider {
+  flex: 0 0 auto;
+  display: grid;
+  gap: 4px;
+}
+
+.avatar-3d-slider-label {
   font-size: 11px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--muted);
+}
+
+.avatar-3d-slider input[type='range'] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.avatar-3d-slider-scale {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.avatar-3d-slider-scale em {
+  font-style: normal;
+}
+
+.avatar-view-canvas {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+/* Absolute + 100%: if the canvas could influence the box that sizes it, the
+ * ResizeObserver -> canvas.width loop would grow it without bound. */
+.avatar-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.avatar-view-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.avatar-view-hint {
+  position: absolute;
+  left: 10px;
+  bottom: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.avatar-view-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.avatar-view-empty[hidden],
+.avatar-3d-only[hidden] {
+  display: none;
+}
+
+.avatar-view.is-2d .avatar-3d-only {
+  display: none;
+}
+
+.avatar-view-foot {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.avatar-3d-collision,
+.avatar-3d-decouple {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.avatar-3d-collision select {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--ink);
+  padding: 4px 6px;
+  font: inherit;
+  font-size: 12px;
+}
+
+.avatar-3d-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.avatar-3d-actions .muted {
+  font-size: 11px;
+}
+
+.avatar-ruler-label {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: rgba(16, 14, 12, 0.9);
+  color: var(--ink);
+  font: 11px var(--mono);
+  white-space: nowrap;
+}
+
+.avatar-ruler-label.is-driven {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.avatar-ruler-dot {
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  margin: -3px 0 0 -3px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
+}
+
+.measure-section {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 12px;
+  background: var(--bg-elev);
+  overflow: hidden;
+}
+
+.measure-section > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  list-style: none;
+}
+
+.measure-section > summary::-webkit-details-marker {
+  display: none;
+}
+
+.measure-section > summary::before {
+  content: '▸';
+  margin-right: 7px;
+  color: var(--muted);
+  font-size: 10px;
+  transition: transform 0.12s ease;
+}
+
+.measure-section[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.measure-section-count {
+  margin-left: auto;
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 11px;
+}
+
+.measure-section-body {
+  padding: 0 12px 10px;
+}
+
+.measure-group {
+  margin-bottom: 6px;
+}
+
+.measure-group > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  list-style: none;
+  margin: 6px 0 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.measure-group > summary::-webkit-details-marker {
+  display: none;
+}
+
+.measure-group > summary::before {
+  content: '▸';
+  font-size: 8px;
+  transition: transform 0.12s ease;
+}
+
+.measure-group[open] > summary::before {
+  transform: rotate(90deg);
 }
 
 .measure-grid {

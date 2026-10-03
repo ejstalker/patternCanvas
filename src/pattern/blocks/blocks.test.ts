@@ -301,8 +301,10 @@ describe('block registry', () => {
 
   it('groups definitions for the placement menu', () => {
     const groups = blockDefinitionsByCategory();
-    expect(groups.map((g) => g.category)).toEqual(['skirt']);
-    expect(groups[0]!.label).toBe('Skirt');
+    expect(groups.map((g) => g.category)).toEqual(['bodice', 'skirt']);
+    expect(groups[0]!.label).toBe('Bodice');
+    expect(groups[0]!.definitions.map((d) => d.id)).toEqual(['bodiceFront', 'bodiceBack']);
+    expect(groups[1]!.label).toBe('Skirt');
   });
 });
 

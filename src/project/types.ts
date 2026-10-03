@@ -114,16 +114,26 @@ export type PatternDocument = {
 };
 
 /**
+ * How a measurement is scaled before the ease is added.
+ *
+ * Expressed as a divisor because that is what the drafts use — a bodice width is
+ * a *quarter* bust arc — but it is really a scale factor, and some fields need
+ * the other direction: a derived `sideLength` is half the underarm seam and
+ * doubles to reach the block's number.
+ */
+export type BlockDivisor = 0.5 | 1 | 2 | 4;
+
+/**
  * A block variable either sits at a fixed number or follows one of a person's
- * measurements, divided and offset. The divisor is not decoration: a bodice
- * width is a *quarter* bust arc plus ease, and a skirt panel is a quarter hip.
+ * measurements, scaled and offset. The scale is not decoration: a bodice width
+ * is a quarter bust plus ease, and a skirt panel is a quarter hip.
  */
 export type BlockMeasurementSource = {
   /** A `MEASUREMENT_FIELDS` id. */
   fieldId: string;
-  /** 1 = the measurement itself, 2 = half, 4 = quarter. */
-  divisor: 1 | 2 | 4;
-  /** Ease added after dividing, in cm. */
+  /** 1 = the measurement itself, 2 = half, 4 = quarter, 0.5 = double. */
+  divisor: BlockDivisor;
+  /** Ease added after scaling, in cm. */
   offsetCm: number;
 };
 
@@ -141,8 +151,13 @@ export type BlockVariableDecl = {
   label: string;
   /** Display grouping, e.g. 'Widths' / 'Lengths' / 'Darts'. */
   group: string;
-  /** Most variables are lengths in cm; a few are counts of things. */
-  kind?: 'length' | 'count';
+  /**
+   * Most variables are lengths in cm and follow the project's display unit.
+   * `count` is a number of things (dart count) and `factor` is a 0–1 shaping
+   * control (how square a curve turns) — both dimensionless, so neither is ever
+   * converted to inches.
+   */
+  kind?: 'length' | 'count' | 'factor';
   /** Bound automatically when the block is first placed on a person. */
   suggested?: BlockMeasurementSource;
   /** Used when the variable is a plain number. Always in cm. */

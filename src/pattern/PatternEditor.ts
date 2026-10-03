@@ -1,5 +1,6 @@
 import type {
   BezierPoint,
+  BlockDivisor,
   BlockInstance,
   BlockVariableBinding,
   BlockVariableDecl,
@@ -350,8 +351,16 @@ export class PatternEditor {
    */
   private blockOwnership = new Map<string, BlockInstance>();
   /** The variable row under the pointer, and the points its value moves. */
-  private hoverVarId: string | null = null;
-  private hoverDriven: Set<string> | null = null;
+  /**
+   * Inspector sections the user has folded shut, by group name.
+   *
+   * Held here rather than read back off the DOM because the rows are rebuilt
+   * whenever a binding changes shape — switching one variable to Measure
+   * rewrites the whole panel, and a section that sprang open every time you did
+   * that would be worse than no accordion at all.
+   */
+  private collapsedBlockGroups = new Set<string>();
+  private hoverVarId: string | null = null;  private hoverDriven: Set<string> | null = null;
   private blockBtn!: HTMLButtonElement;
   private blockMenu!: HTMLElement;
   private blockMenuDocPointerDown: ((e: PointerEvent) => void) | null = null;
@@ -738,6 +747,12 @@ export class PatternEditor {
         this.deleteSelectedBlock();
         return;
       }
+      const groupHead = target.closest<HTMLButtonElement>('button[data-block-group-toggle]');
+      if (groupHead) {
+        const group = groupHead.closest<HTMLElement>('.pattern-block-group');
+        if (group?.dataset.blockGroup) this.toggleBlockGroup(group.dataset.blockGroup, group);
+        return;
+      }
       const mode = target.closest('button[data-block-mode]') as HTMLButtonElement | null;
       const div = target.closest('button[data-block-div]') as HTMLButtonElement | null;
       const varEl = target.closest('[data-var-id]') as HTMLElement | null;
@@ -748,7 +763,7 @@ export class PatternEditor {
         return;
       }
       if (div) {
-        const divisor = Number(div.dataset.blockDiv) as 1 | 2 | 4;
+        const divisor = Number(div.dataset.blockDiv) as BlockDivisor;
         this.setBlockVariableDivisor(varId, divisor);
       }
     });
@@ -1344,17 +1359,39 @@ export class PatternEditor {
   private clearSelection(): void {
     this.selectedIds.clear();
     this.selectedPointId = null;
+    this.releaseBlockSelection();
   }
 
   private setSelection(ids: string[], primary?: string | null): void {
     this.selectedIds = new Set(ids);
     this.selectedPointId = primary ?? ids[ids.length - 1] ?? null;
+    this.releaseBlockSelection();
   }
 
   private selectOnly(pointId: string, pieceId?: string): void {
     this.selectedIds = new Set([pointId]);
     this.selectedPointId = pointId;
     if (pieceId) this.selectedPieceId = pieceId;
+    this.releaseBlockSelection();
+  }
+
+  /**
+   * Drop the block selection once the pieces it describes are no longer picked.
+   *
+   * The block controls edit a block, and they have nothing to say about a
+   * selection that has moved on to something else — a ribbon left up over a
+   * piece you deselected reads as though the two are still connected. Run after
+   * every change to the picked points rather than at each call site, so no path
+   * can forget it.
+   */
+  private releaseBlockSelection(): void {
+    const instance = this.selectedBlock();
+    if (!instance) return;
+    const owned = new Set(instance.pieces.map((entry) => entry.pieceId));
+    const stillPicked = this.pattern.pieces.some(
+      (piece) => owned.has(piece.id) && piece.points.some((pt) => this.selectedIds.has(pt.id))
+    );
+    if (!stillPicked) this.setSelectedBlock(null);
   }
 
   private activePiece(): PatternPiece | null {
@@ -2373,10 +2410,25 @@ export class PatternEditor {
     };
   }
 
+  /** True when the picked points sit on generated (block-owned) geometry. */
+  private selectionIsGenerated(): boolean {
+    for (const piece of this.pattern.pieces) {
+      if (!this.blockOwnership.has(piece.id)) continue;
+      if (piece.points.some((pt) => this.selectedIds.has(pt.id))) return true;
+    }
+    return false;
+  }
+
   private drawSelectionChrome(): void {
     if (this.selectedIds.size < 2) return;
     const box = this.selectionScaleBox();
     if (!box) return;
+    // A selection over generated geometry is an indicator, not a set of handles.
+    // A block moves as a unit and its points are rebuilt from its variables, so
+    // scale grips on it would edit something that is about to be thrown away —
+    // and a box that swallowed the click would rob the block of its own drag,
+    // which is how it is meant to be moved.
+    const generated = this.selectionIsGenerated();
     const x = box.minX;
     const y = box.minY;
     const w = box.maxX - box.minX;
@@ -2387,11 +2439,15 @@ export class PatternEditor {
     rect.setAttribute('y', String(y));
     rect.setAttribute('width', String(w));
     rect.setAttribute('height', String(h));
-    rect.setAttribute('class', 'pattern-selection-box');
+    rect.setAttribute(
+      'class',
+      `pattern-selection-box${generated ? ' is-indicator' : ''}`
+    );
     rect.setAttribute('stroke-width', String(this.px(1.75)));
     rect.setAttribute('stroke-dasharray', `${this.px(7)} ${this.px(4)}`);
     rect.dataset.kind = 'selectionBox';
     this.svg.appendChild(rect);
+    if (generated) return;
 
     const hs = this.px(8);
     const handleSw = this.px(1.5);
@@ -3501,12 +3557,15 @@ export class PatternEditor {
   }
 
   private setSelectedBlock(id: string | null): void {
-    if (this.selectedBlockId === id) return;
-    this.selectedBlockId = id;
     if (id) {
       this.setRulerSelection(null);
-      this.clearSelection();
+      // Cleared inline rather than through clearSelection(), which would call
+      // back into releaseBlockSelection() and unset the id being set here.
+      this.selectedIds.clear();
+      this.selectedPointId = null;
     }
+    if (this.selectedBlockId === id) return;
+    this.selectedBlockId = id;
     this.syncBlockBar();
   }
 
@@ -3664,6 +3723,29 @@ export class PatternEditor {
     }
   }
 
+  /**
+   * Fold an inspector section shut, or open again.
+   *
+   * Done by toggling a class rather than rebuilding the rows: a rebuild would
+   * throw away any half-typed number in the section, and there is nothing to
+   * recompute — the rows are all still there, just not painted.
+   */
+  private toggleBlockGroup(name: string, group: HTMLElement): void {
+    const collapsed = !this.collapsedBlockGroups.has(name);
+    if (collapsed) this.collapsedBlockGroups.add(name);
+    else this.collapsedBlockGroups.delete(name);
+    group.classList.toggle('is-collapsed', collapsed);
+    group
+      .querySelector<HTMLButtonElement>('[data-block-group-toggle]')
+      ?.setAttribute('aria-expanded', String(!collapsed));
+    // A row that is no longer on screen must not leave its outline lit on the
+    // canvas — the pointer is still over the header, but nothing is hovered.
+    if (collapsed && this.hoverVarId) {
+      const row = group.querySelector<HTMLElement>(`[data-var-id="${this.hoverVarId}"]`);
+      if (row) this.setHoveredVar(null);
+    }
+  }
+
   /** Hovered variable → the points it moves. Cheap enough to redo per row. */
   private setHoveredVar(varId: string | null): void {
     if (this.hoverVarId === varId) return;
@@ -3770,7 +3852,7 @@ export class PatternEditor {
     return MEASUREMENT_FIELDS.find((f) => measurementValueCm(set, f.id) != null)?.id ?? null;
   }
 
-  private setBlockVariableDivisor(varId: string, divisor: 1 | 2 | 4): void {
+  private setBlockVariableDivisor(varId: string, divisor: BlockDivisor): void {
     const instance = this.selectedBlock();
     const binding = instance ? this.bindingFor(instance, varId) : null;
     if (!instance || binding?.mode !== 'measurement' || binding.divisor === divisor) return;
@@ -3878,8 +3960,9 @@ export class PatternEditor {
    * Read a numeric inspector field back into canonical units.
    *
    * The box holds *display* units, so an inches project would otherwise write
-   * "30" straight in as 30 cm. Counts (dart counts) are dimensionless and must
-   * never be converted — a count of 2 is 2 in either system.
+   * "30" straight in as 30 cm. Counts (dart counts) and factors (how square a
+   * curve turns) are dimensionless and must never be converted — a factor of
+   * 0.55 is 0.55 in either system.
    */
   private blockFieldCm(varId: string, input: HTMLInputElement): number | null {
     const variable = this.blockVariable(this.selectedBlock(), varId);
@@ -3887,6 +3970,7 @@ export class PatternEditor {
     const raw = Number.parseFloat(input.value);
     if (!Number.isFinite(raw)) return null;
     if (variable.kind === 'count') return Math.round(raw);
+    if (variable.kind === 'factor') return raw;
     return this.blockCm(raw);
   }
 
@@ -3900,7 +3984,19 @@ export class PatternEditor {
       variable,
       bindingValueCm(binding, this.measurementSet(instance.personId))
     );
-    input.value = String(variable.kind === 'count' ? Math.round(cm) : this.blockDisplay(cm));
+    input.value = this.blockFieldText(variable, cm);
+  }
+
+  /** How one variable's number reads inside its input box. */
+  private blockFieldText(variable: BlockVariableDecl, cm: number): string {
+    if (variable.kind === 'count') return String(Math.round(cm));
+    if (variable.kind === 'factor') return String(Number(cm.toFixed(2)));
+    return String(this.blockDisplay(cm));
+  }
+
+  /** Nudge size for a factor, in its own 0–1 domain. */
+  private blockFactorStep(): number {
+    return 0.05;
   }
 
   private blockFieldLabel(fieldId: string): string {
@@ -3945,13 +4041,36 @@ export class PatternEditor {
 
     const set = this.measurementSet(instance.personId);
     let currentGroup = '';
+    let groupBody: HTMLElement | null = null;
     for (const variable of definition.variables) {
       if (variable.group !== currentGroup) {
         currentGroup = variable.group;
-        const head = document.createElement('div');
-        head.className = 'pattern-block-group';
-        head.textContent = currentGroup;
-        host.appendChild(head);
+        const collapsed = this.collapsedBlockGroups.has(currentGroup);
+        const group = document.createElement('div');
+        group.className = 'pattern-block-group';
+        group.dataset.blockGroup = currentGroup;
+        group.classList.toggle('is-collapsed', collapsed);
+
+        const head = document.createElement('button');
+        head.type = 'button';
+        head.className = 'pattern-block-group-head';
+        head.dataset.blockGroupToggle = '';
+        // A real disclosure button, so it is reachable by keyboard and reads
+        // correctly to a screen reader rather than being a div that happens to
+        // have a click handler on it.
+        head.setAttribute('aria-expanded', String(!collapsed));
+        const caret = document.createElement('span');
+        caret.className = 'pattern-block-group-caret';
+        caret.setAttribute('aria-hidden', 'true');
+        const title = document.createElement('span');
+        title.className = 'pattern-block-group-title';
+        title.textContent = currentGroup;
+        head.append(caret, title);
+
+        groupBody = document.createElement('div');
+        groupBody.className = 'pattern-block-group-body';
+        group.append(head, groupBody);
+        host.appendChild(group);
       }
 
       const binding = instance.bindings[variable.id];
@@ -3992,9 +4111,10 @@ export class PatternEditor {
       controls.appendChild(mode);
 
       if (!isMeasurement) {
-        // A count is a count in any unit — only lengths convert. Converting a
-        // dart count through inches is how you end up with a max of 1.181.
-        const isCount = variable.kind === 'count';
+        // Only lengths convert. A dart count and a curve factor are the same
+        // number in any unit — converting a count through inches is how you end
+        // up with a maximum of 1.181.
+        const kind = variable.kind ?? 'length';
         const current = clampToDeclared(
           variable,
           bindingValueCm(
@@ -4009,16 +4129,18 @@ export class PatternEditor {
         // field with a numeric keyboard hint behaves, and the parse and clamp
         // are ours anyway.
         input.type = 'text';
-        input.inputMode = isCount ? 'numeric' : 'decimal';
+        input.inputMode = kind === 'length' ? 'decimal' : 'numeric';
         input.autocomplete = 'off';
         input.spellcheck = false;
         input.className = 'pattern-block-input';
         input.dataset.blockValue = '';
         input.dataset.numberInput = '';
-        input.step = String(isCount ? 1 : this.blockStep());
-        input.min = String(isCount ? variable.minCm : this.blockDisplay(variable.minCm));
-        input.max = String(isCount ? variable.maxCm : this.blockDisplay(variable.maxCm));
-        input.value = String(isCount ? Math.round(current) : this.blockDisplay(current));
+        input.step = String(
+          kind === 'count' ? 1 : kind === 'factor' ? this.blockFactorStep() : this.blockStep()
+        );
+        input.min = String(kind === 'length' ? this.blockDisplay(variable.minCm) : variable.minCm);
+        input.max = String(kind === 'length' ? this.blockDisplay(variable.maxCm) : variable.maxCm);
+        input.value = this.blockFieldText(variable, current);
         input.setAttribute('aria-label', variable.label);
         controls.appendChild(input);
       } else {
@@ -4043,6 +4165,7 @@ export class PatternEditor {
         divisor.className = 'pattern-block-div';
         divisor.setAttribute('role', 'group');
         for (const [value, text] of [
+          [0.5, '×2'],
           [1, '×1'],
           [2, '½'],
           [4, '¼'],
@@ -4076,7 +4199,7 @@ export class PatternEditor {
       }
 
       row.appendChild(controls);
-      host.appendChild(row);
+      groupBody!.appendChild(row);
     }
     this.updateBlockReadouts();
   }
@@ -4094,10 +4217,15 @@ export class PatternEditor {
       ) as HTMLElement | null;
       if (!el) continue;
       const binding = instance.bindings[variable.id];
+      const value = values[variable.id] ?? 0;
       if (variable.kind === 'count') {
-        el.textContent = String(Math.round(values[variable.id] ?? 0));
+        el.textContent = String(Math.round(value));
+      } else if (variable.kind === 'factor') {
+        // A shaping control reads as a percentage — "55%" says more about a
+        // neckline than "0.55".
+        el.textContent = `${Math.round(value * 100)}%`;
       } else {
-        el.textContent = formatLength(values[variable.id] ?? 0, this.unit, 1);
+        el.textContent = formatLength(value, this.unit, 1);
       }
       el.classList.toggle(
         'is-unmeasured',
@@ -4107,9 +4235,19 @@ export class PatternEditor {
   }
 
   /** Clicking a generated piece selects its block rather than its points. */
-  private onBlockPointerDown(e: PointerEvent, p: Vec2, instance: BlockInstance): void {
+  private onBlockPointerDown(
+    e: PointerEvent,
+    p: Vec2,
+    instance: BlockInstance,
+    pieceId: string | undefined
+  ): void {
     this.setSelectedBlock(instance.id);
-    this.markBeforeChange();
+    // Pick the outline as well, so the piece reads as selected the way a
+    // hand-drawn one does rather than only lighting up a panel on the far side
+    // of the canvas. Its geometry is regenerated, so the selection is an
+    // indicator here and carries no scale grips — see drawSelectionChrome.
+    const piece = this.pattern.pieces.find((entry) => entry.id === pieceId);
+    if (piece) this.selectEntirePiece(piece);
     this.drag = {
       type: 'blockMove',
       id: instance.id,
@@ -4316,20 +4454,47 @@ export class PatternEditor {
   private deleteContextPiece(): void {
     const id = this.contextPieceId ?? this.selectedPieceId;
     if (!id) return;
-    this.deletePiece(id);
+    this.deletePieces([id]);
   }
 
-  private deletePiece(pieceId: string): void {
+  /**
+   * Remove whole pieces, and everything that refers to them.
+   *
+   * A block's pieces are not separately deletable. They are regenerated from the
+   * block's variables, so a piece removed on its own comes straight back — with
+   * the block's other pieces renumbered around it — on the next load. Any piece
+   * of a block therefore takes the whole block, which is the same unit the
+   * block's own Delete button works in. Detach is the button that exists for
+   * breaking one up.
+   */
+  private deletePieces(pieceIds: readonly string[]): void {
+    if (pieceIds.length === 0) return;
+    const doomed = new Set(pieceIds);
+    const doomedBlocks = new Set<string>();
+    for (const instance of this.blocks()) {
+      if (instance.pieces.some((entry) => doomed.has(entry.pieceId))) {
+        doomedBlocks.add(instance.id);
+        for (const entry of instance.pieces) doomed.add(entry.pieceId);
+      }
+    }
+
     this.markBeforeChange();
-    this.pattern.pieces = this.pattern.pieces.filter((p) => p.id !== pieceId);
+    this.pattern.pieces = this.pattern.pieces.filter((p) => !doomed.has(p.id));
     this.pattern.seams = this.pattern.seams.filter(
-      (s) => s.a.pieceId !== pieceId && s.b.pieceId !== pieceId
+      (s) => !doomed.has(s.a.pieceId) && !doomed.has(s.b.pieceId)
     );
+    if (doomedBlocks.size > 0) {
+      this.pattern.blocks = this.blocks().filter((b) => !doomedBlocks.has(b.id));
+      if (this.selectedBlockId && doomedBlocks.has(this.selectedBlockId)) {
+        this.selectedBlockId = null;
+      }
+    }
     this.clearSelection();
     this.selectedPieceId = this.pattern.pieces[0]?.id ?? null;
     this.contextPieceId = null;
     this.cbs.onChange();
     this.endHistoryGesture();
+    if (doomedBlocks.size > 0) this.syncBlockBar();
     this.redraw();
   }
 
@@ -4347,7 +4512,7 @@ export class PatternEditor {
     const remaining = piece.points.filter((pt) => !this.selectedIds.has(pt.id));
     if (remaining.length < minPts) {
       // Removing these points would invalidate the outline — delete the piece instead
-      this.deletePiece(piece.id);
+      this.deletePieces([piece.id]);
       return;
     }
 
@@ -4365,19 +4530,17 @@ export class PatternEditor {
       return;
     }
 
-    const piece = this.activePiece();
-    if (!piece) return;
-
-    if (this.selectedIds.size === 0) {
-      // No points selected but piece is active after empty click — ignore
+    // Whole pieces, and there may be several: a marquee dragged across the
+    // layout selects every point of everything it covers, and that is how you
+    // say "these panels" rather than "these handles".
+    const whole = this.pattern.pieces.filter((piece) => this.isEntirePieceSelected(piece));
+    if (whole.length > 0) {
+      this.deletePieces(whole.map((piece) => piece.id));
       return;
     }
 
-    if (this.isEntirePieceSelected(piece)) {
-      this.deletePiece(piece.id);
-      return;
-    }
-
+    // Anything less than a whole piece is a point edit on the piece in hand.
+    if (this.selectedIds.size === 0) return;
     this.deleteSelectedPoints();
   }
 
@@ -4435,13 +4598,35 @@ export class PatternEditor {
     // would otherwise discard whatever you did to an individual point.
     const block = this.blockForPiece(pieceId);
     if (block) {
-      this.onBlockPointerDown(e, p, block);
+      this.onBlockPointerDown(e, p, block, pieceId);
       return;
     }
 
     // Anything else gives the ruler up: a ruler is only "in hand" while nothing
     // else is being edited, so its settings ribbon must not linger.
     this.setRulerSelection(null);
+
+    // A hit on a piece's own body — its fill or its grainline, neither of which
+    // carries a `kind` — picks the whole piece. Without this a click inside a
+    // piece fell through to the marquee and cleared the selection on release, so
+    // the only way to pick up a panel was to catch one of its corners exactly.
+    if (this.tool === 'move' && !kind && pieceId) {
+      const piece = this.pattern.pieces.find((entry) => entry.id === pieceId);
+      if (piece) {
+        // Already part of a wider selection? Then this is a drag of the whole
+        // thing rather than a re-pick of one piece out of it.
+        if (!this.isEntirePieceSelected(piece)) this.selectEntirePiece(piece);
+        this.drag = {
+          type: 'moveSelection',
+          start: p,
+          snapshots: this.snapshotSelection(),
+        };
+        this.svg.setPointerCapture(e.pointerId);
+        e.preventDefault();
+        this.redraw();
+        return;
+      }
+    }
 
     if (this.tool === 'pen') {
       this.onPenDown(e, p);
@@ -4511,7 +4696,6 @@ export class PatternEditor {
     }
 
     if (this.tool === 'move' && kind === 'selectionBox') {
-      this.markBeforeChange();
       this.drag = {
         type: 'moveSelection',
         start: p,
@@ -4565,7 +4749,6 @@ export class PatternEditor {
           this.selectedPieceId = pieceId;
         }
 
-        this.markBeforeChange();
         this.drag = {
           type: 'moveSelection',
           start: p,
@@ -4590,6 +4773,7 @@ export class PatternEditor {
         }
       }
 
+      this.markBeforeChange();
       this.markBeforeChange();
       this.drag = {
         type: 'moveSelection',
@@ -5246,6 +5430,9 @@ export class PatternEditor {
       const d = this.drag;
       const instance = this.blocks().find((b) => b.id === d.id);
       if (!instance) return;
+      // Armed here, on the first movement, rather than on pointerdown: a click
+      // that never moves is a selection, and it should not cost an undo step.
+      this.markBeforeChange();
       instance.origin = {
         x: d.origin.x + (p.x - d.start.x),
         y: d.origin.y + (p.y - d.start.y),
@@ -5365,6 +5552,10 @@ export class PatternEditor {
       const d = this.drag;
       const rawDx = p.x - d.start.x;
       const rawDy = p.y - d.start.y;
+      // Armed here, on the first movement, rather than on pointerdown: picking a
+      // piece up and letting go without dragging it is a selection, and it
+      // should not leave an empty step on the undo stack.
+      if (rawDx !== 0 || rawDy !== 0) this.markBeforeChange();
       // Figma: Ctrl temporarily disables Snap to geometry
       const snapOn = this.softSnap && !e.ctrlKey;
       const { dx, dy, guides } = this.softSnapTranslate(d.snapshots, rawDx, rawDy, snapOn);

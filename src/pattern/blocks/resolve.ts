@@ -3,8 +3,7 @@ import type {
   BlockMeasurementSource,
   BlockVariableBinding,
   BlockVariableDecl,
-} from '../../project/types';
-import type { MeasurementSet } from '../../project/measurements';
+} from '../../project/types';import type { MeasurementSet } from '../../project/measurements';
 import { measurementValueCm } from '../rulers';
 import type { BlockDefinition } from './spec';
 
@@ -24,6 +23,13 @@ export function sourceValueCm(
   const full = measurementValueCm(set, source.fieldId);
   if (full == null) return null;
   return full / source.divisor + source.offsetCm;
+}
+
+/** How a binding's scale reads on screen, e.g. `½ ×`. Empty when it is one-to-one. */
+export function divisorLabel(divisor: BlockMeasurementSource['divisor']): string {
+  if (divisor === 1) return '';
+  if (divisor === 0.5) return '2 × ';
+  return `${divisor === 2 ? '½' : '¼'} × `;
 }
 
 /** Resolve one binding against a person, ignoring the declaration's default. */
@@ -104,7 +110,8 @@ export function describeBinding(
   if (binding.mode === 'value') return format(binding.cm);
   const live = sourceValueCm(binding, set);
   const parts: string[] = [];
-  if (binding.divisor !== 1) parts.push(`${binding.divisor === 2 ? '½' : '¼'} × `);
+  const scale = divisorLabel(binding.divisor);
+  if (scale) parts.push(scale);
   parts.push(fieldLabel(binding.fieldId));
   if (binding.offsetCm !== 0) {
     parts.push(binding.offsetCm > 0 ? ` + ${format(binding.offsetCm)}` : ` − ${format(-binding.offsetCm)}`);

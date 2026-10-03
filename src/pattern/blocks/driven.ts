@@ -34,6 +34,10 @@ function probeValues(variable: BlockVariableDecl, current: number): number[] {
     // Counts change how many darts a panel has, so only whole numbers mean
     // anything.
     candidates.push(Math.round(current) + 1, Math.round(current) - 1);
+  } else if (variable.kind === 'factor') {
+    // A 0–1 shaping control has its whole range inside the bounds above, so it
+    // needs a wiggle in the middle rather than a bigger one.
+    candidates.push(current + 0.2, current - 0.2);
   } else {
     const delta = Math.max(1, (variable.maxCm - variable.minCm) * 0.05);
     candidates.push(current + delta, current - delta);
@@ -51,16 +55,16 @@ function probeValues(variable: BlockVariableDecl, current: number): number[] {
   return out;
 }
 
-function indexAnchors(pieces: GeneratedPiece[]): Map<string, Vec2> {
-  const anchors = new Map<string, Vec2>();
-  for (const { piece } of pieces) {
-    for (const point of piece.points) anchors.set(point.id, point.anchor);
-  }
-  return anchors;
-}
-
+/**
+ * Record every point the probe moved.
+ *
+ * Handles count, not just anchors: a curvature control leaves both endpoints
+ * exactly where they were and only bends the curve between them, and an
+ * inspector that answered "nothing moved" for the neckline curve would be
+ * actively misleading.
+ */
 function collectMoved(
-  anchors: Map<string, Vec2>,
+  anchors: Map<string, Pt>,
   probed: GeneratedPiece[],
   into: Set<string>
 ): void {
@@ -69,13 +73,35 @@ function collectMoved(
       const was = anchors.get(point.id);
       if (
         !was ||
-        Math.abs(was.x - point.anchor.x) > MOVED_EPSILON_CM ||
-        Math.abs(was.y - point.anchor.y) > MOVED_EPSILON_CM
+        moved(was.anchor, point.anchor) ||
+        moved(was.handleIn, point.handleIn) ||
+        moved(was.handleOut, point.handleOut)
       ) {
         into.add(point.id);
       }
     }
   }
+}
+
+function moved(a: Vec2 | null | undefined, b: Vec2 | null | undefined): boolean {
+  if (!a || !b) return Boolean(a) !== Boolean(b);
+  return Math.abs(a.x - b.x) > MOVED_EPSILON_CM || Math.abs(a.y - b.y) > MOVED_EPSILON_CM;
+}
+
+type Pt = { anchor: Vec2; handleIn?: Vec2 | null; handleOut?: Vec2 | null };
+
+function indexAnchors(pieces: GeneratedPiece[]): Map<string, Pt> {
+  const anchors = new Map<string, Pt>();
+  for (const { piece } of pieces) {
+    for (const point of piece.points) {
+      anchors.set(point.id, {
+        anchor: point.anchor,
+        handleIn: point.handleIn,
+        handleOut: point.handleOut,
+      });
+    }
+  }
+  return anchors;
 }
 
 /**

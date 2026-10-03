@@ -1,15 +1,19 @@
 import type { BlockDefinition } from './spec';
+import { BODICE_BACK_BLOCK, BODICE_FRONT_BLOCK } from './bodice';
 import { SKIRT_BLOCK } from './skirt';
 
 /**
  * The built-in block library.
  *
- * Only the skirt is here so far — the bodice blocks need real bezier handles for
- * their armhole and neckline French curves and land next. The shape of this list
- * is the whole point: a definition is a component, and adding one is adding an
- * entry, not changing the system.
+ * A definition is a component: adding one is adding an entry here, not changing
+ * the system. Pieces a definition drafts are ordinary `PatternPiece`s, so
+ * meshing, seams, drape and export need no special case for any of them.
  */
-export const BLOCK_DEFINITIONS: BlockDefinition[] = [SKIRT_BLOCK];
+export const BLOCK_DEFINITIONS: BlockDefinition[] = [
+  BODICE_FRONT_BLOCK,
+  BODICE_BACK_BLOCK,
+  SKIRT_BLOCK,
+];
 
 export function getBlockDefinition(id: string): BlockDefinition | null {
   return BLOCK_DEFINITIONS.find((definition) => definition.id === id) ?? null;

@@ -320,6 +320,88 @@ export function isWeightField(fieldId: string): boolean {
   return fieldId === 'weight';
 }
 
+/**
+ * Measurements a 3D avatar must supply to drive generation — one per MakeHuman
+ * slider. Everything else is derived from the generated model.
+ */
+export const MANDATORY_MEASUREMENT_IDS: readonly string[] = [
+  'height',
+  'neck',
+  'bust',
+  'underBust',
+  'waist',
+  'hip',
+  'shoulderLength',
+  'napeToWaist',
+  'waistToHip',
+  'upperArm',
+  'wrist',
+  'thigh',
+  'knee',
+  'calf',
+  'ankle',
+  'inseam',
+  'shoulderToElbow',
+  'sleeveLength',
+];
+
+/**
+ * Defaults for the mandatory measurements, in centimetres.
+ *
+ * These are the measurements of the generator's own neutral body (MakeHuman
+ * default proportions at 170 cm, average gender), so a new avatar generates
+ * without any slider being pushed out of range.
+ */
+export const DEFAULT_MEASUREMENT_CM: Record<string, number> = {
+  height: 170,
+  neck: 33.2,
+  bust: 88.3,
+  underBust: 74.6,
+  waist: 73.3,
+  hip: 93.5,
+  shoulderLength: 13.6,
+  napeToWaist: 37.6,
+  waistToHip: 18.7,
+  upperArm: 25.1,
+  wrist: 13.7,
+  thigh: 52.8,
+  knee: 34.8,
+  calf: 36.7,
+  ankle: 19.9,
+  inseam: 85.2,
+  shoulderToElbow: 27.2,
+  sleeveLength: 50.3,
+};
+
+/**
+ * Defaults converted into the display unit.
+ *
+ * Pass the avatar's own height to get the neutral body scaled to that height,
+ * which keeps the defaults inside the generator's achievable range.
+ */
+export function defaultMeasurementValues(
+  unit: UnitDisplay,
+  heightCm: number = DEFAULT_MEASUREMENT_CM.height!
+): Record<string, number> {
+  const scale = heightCm / DEFAULT_MEASUREMENT_CM.height!;
+  const out: Record<string, number> = {};
+  for (const [id, cm] of Object.entries(DEFAULT_MEASUREMENT_CM)) {
+    const value = id === 'height' ? heightCm : cm * scale;
+    out[id] = unit === 'in' ? Math.round((value / 2.54) * 10) / 10 : Math.round(value * 10) / 10;
+  }
+  return out;
+}
+
+/** The avatar's own height in cm, or undefined when it has not been entered. */
+export function measurementHeightCm(
+  values: Record<string, number>,
+  unit: UnitDisplay
+): number | undefined {
+  const raw = values.height;
+  if (raw === undefined || !Number.isFinite(raw) || raw <= 0) return undefined;
+  return unit === 'in' ? raw * 2.54 : raw;
+}
+
 /** A named set of measurements — one "person" you draft for. */
 export type MeasurementSet = {
   id: string;
