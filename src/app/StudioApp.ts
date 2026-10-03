@@ -18,11 +18,13 @@ import {
   syncDefaultCameraFromDrapeA,
 } from '../sim/cameraDefaults';
 import type {
+  BlockInstance,
   CanvasNode,
   ImageNode,
   MeshDocument,
   MeshFrameNode,
   PatternDocument,
+  PatternPiece,
   PieceTransform3d,
   ProjectDocument,
   SimInstance,
@@ -34,12 +36,17 @@ import type {
   SimCameraState,
 } from '../project/types';
 import { PatternEditor } from '../pattern/PatternEditor';
+import { generateBlockPieces } from '../pattern/blocks/generate';
+import { getBlockDefinition } from '../pattern/blocks/registry';
+import { MeasurementModal } from './MeasurementModal';
+import { cachedMeasurementLibrary, loadMeasurementLibrary } from '../persistence/measurementLibrary';
 import { MeshPreview } from '../mesh/MeshPreview';
 import { createSharedGpu, SimViewportRuntime } from '../sim/SimViewportRuntime';
 import { Transform3dRuntime } from '../sim/Transform3dRuntime';
 import { DEFAULT_TRANSFORM_PIECE_ROTATION_DEG } from '../sim/transformDefaults';
 import {
   createIcons,
+  ClipboardList,
   FilePlus2,
   Folder,
   Image as ImageIcon,
@@ -145,6 +152,8 @@ export class StudioApp {
   private selectedNodeId: string | null = null;
   /** Fixed-position tip host (escapes inspector overflow clipping). */
   private inspectorTipEl: HTMLDivElement | null = null;
+  /** Body-measurement library dialog, when open. */
+  private measurementModal: MeasurementModal | null = null;
   private panning = false;
   private panLast = { x: 0, y: 0 };
   private draggingNode: { id: string; ox: number; oy: number } | null = null;
@@ -220,8 +229,11 @@ export class StudioApp {
     app.setStatus('Loading projects…');
     try {
       await initializeProjectLibrary();
+      // Rulers read the body-measurement library for their labels, so warm the
+      // cache before the first pattern editor mounts.
+      void loadMeasurementLibrary().then(() => app.refreshRulerLibraries());
       app.project = app.prepareLoadedProject(await app.loadInitialProject());
-      app.syncProjectNameInput();
+      app.syncProjectChrome();
       app.restartAutosave();
       app.renderAll();
       void app.initGpuAndSims();
@@ -377,7 +389,7 @@ export class StudioApp {
           ? prevSelectedNodeId
           : null;
       this.transformInspectorPieceId = prevTransformPieceId;
-      this.syncProjectNameInput();
+      this.syncProjectChrome();
 
       if (needsRemount) {
         this.renderAll();
@@ -759,14 +771,22 @@ export class StudioApp {
       this.updateHistoryButtons();
     }
     this.teardownSims();
-    this.syncProjectNameInput();
+    this.syncProjectChrome();
     this.renderAll();
     void this.initGpuAndSims();
   }
 
-  private syncProjectNameInput(): void {
+  /**
+   * Point the toolbar's document-mirroring chrome at the current project.
+   *
+   * Called on every project switch, not just at build time: the toolbar is
+   * built against a placeholder project *before* the saved one loads, so a
+   * one-shot sync would leave the units label showing the placeholder's unit.
+   */
+  private syncProjectChrome(): void {
     const input = this.toolbar.querySelector('#projectName') as HTMLInputElement | null;
     if (input) input.value = this.project.name;
+    this.updateUnitButton();
   }
 
   private bindImportFile(): void {
@@ -797,8 +817,35 @@ export class StudioApp {
     if (this.restoringUndo) return;
     this.avatarLoadAbort?.abort();
     this.avatarLoadAbort = null;
+    // Flushes any pending measurement write before the dialog is torn down.
+    this.measurementModal?.close();
+    this.measurementModal = null;
     this.modalRoot.hidden = true;
     this.modalRoot.innerHTML = '';
+  }
+
+  private openMeasurementModal(): void {
+    this.modalRoot.hidden = false;
+    const modal = new MeasurementModal(this.modalRoot, {
+      onClose: () => this.closeModal(),
+      onChange: (library) => {
+        const active = library.sets.find((s) => s.id === library.activeId) ?? library.sets[0];
+        this.setStatus(
+          active
+            ? `Measurements · ${active.name} (${library.sets.length} ${library.sets.length === 1 ? 'person' : 'people'})`
+            : 'Measurements updated'
+        );
+        // Rulers are sized and labelled from these numbers — repaint them.
+        this.refreshRulerLibraries();
+      },
+    });
+    this.measurementModal = modal;
+    void modal.open();
+  }
+
+  /** Re-label every open pattern editor after the measurement library changes. */
+  private refreshRulerLibraries(): void {
+    for (const editor of this.editors.values()) editor.reloadRulers();
   }
 
   private openNewProjectPrompt(): void {
@@ -1305,15 +1352,16 @@ export class StudioApp {
       <button type="button" data-act="redo" disabled title="Nothing to redo" aria-label="Redo"><i data-lucide="redo-2" aria-hidden="true"></i><span>Redo</span></button>
       <div class="toolbar-sep"></div>
       <button type="button" data-act="loadAvatar"><i data-lucide="user-round" aria-hidden="true"></i><span>Load avatar model</span></button>
+      <button type="button" data-act="measurements" title="Body measurement sets for the people you draft for"><i data-lucide="clipboard-list" aria-hidden="true"></i><span>Measurements</span></button>
       <div class="toolbar-sep"></div>
-      <button type="button" data-act="unit" title="Display units"><i data-lucide="ruler" aria-hidden="true"></i><span>Units: cm</span></button>
+      <button type="button" data-act="unit" title="Display units"><i data-lucide="ruler" aria-hidden="true"></i><span>Units</span></button>
       <div class="toolbar-sep"></div>
       <button type="button" data-act="addPattern"><i data-lucide="scissors" aria-hidden="true"></i><span>+ Pattern</span></button>
       <button type="button" data-act="addSim"><i data-lucide="shirt" aria-hidden="true"></i><span>+ Sim</span></button>
       <button type="button" data-act="addText"><i data-lucide="sticky-note" aria-hidden="true"></i><span>+ Note</span></button>
       <button type="button" data-act="addImage" title="Add image reference (or paste / drop on canvas)"><i data-lucide="image" aria-hidden="true"></i><span>+ Image</span></button>
     `;
-    this.syncProjectNameInput();
+    this.syncProjectChrome();
     this.updateHistoryButtons();
     this.toolbar.querySelector('#projectName')!.addEventListener('change', (e) => {
       this.pushUndo();
@@ -1334,6 +1382,7 @@ export class StudioApp {
         Redo2,
         UserRound,
         Ruler,
+        ClipboardList,
         Scissors,
         Shirt,
         StickyNote,
@@ -1366,12 +1415,17 @@ export class StudioApp {
       case 'loadAvatar':
         this.openAvatarModal();
         break;
+      case 'measurements':
+        this.openMeasurementModal();
+        break;
       case 'unit':
         this.pushUndo();
         this.project.displayUnit = this.project.displayUnit === 'cm' ? 'in' : 'cm';
         this.updateUnitButton();
         this.editors.forEach((ed) => ed.setUnit(this.project.displayUnit));
         this.meshPreviews.forEach((p) => p.setUnit(this.project.displayUnit));
+        // The unit is document data — make sure the choice reaches the file.
+        this.markDirty(true);
         break;
       case 'addPattern':
         this.pushUndo();
@@ -2337,7 +2391,12 @@ export class StudioApp {
           this.invalidateMeshesForPattern(pattern.id);
           // Flag the remesh chip immediately when editing inside fullscreen.
           this.refreshFullscreenTabs();
+          // Pattern edits are document data — make sure they reach the file.
+          this.markDirty(true);
         },
+        // Rulers are drafting references: they repaint, but never invalidate.
+        onRulerChange: () => this.markDirty(true),
+        getMeasurementLibrary: () => cachedMeasurementLibrary(),
       });
       this.editors.set(node.id, editor);
     } else if (node.type === 'meshFrame') {
@@ -3703,7 +3762,7 @@ export class StudioApp {
             <option value="structuredGrid" ${s.algorithm === 'structuredGrid' ? 'selected' : ''}>Structured grid</option>
           </select>
         </label>
-        <label>Target edge (${this.project.displayUnit})
+        <label>Target edge (cm)
           <input id="meshEdge" type="range" min="1" max="12" step="0.25" value="${s.targetEdgeCm}" />
           <span id="meshEdgeVal">${s.targetEdgeCm.toFixed(2)} cm</span>
         </label>
@@ -4308,7 +4367,55 @@ export class StudioApp {
   private clonePatternDocument(src: PatternDocument): PatternDocument {
     const pieceIdMap = new Map<string, string>();
     const pointIdMap = new Map<string, string>();
-    const pieces = src.pieces.map((piece) => {
+
+    // Blocks are *regenerated* rather than copied. Their piece and point ids are
+    // derived from the instance id, so handing the clone a fresh instance id
+    // means the outlines have to be rebuilt to match — otherwise the first
+    // regeneration afterwards would silently orphan every seam on the block.
+    const library = cachedMeasurementLibrary();
+    const sourceBlocks = src.blocks ?? [];
+    const ownedPieceIds = new Set(
+      sourceBlocks.flatMap((instance) => instance.pieces.map((entry) => entry.pieceId))
+    );
+    const blocks: BlockInstance[] = [];
+    const generatedPieces: PatternPiece[] = [];
+
+    for (const instance of sourceBlocks) {
+      const definition = getBlockDefinition(instance.definitionId);
+      if (!definition) continue;
+      const copy: BlockInstance = {
+        ...instance,
+        id: uid('blk'),
+        origin: { ...instance.origin },
+        bindings: structuredClone(instance.bindings),
+        pieces: [],
+      };
+      const set =
+        library?.sets.find((s) => s.id === instance.personId) ??
+        (instance.personId ? null : (library?.sets.find((s) => s.id === library.activeId) ?? null));
+      const generated = generateBlockPieces(definition, copy, set);
+
+      // Carry the old ids across so any seam pointing at the original still does.
+      for (const entry of generated) {
+        const original = instance.pieces.find((e) => e.role === entry.role);
+        if (!original) continue;
+        pieceIdMap.set(original.pieceId, entry.piece.id);
+        const from = src.pieces.find((p) => p.id === original.pieceId);
+        if (!from) continue;
+        for (const [index, point] of from.points.entries()) {
+          const to = entry.piece.points[index];
+          if (to) pointIdMap.set(point.id, to.id);
+        }
+      }
+
+      copy.pieces = generated.map((entry) => ({ role: entry.role, pieceId: entry.piece.id }));
+      blocks.push(copy);
+      generatedPieces.push(...generated.map((entry) => entry.piece));
+    }
+
+    const pieces = src.pieces
+      .filter((piece) => !ownedPieceIds.has(piece.id))
+      .map((piece) => {
       const newPieceId = uid('piece');
       pieceIdMap.set(piece.id, newPieceId);
       const points = piece.points.map((pt) => {
@@ -4345,13 +4452,16 @@ export class StudioApp {
     return {
       id: uid('pattern'),
       name: `${src.name} copy`,
-      pieces,
+      pieces: [...pieces, ...generatedPieces],
       seams: src.seams.map((seam) => ({
         id: uid('seam'),
         a: remapEdge(seam.a),
         b: remapEdge(seam.b),
         restGapCm: seam.restGapCm,
       })),
+      rulers: src.rulers ? structuredClone(src.rulers) : undefined,
+      blocks: blocks.length > 0 ? blocks : undefined,
+      pieceSuccessors: src.pieceSuccessors ? structuredClone(src.pieceSuccessors) : undefined,
     };
   }
 

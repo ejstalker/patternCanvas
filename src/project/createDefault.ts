@@ -9,6 +9,7 @@ import type {
   Transform3dInstance,
   Vec2,
 } from './types';
+import { DEFAULT_DISPLAY_UNIT } from './types';
 import { DEFAULT_MESH_SETTINGS, triangulatePattern } from '../mesh/triangulate';
 import { getDefaultSimCamera, syncDefaultCameraFromDrapeA } from '../sim/cameraDefaults';
 
@@ -221,7 +222,7 @@ export function createDefaultProject(): ProjectDocument {
     version: 2,
     id: uid('project'),
     name: 'Untitled project',
-    displayUnit: 'cm',
+    displayUnit: DEFAULT_DISPLAY_UNIT,
     canvas: {
       panX: 40,
       panY: 40,

@@ -1,10 +1,16 @@
 import type { MeshDocument, ProjectDocument } from '../project/types';
+import { DEFAULT_DISPLAY_UNIT } from '../project/types';
 import { createMeshDocument, uid } from '../project/createDefault';
 import { DEFAULT_MESH_SETTINGS, triangulatePattern } from '../mesh/triangulate';
 
 export function normalizeProject(project: ProjectDocument): ProjectDocument {
   const normalized: ProjectDocument = {
     ...project,
+    // A hand-edited or truncated file must not leave the UI showing
+    // "Units: undefined" — fall back to the default rather than trust it.
+    displayUnit: project.displayUnit === 'in' || project.displayUnit === 'cm'
+      ? project.displayUnit
+      : DEFAULT_DISPLAY_UNIT,
     transforms: project.transforms ?? [],
     meshTransformAssignments: project.meshTransformAssignments ?? [],
     transformSimAssignments: project.transformSimAssignments ?? [],

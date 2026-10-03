@@ -2,6 +2,15 @@
 
 export type UnitDisplay = 'cm' | 'in';
 
+/**
+ * The unit a project opens in.
+ *
+ * Storage is always canonical centimetres — this only decides how numbers are
+ * *shown*, and every project records its own choice, so changing this affects
+ * new projects only and never rewrites an existing one.
+ */
+export const DEFAULT_DISPLAY_UNIT: UnitDisplay = 'in';
+
 export type Vec2 = { x: number; y: number };
 
 /** Cubic bezier segment in pattern space (cm). */
@@ -56,11 +65,45 @@ export type SeamVertexTag = {
   t: number;
 };
 
+/**
+ * A linear reference line laid over a pattern — a physical ruler you can park
+ * next to the piece while drafting.
+ *
+ * It measures a *person*, not the pattern: `measurementId` points at one of the
+ * body measurements from `MEASUREMENT_FIELDS` and the drawn length tracks that
+ * person's live value. `lengthCm` is the last known value, kept so the ruler
+ * still draws when the library (or that person) is not available.
+ */
+export type PatternRuler = {
+  id: string;
+  /** Centre of the ruler in pattern space (cm). */
+  center: Vec2;
+  /** Rotation in degrees; 0 lies along +x (reads left to right). */
+  angle: number;
+  /** Length of the *full* measurement in cm (ignored when `measurementId` is null). */
+  lengthCm: number;
+  /** Body-measurement field id, or null for a free-standing ruler. */
+  measurementId: string | null;
+  /** Measurement set ("person") this references, or null. */
+  personId: string | null;
+  /** Person name snapshot, so the label survives a renamed / missing set. */
+  personName: string;
+  /** Draw at half the measurement — the usual fold / half-scale drafting length. */
+  half: boolean;
+};
+
 export type PatternDocument = {
   id: string;
   name: string;
   pieces: PatternPiece[];
   seams: SeamBinding[];
+  /** Drafting reference rulers (see `PatternRuler`). */
+  rulers?: PatternRuler[];
+  /**
+   * Parametric block instances (see `BlockInstance`). Their pieces live in
+   * `pieces` like any other, so meshing, seams and export need no special case.
+   */
+  blocks?: BlockInstance[];
   /**
    * Lineage for pieces that were replaced by new ids (e.g. a knife cut):
    * removed piece id → the ids that took its place. Downstream Transform 3D
@@ -69,6 +112,68 @@ export type PatternDocument = {
    */
   pieceSuccessors?: Record<string, string[]>;
 };
+
+/**
+ * A block variable either sits at a fixed number or follows one of a person's
+ * measurements, divided and offset. The divisor is not decoration: a bodice
+ * width is a *quarter* bust arc plus ease, and a skirt panel is a quarter hip.
+ */
+export type BlockMeasurementSource = {
+  /** A `MEASUREMENT_FIELDS` id. */
+  fieldId: string;
+  /** 1 = the measurement itself, 2 = half, 4 = quarter. */
+  divisor: 1 | 2 | 4;
+  /** Ease added after dividing, in cm. */
+  offsetCm: number;
+};
+
+export type BlockVariableBinding =
+  | { mode: 'value'; cm: number }
+  | (BlockMeasurementSource & {
+      mode: 'measurement';
+      /** Snapshot so the block still draws when the library is missing. */
+      fallbackCm: number;
+    });
+
+/** One editable number a block definition exposes. */
+export type BlockVariableDecl = {
+  id: string;
+  label: string;
+  /** Display grouping, e.g. 'Widths' / 'Lengths' / 'Darts'. */
+  group: string;
+  /** Most variables are lengths in cm; a few are counts of things. */
+  kind?: 'length' | 'count';
+  /** Bound automatically when the block is first placed on a person. */
+  suggested?: BlockMeasurementSource;
+  /** Used when the variable is a plain number. Always in cm. */
+  defaultValueCm: number;
+  minCm: number;
+  maxCm: number;
+  /** Why this number is what it is — the draft formula it came from. */
+  note?: string;
+};
+
+/**
+ * A placed block. Its geometry is regenerated from `bindings` whenever a
+ * variable changes, so the generated pieces are read-only until detached.
+ */
+export type BlockInstance = {
+  id: string;
+  definitionId: string;
+  /** The person this block is drafted for; null means the active person. */
+  personId: string | null;
+  personName: string;
+  /** Where the draft's origin sits in pattern space (cm). */
+  origin: Vec2;
+  /** Variable id → binding. Anything missing falls back to the declaration. */
+  bindings: Record<string, BlockVariableBinding>;
+  /**
+   * Generated pieces, keyed by the role the definition gave them, so
+   * regeneration can keep piece and point ids stable and seams survive.
+   */
+  pieces: Array<{ role: string; pieceId: string }>;
+};
+
 
 export type MeshAlgorithm = 'structuredGrid' | 'delaunay' | 'centroidal';
 

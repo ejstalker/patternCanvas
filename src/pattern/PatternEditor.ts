@@ -1,13 +1,36 @@
 import type {
   BezierPoint,
+  BlockInstance,
+  BlockVariableBinding,
+  BlockVariableDecl,
   PatternDocument,
   PatternPiece,
+  PatternRuler,
   SeamBinding,
   SeamEdgeRef,
   UnitDisplay,
   Vec2,
 } from '../project/types';
-import { formatLength } from '../project/types';
+import { formatLength, cmToDisplay, displayToCm } from '../project/types';
+import type { MeasurementLibrary, MeasurementSet } from '../project/measurements';
+import { MEASUREMENT_FIELDS } from '../project/measurements';
+import {
+  buildMeasurementMenu,
+  distanceToSegment,
+  filterMeasurementMenu,
+  measurementField,
+  measurementSearchTokens,
+  measurementValueCm,
+  nearestMeasurementField,
+  normalizeRulers,
+  rulerAngle,
+  rulerEndpoints,
+  rulerGraduations,
+  rulerLabel,
+  rulerTextFlipped,
+  setRulerDrawnLength,
+  type RulerHit,
+} from './rulers';
 import { drawMeshSeamConnectors } from '../mesh/meshSeamDraw';
 import { recordPieceSuccessors } from '../sim/pieceTransforms';
 import { circlePiece, rectPiece, uid } from '../project/createDefault';
@@ -39,7 +62,19 @@ import {
   type CutterPath,
 } from './slice';
 import { parseSvgToPieces, scalePieces, type SvgImportResult } from './importSvg';
+import { buildGridGroup } from './grid';
 import { buildManyToManySeams } from './multiSew';
+import { drivenPointIds } from './blocks/driven';
+import {
+  createBlockInstance,
+  generateBlockPieces,
+  nextBlockOrigin,
+  normalizeBlocks,
+  spliceBlockPieces,
+} from './blocks/generate';
+import { BLOCK_DEFINITIONS, getBlockDefinition } from './blocks/registry';
+import { bindingValueCm, clampToDeclared, resolveBlockValues, sourceValueCm } from './blocks/resolve';
+import type { BlockDefinition } from './blocks/spec';
 import { DEFAULT_SEAM_GAP_CM } from '../mesh/triangulate';
 import {
   AVATAR_OVERLAY_VIEWS,
@@ -52,6 +87,13 @@ export type PatternEditorCallbacks = {
   onChange: () => void;
   /** Fired once before a gesture/mutation so the host can snapshot undo history. */
   onBeforeChange?: () => void;
+  /**
+   * Ruler edits are drafting references only — they never change geometry, so
+   * they must not invalidate the mesh the way `onChange` does.
+   */
+  onRulerChange?: () => void;
+  /** Body-measurement library (people + values) used to size and label rulers. */
+  getMeasurementLibrary?: () => MeasurementLibrary | null;
 };
 
 /** Figma-aligned vector tools inside a pattern frame. */
@@ -63,7 +105,8 @@ export type PatternTool =
   | 'knife'
   | 'dart'
   | 'sew'
-  | 'bend';
+  | 'bend'
+  | 'ruler';
 
 export type KnifeMode = 'linear' | 'circle' | 'curve';
 export type SewMode = 'segment' | 'many';
@@ -94,6 +137,10 @@ type DragKind =
       /** Shift locks rectangle to square; ignored for circle (always circular). */
       lockAspect: boolean;
     }
+  | { type: 'rulerCreate'; start: Vec2; current: Vec2; snap: boolean }
+  | { type: 'rulerMove'; id: string; start: Vec2; origin: Vec2 }
+  | { type: 'rulerTurn'; id: string; which: 'a' | 'b' }
+  | { type: 'blockMove'; id: string; start: Vec2; origin: Vec2 }
   | { type: 'knifeLine'; start: Vec2; current: Vec2; shift: boolean }
   | { type: 'knifeCircle'; center: Vec2; radius: number; shift: boolean }
   | { type: 'knifeCurveHandles'; a: Vec2; b: Vec2; c0: Vec2; c1: Vec2 }
@@ -137,6 +184,47 @@ type SnapGuide =
     };
 
 type SnapMidTarget = { at: Vec2; a: Vec2; b: Vec2 };
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+function svgEl<K extends keyof SVGElementTagNameMap>(tag: K): SVGElementTagNameMap[K] {
+  return document.createElementNS(SVG_NS, tag);
+}
+
+function svgLine(
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  cls: string,
+  strokeWidth: number
+): SVGLineElement {
+  const line = svgEl('line');
+  line.setAttribute('x1', String(x1));
+  line.setAttribute('y1', String(y1));
+  line.setAttribute('x2', String(x2));
+  line.setAttribute('y2', String(y2));
+  line.setAttribute('class', cls);
+  line.setAttribute('stroke-width', String(strokeWidth));
+  return line;
+}
+
+/**
+ * Repair a pattern's derived data on the way in.
+ *
+ * Both of these are caches that a document can carry stale copies of: ruler
+ * labels are resolved live, and block outlines are a rendering of the block's
+ * variables. Nothing should ever draw before this has run — an older build, a
+ * hand-edited archive or a clamped variable would otherwise keep showing a
+ * shape the data no longer describes.
+ */
+function normalizePattern(
+  pattern: PatternDocument,
+  setFor: (personId: string | null) => MeasurementSet | null | undefined
+): void {
+  if (pattern.rulers) pattern.rulers = normalizeRulers(pattern.rulers);
+  normalizeBlocks(pattern, getBlockDefinition, setFor);
+}
 
 /**
  * SVG pattern editor with Move / Pen / Bend tools (Figma-like) and
@@ -233,6 +321,48 @@ export class PatternEditor {
   private svgFileInput!: HTMLInputElement;
   private importDialog: HTMLElement | null = null;
   private pendingSvgImport: SvgImportResult | null = null;
+  /** Ruler tool state — rulers are document data on `pattern.rulers`. */
+  private selectedRulerId: string | null = null;
+  private hoverRulerId: string | null = null;
+  private rulerBtn!: HTMLButtonElement;
+  private rulerMenu!: HTMLElement;
+  private rulerSearchInput!: HTMLInputElement;
+  private rulerTree!: HTMLElement;
+  private rulerMenuHoldTimer: ReturnType<typeof setTimeout> | null = null;
+  private rulerMenuHoldOpened = false;
+  private rulerMenuDocPointerDown: ((e: PointerEvent) => void) | null = null;
+  /**
+   * A measurement chosen from the hold-open menu, waiting for the next drag.
+   * Lets you lay out several rulers of the same body dimension in a row.
+   */
+  private rulerArmed: {
+    personId: string;
+    personName: string;
+    fieldId: string;
+    lengthCm: number;
+  } | null = null;
+  private rulerBar!: HTMLElement;
+  /** Block tool state — instances are document data on `pattern.blocks`. */
+  private selectedBlockId: string | null = null;
+  /**
+   * Which block owns each generated piece. Rebuilt at the top of `redraw()` so
+   * `drawPiece` can tint block geometry without a scan per piece.
+   */
+  private blockOwnership = new Map<string, BlockInstance>();
+  /** The variable row under the pointer, and the points its value moves. */
+  private hoverVarId: string | null = null;
+  private hoverDriven: Set<string> | null = null;
+  private blockBtn!: HTMLButtonElement;
+  private blockMenu!: HTMLElement;
+  private blockMenuDocPointerDown: ((e: PointerEvent) => void) | null = null;
+  private blockBar!: HTMLElement;
+  private blockPersonSelect!: HTMLSelectElement;
+  private blockSourceNote!: HTMLElement;
+  private blockVarsHost!: HTMLElement;
+  private rulerPersonSelect!: HTMLSelectElement;
+  private rulerMeasureSelect!: HTMLSelectElement;
+  private rulerScaleBtns: HTMLButtonElement[] = [];
+  private rulerReadout!: HTMLElement;
 
   constructor(
     host: HTMLElement,
@@ -244,6 +374,7 @@ export class PatternEditor {
     this.pattern = pattern;
     this.unit = unit;
     this.cbs = cbs;
+    normalizePattern(pattern, (id) => this.measurementSet(id));
 
     this.root.innerHTML = '';
     this.root.classList.add('pattern-editor');
@@ -298,6 +429,32 @@ export class PatternEditor {
           </div>
         </div>
         <button type="button" data-tool="bend" data-tip="Bend" aria-label="Bend">∿</button>
+        <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="ruler">
+          <button type="button" data-tool="ruler" data-tip="Ruler · hold for measurements" aria-label="Ruler" aria-haspopup="true" aria-expanded="false">
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+              <g transform="rotate(-45 8 8)">
+                <rect x="1.2" y="5.4" width="13.6" height="5.2" rx="0.8" fill="none" stroke="currentColor" stroke-width="1.3"/>
+                <path fill="none" stroke="currentColor" stroke-width="1.1" d="M4 5.4v2M6.6 5.4v1.3M9.2 5.4v2M11.8 5.4v1.3"/>
+              </g>
+            </svg>
+          </button>
+          <div class="pattern-tool-flyout-menu pattern-ruler-menu" hidden role="menu">
+            <div class="pattern-ruler-menu-search">
+              <input type="search" data-ruler-search autocomplete="off" spellcheck="false"
+                placeholder="Search people or measurements…" aria-label="Search people and measurements" />
+            </div>
+            <div class="pattern-ruler-menu-tree" data-ruler-tree role="tree"></div>
+          </div>
+        </div>
+        <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="block">
+          <button type="button" data-act="add-block" data-tip="Block · add a pattern block" aria-label="Add block" aria-haspopup="true" aria-expanded="false">
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M2.6 5.6 L8 2.9 L13.4 5.6 L13.4 10.6 L8 13.3 L2.6 10.6 Z"/>
+              <circle cx="8" cy="8" r="1.5" fill="currentColor"/>
+            </svg>
+          </button>
+          <div class="pattern-tool-flyout-menu pattern-block-menu" hidden role="menu" data-block-menu></div>
+        </div>
         <button type="button" data-act="import-svg" data-tip="Import SVG" aria-label="Import SVG">
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
             <path fill="none" stroke="currentColor" stroke-width="1.3" d="M3.5 3.5h9v9h-9z"/>
@@ -357,8 +514,29 @@ export class PatternEditor {
     this.sewFlyout = this.toolbar.querySelector(
       '[data-flyout="sew"] .pattern-tool-flyout-menu'
     ) as HTMLElement;
+    this.rulerBtn = this.toolbar.querySelector('button[data-tool="ruler"]') as HTMLButtonElement;
+    this.rulerMenu = this.toolbar.querySelector(
+      '[data-flyout="ruler"] .pattern-tool-flyout-menu'
+    ) as HTMLElement;
+    this.blockBtn = this.toolbar.querySelector('button[data-act="add-block"]') as HTMLButtonElement;
+    this.blockMenu = this.toolbar.querySelector('[data-block-menu]') as HTMLElement;
+    this.bindBlockMenu();
+    this.rulerSearchInput = this.toolbar.querySelector(
+      'input[data-ruler-search]'
+    ) as HTMLInputElement;
+    this.rulerTree = this.toolbar.querySelector('[data-ruler-tree]') as HTMLElement;
     this.bindKnifeFlyout();
     this.bindSewFlyout();
+    this.bindRulerMenu();
+    this.rulerSearchInput.addEventListener('input', () => this.renderRulerMenu());
+    this.rulerTree.addEventListener('click', (e) => {
+      const item = (e.target as HTMLElement).closest(
+        'button[data-measure-id]'
+      ) as HTMLButtonElement | null;
+      if (!item || item.disabled) return;
+      e.preventDefault();
+      this.chooseRulerMeasurement(item.dataset.personId ?? '', item.dataset.measureId ?? '');
+    });
     this.toolbar.addEventListener('click', (e) => {
       const importBtn = (e.target as HTMLElement).closest(
         'button[data-act="import-svg"]'
@@ -422,7 +600,13 @@ export class PatternEditor {
       const btn = (e.target as HTMLElement).closest('button[data-tool]') as HTMLButtonElement | null;
       if (!btn) return;
       // Flyout main buttons are handled by press/click bindings.
-      if (btn.dataset.tool === 'knife' || btn.dataset.tool === 'sew') return;
+      if (
+        btn.dataset.tool === 'knife' ||
+        btn.dataset.tool === 'sew' ||
+        btn.dataset.tool === 'ruler'
+      ) {
+        return;
+      }
       this.hideKnifeFlyout();
       this.hideSewFlyout();
       this.setTool(btn.dataset.tool as PatternTool);
@@ -434,20 +618,191 @@ export class PatternEditor {
 
     this.pointBar = document.createElement('div');
     this.pointBar.className = 'pattern-point-bar';
+    this.pointBar.hidden = true;
     this.pointBar.innerHTML = `
       <label title="Keep handles opposite when dragging"><input type="checkbox" data-opt="parallel" /> Parallel handles</label>
       <label title="Zero-length handles — corner / straight segments"><input type="checkbox" data-opt="corner" /> Corner (zero handles)</label>
     `;
-    main.appendChild(this.pointBar);
     this.parallelCheck = this.pointBar.querySelector('input[data-opt="parallel"]') as HTMLInputElement;
     this.cornerCheck = this.pointBar.querySelector('input[data-opt="corner"]') as HTMLInputElement;
-    this.pointBar.addEventListener('pointerdown', (e) => e.stopPropagation());
+    this.sealOverlay(this.pointBar);
     this.parallelCheck.addEventListener('change', () => this.onParallelToggle());
     this.cornerCheck.addEventListener('change', () => this.onCornerToggle());
 
     this.viewport = document.createElement('div');
     this.viewport.className = 'pattern-viewport';
     main.appendChild(this.viewport);
+    // Floats over the canvas in the top-left slot — as a layout sibling above
+    // the viewport it used to shove the whole canvas down whenever you clicked
+    // a point.
+    this.viewport.appendChild(this.pointBar);
+
+    // Ruler inspector — appears only while a reference ruler is selected.
+    this.rulerBar = document.createElement('div');
+    this.rulerBar.className = 'pattern-ruler-bar';
+    this.rulerBar.hidden = true;
+    this.rulerBar.innerHTML = `
+      <span class="pattern-ruler-bar-label">
+        <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+          <g transform="rotate(-45 8 8)">
+            <rect x="1.2" y="5.4" width="13.6" height="5.2" rx="0.8" fill="none" stroke="currentColor" stroke-width="1.3"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.1" d="M4 5.4v2M6.6 5.4v1.3M9.2 5.4v2M11.8 5.4v1.3"/>
+          </g>
+        </svg>
+        Ruler
+      </span>
+      <label class="pattern-ruler-field">
+        <span>Person</span>
+        <select data-ruler-person aria-label="Measurement person"></select>
+      </label>
+      <label class="pattern-ruler-field">
+        <span>Measurement</span>
+        <select data-ruler-measure aria-label="Body measurement"></select>
+      </label>
+      <div class="pattern-ruler-scale" role="group" aria-label="Ruler width">
+        <button type="button" data-ruler-half="0">Full</button>
+        <button type="button" data-ruler-half="1" title="Half the measurement — the usual fold line">Half</button>
+      </div>
+      <span class="pattern-ruler-readout" data-ruler-readout></span>
+      <button type="button" class="pattern-ruler-delete" data-ruler-delete aria-label="Delete ruler">Delete</button>
+    `;
+    this.viewport.appendChild(this.rulerBar);
+    this.rulerPersonSelect = this.rulerBar.querySelector(
+      'select[data-ruler-person]'
+    ) as HTMLSelectElement;
+    this.rulerMeasureSelect = this.rulerBar.querySelector(
+      'select[data-ruler-measure]'
+    ) as HTMLSelectElement;
+    this.rulerReadout = this.rulerBar.querySelector('[data-ruler-readout]') as HTMLElement;
+    this.rulerScaleBtns = Array.from(
+      this.rulerBar.querySelectorAll('button[data-ruler-half]')
+    ) as HTMLButtonElement[];
+    this.sealOverlay(this.rulerBar);
+    this.rulerBar.addEventListener('click', (e) => {
+      const halfBtn = (e.target as HTMLElement).closest(
+        'button[data-ruler-half]'
+      ) as HTMLButtonElement | null;
+      if (halfBtn) {
+        this.setSelectedRulerHalf(halfBtn.dataset.rulerHalf === '1');
+        return;
+      }
+      const del = (e.target as HTMLElement).closest(
+        'button[data-ruler-delete]'
+      ) as HTMLButtonElement | null;
+      if (del) this.deleteSelectedRuler();
+    });
+    this.rulerPersonSelect.addEventListener('change', () =>
+      this.onRulerPersonChange(this.rulerPersonSelect.value)
+    );
+    this.rulerMeasureSelect.addEventListener('change', () =>
+      this.onRulerMeasurementChange(this.rulerMeasureSelect.value)
+    );
+
+    // Block inspector — takes the same top-left slot as the point and ruler
+    // ribbons; the three are mutually exclusive by selection.
+    this.blockBar = document.createElement('div');
+    this.blockBar.className = 'pattern-block-bar';
+    this.blockBar.hidden = true;
+    this.blockBar.innerHTML = `
+      <div class="pattern-block-head">
+        <span class="pattern-block-name" data-block-name></span>
+        <label class="pattern-block-field">
+          <span>Person</span>
+          <select data-block-person aria-label="Measurement person"></select>
+        </label>
+        <button type="button" class="pattern-block-detach" data-block-detach
+          title="Keep the pieces but stop tracking them as a block">Detach</button>
+        <button type="button" class="pattern-block-delete" data-block-delete
+          aria-label="Delete block">Delete</button>
+      </div>
+      <div class="pattern-block-vars" data-block-vars></div>
+      <div class="pattern-block-source muted" data-block-source></div>
+    `;
+    this.viewport.appendChild(this.blockBar);
+    this.blockPersonSelect = this.blockBar.querySelector(
+      'select[data-block-person]'
+    ) as HTMLSelectElement;
+    this.blockVarsHost = this.blockBar.querySelector('[data-block-vars]') as HTMLElement;
+    this.blockSourceNote = this.blockBar.querySelector('[data-block-source]') as HTMLElement;
+    this.sealOverlay(this.blockBar);
+    this.blockPersonSelect.addEventListener('change', () =>
+      this.onBlockPersonChange(this.blockPersonSelect.value)
+    );
+    this.blockBar.addEventListener('click', (e) => {
+      const target = e.target as HTMLElement;
+      if (target.closest('button[data-block-detach]')) {
+        this.detachSelectedBlock();
+        return;
+      }
+      if (target.closest('button[data-block-delete]')) {
+        this.deleteSelectedBlock();
+        return;
+      }
+      const mode = target.closest('button[data-block-mode]') as HTMLButtonElement | null;
+      const div = target.closest('button[data-block-div]') as HTMLButtonElement | null;
+      const varEl = target.closest('[data-var-id]') as HTMLElement | null;
+      if (!varEl) return;
+      const varId = varEl.dataset.varId!;
+      if (mode) {
+        this.setBlockVariableMode(varId, mode.dataset.blockMode as 'value' | 'measurement');
+        return;
+      }
+      if (div) {
+        const divisor = Number(div.dataset.blockDiv) as 1 | 2 | 4;
+        this.setBlockVariableDivisor(varId, divisor);
+      }
+    });
+    this.blockBar.addEventListener('input', (e) => {
+      const target = e.target as HTMLInputElement;
+      const varEl = target.closest('[data-var-id]') as HTMLElement | null;
+      if (!varEl) return;
+      const varId = varEl.dataset.varId!;
+      // Typing is not a structural edit: the rows stay put so the caret survives
+      // and the whole typed entry collapses into one undo step.
+      if (target.matches('[data-block-value]')) {
+        const cm = this.blockFieldCm(varId, target);
+        if (cm != null) this.setBlockVariableValue(varId, cm, false);
+        return;
+      }
+      if (target.matches('[data-block-offset]')) {
+        const raw = Number.parseFloat(target.value);
+        if (Number.isFinite(raw)) this.setBlockVariableOffset(varId, this.blockCm(raw), false);
+      }
+    });
+    this.blockBar.addEventListener('change', (e) => {
+      const target = e.target as HTMLInputElement | HTMLSelectElement;
+      const varEl = target.closest('[data-var-id]') as HTMLElement | null;
+      if (!varEl) return;
+      const varId = varEl.dataset.varId!;
+      if (target.matches('[data-block-field]')) {
+        this.setBlockVariableField(varId, (target as HTMLSelectElement).value);
+        return;
+      }
+      // Past the select, everything left in this bar is a number field.
+      const field = target as HTMLInputElement;
+      // A field left empty, half-typed or out of range snaps back to the value
+      // the block is really using, so the box never lies about the draft.
+      if (target.matches('[data-block-value]')) {
+        const cm = this.blockFieldCm(varId, field);
+        if (cm != null) this.setBlockVariableValue(varId, cm, false);
+      } else if (target.matches('[data-block-offset]')) {
+        const raw = Number.parseFloat(field.value);
+        if (Number.isFinite(raw)) this.setBlockVariableOffset(varId, this.blockCm(raw), false);
+      }
+      this.syncBlockField(varId, field);
+      this.endHistoryGesture();
+    });
+    // Belt and braces: `change` already fires on blur, but an interrupted edit
+    // must never leave the undo gesture open for the next unrelated action.
+    this.blockBar.addEventListener('focusout', () => this.endHistoryGesture());
+
+    // Hovering a variable lights up the outline it controls, so you can see what
+    // "dart space" or "hip depth, side" actually moves before you touch it.
+    this.blockVarsHost.addEventListener('pointerover', (e) => {
+      const row = (e.target as HTMLElement).closest<HTMLElement>('[data-var-id]');
+      this.setHoveredVar(row?.dataset.varId ?? null);
+    });
+    this.blockVarsHost.addEventListener('pointerleave', () => this.setHoveredVar(null));
 
     this.sewBar = document.createElement('div');
     this.sewBar.className = 'pattern-sew-bar';
@@ -458,7 +813,7 @@ export class PatternEditor {
       <button type="button" data-sew-cancel aria-label="Cancel many-to-many sewing">Cancel</button>
     `;
     this.viewport.appendChild(this.sewBar);
-    this.sewBar.addEventListener('pointerdown', (e) => e.stopPropagation());
+    this.sealOverlay(this.sewBar);
     this.sewBar.querySelector('[data-sew-next]')?.addEventListener('click', () => {
       this.advanceMultiSew();
     });
@@ -482,7 +837,7 @@ export class PatternEditor {
     this.xrayOpacityInput = this.xrayBar.querySelector(
       'input[data-xray-opacity]'
     ) as HTMLInputElement;
-    this.xrayBar.addEventListener('pointerdown', (e) => e.stopPropagation());
+    this.sealOverlay(this.xrayBar);
     this.xrayOpacityInput.addEventListener('input', () => {
       const pct = Math.max(5, Math.min(100, parseFloat(this.xrayOpacityInput.value) || 35));
       this.xrayOpacity = pct / 100;
@@ -519,7 +874,7 @@ export class PatternEditor {
     this.avatarOffsetYInput = this.avatarBar.querySelector(
       'input[data-avatar-oy]'
     ) as HTMLInputElement;
-    this.avatarBar.addEventListener('pointerdown', (e) => e.stopPropagation());
+    this.sealOverlay(this.avatarBar);
     this.avatarViewSelect.addEventListener('change', () => {
       this.avatarOverlayView = this.avatarViewSelect.value as AvatarOverlayView;
       void this.refreshAvatarOverlayPath();
@@ -559,9 +914,11 @@ export class PatternEditor {
       <button type="button" data-act="delete-piece" class="danger">Delete piece</button>
       <button type="button" data-act="reverse-seam" hidden>Reverse seam</button>
       <button type="button" data-act="remove-seam" class="danger" hidden>Remove seam</button>
+      <button type="button" data-act="ruler-toggle-half" hidden>Toggle full / half width</button>
+      <button type="button" data-act="ruler-delete" class="danger" hidden>Delete ruler</button>
     `;
     this.viewport.appendChild(this.contextMenu);
-    this.contextMenu.addEventListener('pointerdown', (e) => e.stopPropagation());
+    this.sealOverlay(this.contextMenu);
     this.contextMenu.addEventListener('click', (e) => {
       const btn = (e.target as HTMLElement).closest('button[data-act]') as HTMLButtonElement | null;
       if (!btn) return;
@@ -572,6 +929,8 @@ export class PatternEditor {
       else if (act === 'delete-piece') this.deleteContextPiece();
       else if (act === 'reverse-seam') this.reverseContextSeam();
       else if (act === 'remove-seam') this.removeContextSeam();
+      else if (act === 'ruler-toggle-half') this.setSelectedRulerHalf(!this.selectedRuler()?.half);
+      else if (act === 'ruler-delete') this.deleteSelectedRuler();
       this.hideContextMenu();
     });
 
@@ -599,6 +958,7 @@ export class PatternEditor {
     this.selectedPieceId = pattern.pieces[0]?.id ?? null;
     this.fitView();
     this.setTool('move');
+    this.syncRulerToolbar();
     this.redraw();
     this.bindViewportResize();
     // Constructor often runs before flex layout assigns svg size; redraw once laid out.
@@ -652,6 +1012,10 @@ export class PatternEditor {
         this.syncKnifeToolbar();
         this.redraw();
       }
+      this.setRulerSelection(null);
+      this.setSelectedBlock(null);
+      this.hideRulerMenu();
+      this.hideBlockMenu();
       this.hideContextMenu();
       return;
     }
@@ -689,6 +1053,16 @@ export class PatternEditor {
 
   setPattern(pattern: PatternDocument): void {
     this.pattern = pattern;
+    // Block outlines are a cache of their variables, so rebuild them before
+    // anything measures or draws: a document written by an older build, or one
+    // whose variables were clamped on the way in, must not keep displaying the
+    // shape it was saved with.
+    normalizePattern(pattern, (id) => this.measurementSet(id));
+    this.selectedRulerId = null;
+    this.hoverRulerId = null;
+    this.selectedBlockId = null;
+    this.syncRulerBar();
+    this.syncBlockBar();
     this.selectedPieceId = pattern.pieces[0]?.id ?? null;
     this.clearSelection();
     this.fitView();
@@ -699,6 +1073,15 @@ export class PatternEditor {
   reloadAvatarOverlay(): void {
     if (!this.avatarOverlayOn) return;
     void this.refreshAvatarOverlayPath();
+  }
+
+  /**
+   * Called when the body-measurement library changes: rulers read their person
+   * and measurement live, so their lengths and labels need a repaint.
+   */
+  reloadRulers(): void {
+    this.syncRulerBar();
+    this.redraw();
   }
 
   getPattern(): PatternDocument {
@@ -718,6 +1101,19 @@ export class PatternEditor {
       this.clearKnifeDraft();
       this.hideKnifeFlyout();
     }
+    if (tool !== 'ruler') {
+      this.hideRulerMenu();
+      // A measurement armed for the ruler tool is meaningless elsewhere.
+      this.rulerArmed = null;
+      this.syncRulerToolbar();
+    }
+    // Rulers are only interactive under the ruler and move tools; drop the
+    // inspector rather than leaving an invisible selection behind.
+    if (tool !== 'ruler' && tool !== 'move') {
+      this.selectedRulerId = null;
+      this.hoverRulerId = null;
+      this.syncRulerBar();
+    }
     this.syncKnifeToolbar();
     this.syncSewToolbar();
     for (const btn of Array.from(this.toolbar.querySelectorAll('button[data-tool]'))) {
@@ -729,7 +1125,8 @@ export class PatternEditor {
       tool === 'sew' ||
       tool === 'rect' ||
       tool === 'circle' ||
-      tool === 'knife'
+      tool === 'knife' ||
+      tool === 'ruler'
         ? 'crosshair'
         : tool === 'bend'
           ? 'pointer'
@@ -1229,6 +1626,17 @@ export class PatternEditor {
     this.avatarSvg.appendChild(g);
   }
 
+  /**
+   * Minor/major reference grid — see `buildGridGroup` for the letterbox overscan
+   * and the zoom-out ladder.
+   */
+  private drawGrid(): SVGGElement {
+    return buildGridGroup(this.viewBox, this.unit, {
+      width: this.svg.clientWidth,
+      height: this.svg.clientHeight,
+    });
+  }
+
   private redraw(): void {
     const { x, y, w, h } = this.viewBox;
     this.svg.setAttribute('viewBox', `${x} ${y} ${w} ${h}`);
@@ -1240,37 +1648,32 @@ export class PatternEditor {
       this.lastChromeLayout = { w: layoutW, h: layoutH };
     }
 
-    const grid = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-    grid.setAttribute('class', 'pattern-grid');
-    const step = this.unit === 'in' ? 2.54 : 5;
-    const x0 = Math.floor(x / step) * step;
-    const y0 = Math.floor(y / step) * step;
-    const gridSw = this.px(1);
-    for (let gx = x0; gx < x + w; gx += step) {
-      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-      line.setAttribute('x1', String(gx));
-      line.setAttribute('y1', String(y));
-      line.setAttribute('x2', String(gx));
-      line.setAttribute('y2', String(y + h));
-      line.setAttribute('stroke-width', String(gridSw));
-      grid.appendChild(line);
-    }
-    for (let gy = y0; gy < y + h; gy += step) {
-      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-      line.setAttribute('x1', String(x));
-      line.setAttribute('y1', String(gy));
-      line.setAttribute('x2', String(x + w));
-      line.setAttribute('y2', String(gy));
-      line.setAttribute('stroke-width', String(gridSw));
-      grid.appendChild(line);
-    }
+    const grid = this.drawGrid();
     this.svg.appendChild(grid);
+
+    // Ownership has to be known before anything is drawn, and the group boxes go
+    // down first so a piece stroke can never be painted over by one.
+    this.blockOwnership = new Map();
+    for (const instance of this.blocks()) {
+      for (const entry of instance.pieces) this.blockOwnership.set(entry.pieceId, instance);
+      this.drawBlockOutline(instance);
+    }
 
     for (const piece of this.pattern.pieces) {
       this.drawPiece(piece);
     }
 
+    // Above the pieces, below the seams and everything you can grab: the
+    // highlight is an answer to "what does this number move?", not a handle.
+    this.drawBlockHighlight();
+
     this.drawSeams();
+
+    // Rulers are laid *over* the work like a real ruler on the table, so the
+    // line you are measuring against is always visible and grabbable. The
+    // readings come back separately so a later ruler's graduations can never
+    // cover an earlier ruler's numbers.
+    for (const reading of this.drawRulers()) this.svg.appendChild(reading);
 
     if (this.tool === 'move') {
       this.drawSelectionChrome();
@@ -1299,6 +1702,8 @@ export class PatternEditor {
     }
 
     this.updatePointBar();
+    this.updateRulerReadout();
+    this.updateBlockReadouts();
   }
 
   private selectedPoint(): BezierPoint | null {
@@ -1321,10 +1726,10 @@ export class PatternEditor {
   private updatePointBar(): void {
     const pt = this.selectedPoint();
     if (!pt) {
-      this.pointBar.classList.remove('visible');
+      this.pointBar.hidden = true;
       return;
     }
-    this.pointBar.classList.add('visible');
+    this.pointBar.hidden = false;
     const corner = this.isCornerPoint(pt);
     this.cornerCheck.checked = corner;
     this.parallelCheck.checked = !!pt.handlesParallel;
@@ -2020,30 +2425,70 @@ export class PatternEditor {
 
   private drawPiece(piece: PatternPiece): void {
     const n = piece.points.length;
+    // Generated geometry reads as one family: lavender lines and points say
+    // "this is drafted from variables" at a glance, and marks the pieces that
+    // will be rebuilt the moment a variable moves.
+    const block = this.blockOwnership.get(piece.id);
+    const blockCls = block ? ' is-block' : '';
     if (n > 0) {
       const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
       path.setAttribute('d', this.piecePathD(piece));
-      path.setAttribute('class', 'pattern-fill');
+      path.setAttribute('class', `pattern-fill${blockCls}`);
       path.setAttribute('stroke-width', String(this.px(2)));
       path.dataset.pieceId = piece.id;
       this.svg.appendChild(path);
     }
 
+    // Drafted blocks are full of short edges — dart legs, the waistband notch,
+    // ease offsets. Labelling every one of them piles unreadable text over the
+    // outline, so lengths are placed greedily: an edge earns a label only when
+    // the text fits along it *and* the resulting box is clear of every label
+    // already placed. Longest edges are considered first, because those are the
+    // ones you actually measure; short ones fill the gaps if there is room.
     const lengths = segmentLengths(piece.points, piece.closed);
     const edgeCount = piece.closed ? n : Math.max(0, n - 1);
-    const fontSize = this.px(11);
+    const labelPx = 11;
+    const fontSize = this.px(labelPx);
+    const scale = this.viewScale();
+    type Candidate = { index: number; text: string; x: number; y: number; w: number; h: number };
+    const candidates: Candidate[] = [];
     for (let i = 0; i < edgeCount; i++) {
+      const text = formatLength(lengths[i], this.unit, 1);
+      const w = text.length * labelPx * 0.62;
+      if (lengths[i] * scale < w + 8) continue;
       const a = piece.points[i].anchor;
       const b = piece.points[(i + 1) % n].anchor;
-      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      candidates.push({
+        index: i,
+        text,
+        x: (a.x + b.x) / 2,
+        y: (a.y + b.y) / 2 - this.px(10),
+        w,
+        h: labelPx * 1.1,
+      });
+    }
+    candidates.sort((a, b) => lengths[b.index] - lengths[a.index]);
+    const placed: Array<{ index: number; text: string; x: number; y: number }> = [];
+    const boxes: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
+    for (const c of candidates) {
+      const box = { x0: c.x - c.w / 2, y0: c.y - c.h / 2, x1: c.x + c.w / 2, y1: c.y + c.h / 2 };
+      const clash = boxes.some(
+        (b) => box.x0 < b.x1 && box.x1 > b.x0 && box.y0 < b.y1 && box.y1 > b.y0
+      );
+      if (clash) continue;
+      boxes.push(box);
+      placed.push({ index: c.index, text: c.text, x: c.x, y: c.y });
+    }
+    placed.sort((a, b) => a.index - b.index);
+    for (const p of placed) {
       const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-      label.setAttribute('x', String(mid.x));
-      label.setAttribute('y', String(mid.y - this.px(10)));
+      label.setAttribute('x', String(p.x));
+      label.setAttribute('y', String(p.y));
       label.setAttribute('class', 'pattern-length');
       label.setAttribute('font-size', String(fontSize));
       label.setAttribute('pointer-events', 'none');
       label.style.userSelect = 'none';
-      label.textContent = formatLength(lengths[i], this.unit, 1);
+      label.textContent = p.text;
       this.svg.appendChild(label);
     }
 
@@ -2053,7 +2498,11 @@ export class PatternEditor {
       g.setAttribute('y1', String(piece.grainline.from.y));
       g.setAttribute('x2', String(piece.grainline.to.x));
       g.setAttribute('y2', String(piece.grainline.to.y));
-      g.setAttribute('class', 'pattern-grain');
+      g.setAttribute('class', `pattern-grain${blockCls}`);
+      // Every mark belonging to a piece has to advertise it: the editor resolves
+      // "which piece was clicked" from the event target, so artwork without the
+      // id swallows the gesture and the piece looks dead under the cursor.
+      g.dataset.pieceId = piece.id;
       g.setAttribute('stroke-width', String(this.px(2)));
       g.setAttribute('stroke-dasharray', `${this.px(6)} ${this.px(4)}`);
       this.svg.appendChild(g);
@@ -2077,7 +2526,7 @@ export class PatternEditor {
       c.setAttribute('stroke-width', String(pointSw));
       c.setAttribute(
         'class',
-        this.selectedIds.has(pt.id) ? 'pattern-point selected' : 'pattern-point'
+        `${this.selectedIds.has(pt.id) ? 'pattern-point selected' : 'pattern-point'}${blockCls}`
       );
       c.dataset.pointId = pt.id;
       c.dataset.pieceId = piece.id;
@@ -2377,6 +2826,15 @@ export class PatternEditor {
     }
 
     const p = this.svgPointFromClient(e.clientX, e.clientY);
+    const rulerHit = this.findRulerHit(p);
+    if (rulerHit) {
+      e.stopPropagation();
+      this.setRulerSelection(rulerHit.id);
+      this.showContextMenu(e.clientX, e.clientY, 'ruler');
+      this.redraw();
+      return;
+    }
+
     const seamHit = this.findSeamNearClick(p);
     if (seamHit) {
       e.stopPropagation();
@@ -2402,13 +2860,22 @@ export class PatternEditor {
     this.redraw();
   }
 
-  private showContextMenu(clientX: number, clientY: number, mode: 'piece' | 'seam' = 'piece'): void {
+  private showContextMenu(
+    clientX: number,
+    clientY: number,
+    mode: 'piece' | 'seam' | 'ruler' = 'piece'
+  ): void {
     const pieceActs = ['duplicate', 'mirror-x', 'mirror-y', 'delete-piece'];
     const seamActs = ['reverse-seam', 'remove-seam'];
+    const rulerActs = ['ruler-toggle-half', 'ruler-delete'];
     for (const btn of Array.from(this.contextMenu.querySelectorAll('button[data-act]'))) {
       const act = (btn as HTMLElement).dataset.act!;
       const show =
-        mode === 'piece' ? pieceActs.includes(act) : seamActs.includes(act);
+        mode === 'piece'
+          ? pieceActs.includes(act)
+          : mode === 'ruler'
+            ? rulerActs.includes(act)
+            : seamActs.includes(act);
       (btn as HTMLButtonElement).hidden = !show;
     }
 
@@ -2429,6 +2896,1387 @@ export class PatternEditor {
     this.contextMenu.hidden = true;
     this.contextPieceId = null;
     this.contextSeamId = null;
+  }
+
+  /**
+   * A floating ribbon is a UI island: gestures on it must never reach the canvas
+   * underneath.
+   *
+   * The pointer guard stops a click on a ribbon from being read as a canvas
+   * gesture. The wheel guard matters just as much — the viewport zooms on wheel
+   * (see the constructor), so without it, Alt+scrolling an offset field would
+   * nudge the value *and* zoom the pattern behind it.
+   */
+  private sealOverlay(el: HTMLElement): void {
+    el.addEventListener('pointerdown', (e) => e.stopPropagation());
+    el.addEventListener('wheel', (e) => e.stopPropagation(), { passive: true });
+  }
+
+  // ── Rulers ───────────────────────────────────────────────────────────────
+  //
+  // A ruler is a physical reference line pinned over the pattern. It measures a
+  // *person*: the length tracks a body measurement, so you can eyeball "this
+  // panel is a half-bust wide" without re-reading the measurement chart.
+  // Rulers are document data (`pattern.rulers`) so they round-trip with the
+  // project, and they never touch geometry — hence `onRulerChange`, not
+  // `onChange`, which would invalidate the mesh.
+
+  private rulers(): PatternRuler[] {
+    return this.pattern.rulers ?? [];
+  }
+
+  private ensureRulers(): PatternRuler[] {
+    if (!this.pattern.rulers) this.pattern.rulers = [];
+    return this.pattern.rulers;
+  }
+
+  private selectedRuler(): PatternRuler | null {
+    if (!this.selectedRulerId) return null;
+    return this.rulers().find((r) => r.id === this.selectedRulerId) ?? null;
+  }
+
+  /** The person a ruler points at; `null` asks for the active person. */
+  private measurementSet(personId: string | null): MeasurementSet | null {
+    const lib = this.cbs.getMeasurementLibrary?.() ?? null;
+    if (!lib || lib.sets.length === 0) return null;
+    if (!personId) {
+      return lib.sets.find((s) => s.id === lib.activeId) ?? lib.sets[0] ?? null;
+    }
+    return lib.sets.find((s) => s.id === personId) ?? null;
+  }
+
+  private activeSet(): MeasurementSet | null {
+    return this.measurementSet(null);
+  }
+
+  /**
+   * Drawn length: a live measurement value when the person still has one, else
+   * the number snapshotted on the ruler.
+   */
+  private rulerDrawnLength(ruler: PatternRuler): number {
+    const live = measurementValueCm(this.measurementSet(ruler.personId), ruler.measurementId);
+    const full = live ?? (Number.isFinite(ruler.lengthCm) ? Math.max(0, ruler.lengthCm) : 0);
+    return ruler.half ? full / 2 : full;
+  }
+
+  private notifyRulerChange(): void {
+    if (this.cbs.onRulerChange) this.cbs.onRulerChange();
+    else this.cbs.onChange();
+  }
+
+  // ── Hold-to-open measurement picker ──────────────────────────────────────
+  //
+  // Holding the ruler button drops a tree of everybody in the measurement
+  // library and their measurements, with a search box that matches a person and
+  // a measurement together ("alex waist"). Picking one either rebinds the
+  // selected ruler or arms the tool for the next one you drag out.
+
+  private bindRulerMenu(): void {
+    const HOLD_MS = 380;
+    this.rulerBtn.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.hideToolbarTip();
+      this.rulerMenuHoldOpened = false;
+      this.rulerMenuHoldTimer = setTimeout(() => {
+        this.rulerMenuHoldTimer = null;
+        this.rulerMenuHoldOpened = true;
+        this.showRulerMenu();
+      }, HOLD_MS);
+      const onUp = (ev: PointerEvent) => {
+        window.removeEventListener('pointerup', onUp, true);
+        window.removeEventListener('pointercancel', onUp, true);
+        if (this.rulerMenuHoldTimer) {
+          clearTimeout(this.rulerMenuHoldTimer);
+          this.rulerMenuHoldTimer = null;
+        }
+        if (this.rulerMenuHoldOpened) return;
+        // Quick click → plain ruler tool.
+        if (ev.target && this.rulerBtn.contains(ev.target as Node)) this.setTool('ruler');
+      };
+      window.addEventListener('pointerup', onUp, true);
+      window.addEventListener('pointercancel', onUp, true);
+    });
+  }
+
+  private showRulerMenu(): void {
+    this.rulerMenu.hidden = false;
+    this.rulerBtn.setAttribute('aria-expanded', 'true');
+    this.renderRulerMenu();
+    if (!this.rulerMenuDocPointerDown) {
+      this.rulerMenuDocPointerDown = (e: PointerEvent) => {
+        const t = e.target as Node;
+        if (this.rulerMenu.contains(t) || this.rulerBtn.contains(t)) return;
+        this.hideRulerMenu();
+      };
+      document.addEventListener('pointerdown', this.rulerMenuDocPointerDown, true);
+    }
+    // Focus so you can type straight away; selecting means a new query replaces
+    // the old one instead of appending to it.
+    this.rulerSearchInput.focus();
+    this.rulerSearchInput.select();
+  }
+
+  private hideRulerMenu(): void {
+    this.rulerMenu.hidden = true;
+    this.rulerBtn.setAttribute('aria-expanded', 'false');
+    if (this.rulerMenuDocPointerDown) {
+      document.removeEventListener('pointerdown', this.rulerMenuDocPointerDown, true);
+      this.rulerMenuDocPointerDown = null;
+    }
+  }
+
+  /** Wrap every literal occurrence of the query tokens in `<mark>`. */
+  private highlightText(text: string, tokens: string[]): DocumentFragment {
+    const frag = document.createDocumentFragment();
+    if (tokens.length === 0) {
+      frag.appendChild(document.createTextNode(text));
+      return frag;
+    }
+    const lower = text.toLowerCase();
+    const hits: Array<[number, number]> = [];
+    for (const token of tokens) {
+      let from = 0;
+      for (;;) {
+        const at = lower.indexOf(token, from);
+        if (at < 0) break;
+        hits.push([at, at + token.length]);
+        from = at + token.length;
+      }
+    }
+    if (hits.length === 0) {
+      // Fuzzy (subsequence) match — nothing literal to underline.
+      frag.appendChild(document.createTextNode(text));
+      return frag;
+    }
+    hits.sort((a, b) => a[0] - b[0]);
+    const merged: Array<[number, number]> = [];
+    for (const hit of hits) {
+      const last = merged[merged.length - 1];
+      if (last && hit[0] <= last[1]) last[1] = Math.max(last[1], hit[1]);
+      else merged.push([hit[0], hit[1]]);
+    }
+    let cursor = 0;
+    for (const [from, to] of merged) {
+      if (from > cursor) frag.appendChild(document.createTextNode(text.slice(cursor, from)));
+      const mark = document.createElement('mark');
+      mark.textContent = text.slice(from, to);
+      frag.appendChild(mark);
+      cursor = to;
+    }
+    if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
+    return frag;
+  }
+
+  private renderRulerMenu(): void {
+    const query = this.rulerSearchInput.value;
+    const sets = this.cbs.getMeasurementLibrary?.()?.sets ?? [];
+    const tokens = measurementSearchTokens(query);
+    const sections = filterMeasurementMenu(buildMeasurementMenu(sets), query);
+    this.rulerTree.innerHTML = '';
+
+    const hint = (text: string): void => {
+      const el = document.createElement('div');
+      el.className = 'pattern-ruler-menu-empty';
+      el.textContent = text;
+      this.rulerTree.appendChild(el);
+    };
+
+    if (sets.length === 0) {
+      hint('No people yet — add one from Measurements in the toolbar.');
+      return;
+    }
+
+    // The escape hatch back to a plain, free-length ruler.
+    if (tokens.length === 0) {
+      const free = document.createElement('button');
+      free.type = 'button';
+      free.className = 'pattern-ruler-item is-free';
+      free.dataset.personId = '';
+      free.dataset.measureId = '';
+      const label = document.createElement('span');
+      label.className = 'pattern-ruler-item-label';
+      label.textContent = 'No measurement';
+      const value = document.createElement('span');
+      value.className = 'pattern-ruler-item-value';
+      value.textContent = 'free length';
+      free.append(label, value);
+      this.rulerTree.appendChild(free);
+      const rule = document.createElement('div');
+      rule.className = 'pattern-ruler-menu-divider';
+      this.rulerTree.appendChild(rule);
+    }
+
+    if (sections.length === 0) {
+      hint(`Nothing matches “${query.trim()}”.`);
+      return;
+    }
+
+    for (const section of sections) {
+      const head = document.createElement('div');
+      head.className = 'pattern-ruler-person';
+      head.appendChild(this.highlightText(section.personName, tokens));
+      const unit = document.createElement('span');
+      unit.className = 'pattern-ruler-person-unit';
+      unit.textContent = section.unit;
+      head.appendChild(unit);
+      this.rulerTree.appendChild(head);
+
+      for (const row of section.rows) {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'pattern-ruler-item';
+        item.dataset.personId = section.personId;
+        item.dataset.measureId = row.fieldId;
+        item.dataset.measureLabel = row.label;
+        // An unmeasured field has no length to draw, so it stays visible (you
+        // can see the gap in someone's chart) but not selectable.
+        item.disabled = row.valueCm == null;
+
+        const label = document.createElement('span');
+        label.className = 'pattern-ruler-item-label';
+        label.appendChild(this.highlightText(row.label, tokens));
+
+        const value = document.createElement('span');
+        value.className = 'pattern-ruler-item-value';
+        value.textContent = row.valueCm == null ? 'not set' : formatLength(row.valueCm, this.unit, 1);
+
+        item.append(label, value);
+        this.rulerTree.appendChild(item);
+      }
+    }
+  }
+
+  /** Apply a picked measurement to the selected ruler, or arm the tool with it. */
+  private chooseRulerMeasurement(personId: string, fieldId: string): void {
+    this.hideRulerMenu();
+    this.setTool('ruler');
+
+    const ruler = this.selectedRuler();
+    if (!personId || !fieldId) {
+      this.rulerArmed = null;
+      if (ruler) {
+        this.markBeforeChange();
+        ruler.measurementId = null;
+        ruler.personId = null;
+        ruler.personName = '';
+        this.notifyRulerChange();
+        this.endHistoryGesture();
+        this.syncRulerBar();
+      } else {
+        this.syncRulerToolbar();
+      }
+      this.redraw();
+      return;
+    }
+
+    const set = this.measurementSet(personId);
+    const value = measurementValueCm(set, fieldId);
+    if (!set || value == null) return;
+
+    if (ruler) {
+      this.markBeforeChange();
+      ruler.personId = set.id;
+      ruler.personName = set.name;
+      ruler.measurementId = fieldId;
+      ruler.lengthCm = value;
+      this.notifyRulerChange();
+      this.endHistoryGesture();
+      this.syncRulerBar();
+    } else {
+      this.rulerArmed = {
+        personId: set.id,
+        personName: set.name,
+        fieldId,
+        lengthCm: value,
+      };
+      this.syncRulerToolbar();
+    }
+    this.redraw();
+  }
+
+  /** Tooltip + armed marker on the ruler button. */
+  private syncRulerToolbar(): void {
+    const armed = this.rulerArmed;
+    const field = armed ? measurementField(armed.fieldId) : null;
+    const tip = armed
+      ? `Ruler · ${armed.personName} ${field?.label ?? armed.fieldId} — drag to place`
+      : 'Ruler · hold for measurements';
+    this.rulerBtn.dataset.tip = tip;
+    this.rulerBtn.setAttribute('aria-label', tip);
+    this.rulerBtn.classList.toggle('is-armed', !!armed);
+  }
+
+  private setRulerSelection(id: string | null): void {
+    if (this.selectedRulerId === id) return;
+    this.selectedRulerId = id;
+    this.syncRulerBar();
+  }
+
+  private findRulerHit(p: Vec2): RulerHit | null {
+    const list = this.rulers();
+    const grab = this.px(10);
+    const along = this.px(7);
+    // Reverse order so the most recently added ruler wins, matching paint order.
+    for (let i = list.length - 1; i >= 0; i--) {
+      const ruler = list[i]!;
+      const { a, b } = rulerEndpoints(ruler, this.rulerDrawnLength(ruler));
+      if (dist(p, a) <= grab) return { id: ruler.id, part: 'a' };
+      if (dist(p, b) <= grab) return { id: ruler.id, part: 'b' };
+      if (distanceToSegment(p, a, b) <= along) return { id: ruler.id, part: 'body' };
+    }
+    return null;
+  }
+
+  private onRulerDown(e: PointerEvent, p: Vec2, preset?: RulerHit | null): void {
+    const hit = preset ?? this.findRulerHit(p);
+    if (!hit) {
+      // Empty canvas → draw a new ruler.
+      this.setRulerSelection(null);
+      this.clearSelection();
+      this.drag = { type: 'rulerCreate', start: p, current: p, snap: e.shiftKey };
+      this.svg.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      this.redraw();
+      return;
+    }
+    const ruler = this.rulers().find((r) => r.id === hit.id);
+    if (!ruler) return;
+    this.setRulerSelection(ruler.id);
+    // A point selection gives way to the ruler — they share the same handles.
+    this.clearSelection();
+    this.markBeforeChange();
+    this.drag =
+      hit.part === 'body'
+        ? { type: 'rulerMove', id: ruler.id, start: p, origin: { ...ruler.center } }
+        : { type: 'rulerTurn', id: ruler.id, which: hit.part };
+    this.svg.setPointerCapture(e.pointerId);
+    e.preventDefault();
+    this.redraw();
+  }
+
+  /** Turn a finished create-drag into a ruler, snapping to a real measurement. */
+  private commitRulerCreate(drag: Extract<DragKind, { type: 'rulerCreate' }>): void {
+    const dx = drag.current.x - drag.start.x;
+    const dy = drag.current.y - drag.start.y;
+    const length = Math.hypot(dx, dy);
+    if (!(length > 1)) return;
+
+    const deg = rulerAngle(drag.start, drag.current, drag.snap);
+    const th = (deg * Math.PI) / 180;
+    const set = this.activeSet();
+    // A measurement picked from the hold-open menu wins over auto-matching, so
+    // you can lay out several rulers of the same body dimension in a row.
+    const armed = this.rulerArmed;
+    const fieldId = armed ? armed.fieldId : nearestMeasurementField(set, length);
+    const live = armed ? armed.lengthCm : measurementValueCm(set, fieldId);
+
+    const ruler: PatternRuler = {
+      id: uid('ruler'),
+      center: {
+        x: drag.start.x + (Math.cos(th) * length) / 2,
+        y: drag.start.y + (Math.sin(th) * length) / 2,
+      },
+      angle: deg,
+      // A near-enough measurement snaps the line to its exact value.
+      lengthCm: live ?? length,
+      measurementId: fieldId,
+      personId: armed ? armed.personId : (set?.id ?? null),
+      personName: armed ? armed.personName : (set?.name ?? ''),
+      half: false,
+    };
+    this.markBeforeChange();
+    this.ensureRulers().push(ruler);
+    this.selectedRulerId = ruler.id;
+    this.syncRulerBar();
+    this.notifyRulerChange();
+    this.endHistoryGesture();
+  }
+
+  private setSelectedRulerHalf(half: boolean): void {
+    const ruler = this.selectedRuler();
+    if (!ruler || ruler.half === half) return;
+    this.markBeforeChange();
+    ruler.half = half;
+    this.notifyRulerChange();
+    this.endHistoryGesture();
+    this.syncRulerBar();
+    this.redraw();
+  }
+
+  private onRulerPersonChange(setId: string): void {
+    const ruler = this.selectedRuler();
+    const set = this.measurementSet(setId);
+    if (!ruler || !set) return;
+    this.markBeforeChange();
+    ruler.personId = set.id;
+    ruler.personName = set.name;
+    // Keep the stored fallback truthful for the new person.
+    const live = measurementValueCm(set, ruler.measurementId);
+    if (live != null) ruler.lengthCm = live;
+    this.notifyRulerChange();
+    this.endHistoryGesture();
+    this.syncRulerBar();
+    this.redraw();
+  }
+
+  private onRulerMeasurementChange(fieldId: string): void {
+    const ruler = this.selectedRuler();
+    if (!ruler) return;
+    this.markBeforeChange();
+    ruler.measurementId = fieldId || null;
+    const live = measurementValueCm(this.measurementSet(ruler.personId), ruler.measurementId);
+    if (live != null) ruler.lengthCm = live;
+    // Binding a person is the point of the tool — do it when one is available.
+    if (ruler.measurementId && !ruler.personId) {
+      const set = this.activeSet();
+      if (set) {
+        ruler.personId = set.id;
+        ruler.personName = set.name;
+      }
+    }
+    this.notifyRulerChange();
+    this.endHistoryGesture();
+    this.syncRulerBar();
+    this.redraw();
+  }
+
+  private deleteSelectedRuler(): void {
+    const ruler = this.selectedRuler();
+    if (!ruler) return;
+    this.markBeforeChange();
+    this.pattern.rulers = this.rulers().filter((r) => r.id !== ruler.id);
+    this.selectedRulerId = null;
+    this.hoverRulerId = null;
+    this.notifyRulerChange();
+    this.endHistoryGesture();
+    this.syncRulerBar();
+    this.redraw();
+  }
+
+  private fillOptions(
+    select: HTMLSelectElement,
+    entries: Array<{ value: string; label: string }>,
+    selected: string
+  ): void {
+    select.innerHTML = '';
+    for (const entry of entries) {
+      const opt = document.createElement('option');
+      opt.value = entry.value;
+      opt.textContent = entry.label;
+      select.appendChild(opt);
+    }
+    select.value = entries.some((e) => e.value === selected) ? selected : (entries[0]?.value ?? '');
+  }
+
+  /** Full rebuild — visibility, selects and readout. Not called per frame. */
+  private syncRulerBar(): void {
+    const ruler = this.selectedRuler();
+    if (!ruler) {
+      this.rulerBar.hidden = true;
+      return;
+    }
+    this.rulerBar.hidden = false;
+
+    const sets = this.cbs.getMeasurementLibrary?.()?.sets ?? [];
+    this.fillOptions(
+      this.rulerPersonSelect,
+      sets.length > 0
+        ? sets.map((s) => ({ value: s.id, label: s.name }))
+        : [{ value: '', label: 'No people yet' }],
+      ruler.personId ?? sets[0]?.id ?? ''
+    );
+
+    const set = this.measurementSet(ruler.personId) ?? sets[0] ?? null;
+    const entries: Array<{ value: string; label: string }> = [
+      { value: '', label: '— free length —' },
+    ];
+    if (set) {
+      for (const field of MEASUREMENT_FIELDS) {
+        const value = measurementValueCm(set, field.id);
+        if (value == null) continue;
+        entries.push({
+          value: field.id,
+          label: `${field.label} · ${formatLength(value, this.unit, 1)}`,
+        });
+      }
+      // Never silently drop a reference the ruler already points at.
+      if (ruler.measurementId && !entries.some((e) => e.value === ruler.measurementId)) {
+        const field = measurementField(ruler.measurementId);
+        entries.push({
+          value: ruler.measurementId,
+          label: `${field?.label ?? ruler.measurementId} · not measured`,
+        });
+      }
+    }
+    this.fillOptions(this.rulerMeasureSelect, entries, ruler.measurementId ?? '');
+    this.updateRulerReadout();
+  }
+
+  /** Cheap per-frame refresh: the numbers change while a free ruler is sized. */
+  private updateRulerReadout(): void {
+    const ruler = this.selectedRuler();
+    if (!ruler) return;
+    for (const btn of this.rulerScaleBtns) {
+      btn.classList.toggle('is-active', (btn.dataset.rulerHalf === '1') === ruler.half);
+    }
+    const length = this.rulerDrawnLength(ruler);
+    const field = measurementField(ruler.measurementId);
+    const parts = [formatLength(length, this.unit, 1)];
+    if (ruler.half) parts.push('half width');
+    if (!field) parts.push('free');
+    this.rulerReadout.textContent = parts.join(' · ');
+  }
+
+  // ── Blocks ───────────────────────────────────────────────────────────────
+  //
+  // A block instance is a parametric component: it owns a set of generated
+  // pieces and rebuilds them whenever one of its variables changes. Its pieces
+  // are ordinary `PatternPiece`s, so nothing downstream needs to know blocks
+  // exist — the only special case is that their points are read-only until you
+  // Detach, because regeneration would otherwise silently discard your edits.
+
+  private blocks(): BlockInstance[] {
+    return this.pattern.blocks ?? [];
+  }
+
+  private blockDefinition(instance: BlockInstance): BlockDefinition | null {
+    return getBlockDefinition(instance.definitionId);
+  }
+
+  /** The block that owns a piece, if any. */
+  private blockForPiece(pieceId: string | undefined): BlockInstance | null {
+    if (!pieceId) return null;
+    return (
+      this.blocks().find((instance) => instance.pieces.some((e) => e.pieceId === pieceId)) ?? null
+    );
+  }
+
+  /**
+   * A faint dotted box around every piece a block drafts.
+   *
+   * A component that produces several panels — back, front, waistband — is one
+   * object on the canvas, and without a container you cannot tell at a glance
+   * whether the panels sitting next to each other are parts of one block or
+   * separate pieces you drew. A single-piece block gets no box: a rectangle
+   * around one outline is just a second outline.
+   */
+  private drawBlockOutline(instance: BlockInstance): void {
+    if (instance.pieces.length < 2) return;
+    const owned = new Set(instance.pieces.map((entry) => entry.pieceId));
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const piece of this.pattern.pieces) {
+      if (!owned.has(piece.id)) continue;
+      for (const pt of piece.points) {
+        minX = Math.min(minX, pt.anchor.x);
+        minY = Math.min(minY, pt.anchor.y);
+        maxX = Math.max(maxX, pt.anchor.x);
+        maxY = Math.max(maxY, pt.anchor.y);
+      }
+    }
+    if (!Number.isFinite(minX)) return;
+
+    // Stand the box off in pattern units so it hugs the draft at any zoom
+    // instead of touching a seam allowance.
+    const pad = 1.5;
+    const rect = svgEl('rect');
+    rect.setAttribute('x', String(minX - pad));
+    rect.setAttribute('y', String(minY - pad));
+    rect.setAttribute('width', String(maxX - minX + pad * 2));
+    rect.setAttribute('height', String(maxY - minY + pad * 2));
+    rect.setAttribute('class', `pattern-block-outline${instance.id === this.selectedBlockId ? ' is-selected' : ''}`);
+    rect.setAttribute('rx', String(this.px(8)));
+    rect.setAttribute('stroke-width', String(this.px(1.4)));
+    rect.setAttribute('stroke-dasharray', `${this.px(3)} ${this.px(6)}`);
+    this.svg.appendChild(rect);
+  }
+
+  private selectedBlock(): BlockInstance | null {
+    if (!this.selectedBlockId) return null;
+    return this.blocks().find((instance) => instance.id === this.selectedBlockId) ?? null;
+  }
+
+  private setSelectedBlock(id: string | null): void {
+    if (this.selectedBlockId === id) return;
+    this.selectedBlockId = id;
+    if (id) {
+      this.setRulerSelection(null);
+      this.clearSelection();
+    }
+    this.syncBlockBar();
+  }
+
+  // — Placement —
+
+  private bindBlockMenu(): void {
+    this.blockBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.hideToolbarTip();
+      if (this.blockMenu.hidden) this.showBlockMenu();
+      else this.hideBlockMenu();
+    });
+  }
+
+  private showBlockMenu(): void {
+    this.renderBlockMenu();
+    this.blockMenu.hidden = false;
+    this.blockBtn.setAttribute('aria-expanded', 'true');
+    if (!this.blockMenuDocPointerDown) {
+      this.blockMenuDocPointerDown = (e: PointerEvent) => {
+        const t = e.target as Node;
+        if (this.blockMenu.contains(t) || this.blockBtn.contains(t)) return;
+        this.hideBlockMenu();
+      };
+      document.addEventListener('pointerdown', this.blockMenuDocPointerDown, true);
+    }
+  }
+
+  private hideBlockMenu(): void {
+    this.blockMenu.hidden = true;
+    this.blockBtn.setAttribute('aria-expanded', 'false');
+    if (this.blockMenuDocPointerDown) {
+      document.removeEventListener('pointerdown', this.blockMenuDocPointerDown, true);
+      this.blockMenuDocPointerDown = null;
+    }
+  }
+
+  private renderBlockMenu(): void {
+    const menu = this.blockMenu;
+    menu.innerHTML = '';
+    if (BLOCK_DEFINITIONS.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'pattern-block-menu-empty';
+      empty.textContent = 'No blocks in the library yet.';
+      menu.appendChild(empty);
+      return;
+    }
+    const sets = this.cbs.getMeasurementLibrary?.()?.sets ?? [];
+    const person = this.activeSet();
+    void sets;
+    const hint = document.createElement('div');
+    hint.className = 'pattern-block-menu-hint';
+    hint.textContent = person
+      ? `Will be drafted for ${person.name}.`
+      : 'No measurements yet — blocks start from the book’s default figures.';
+    menu.appendChild(hint);
+
+    for (const definition of BLOCK_DEFINITIONS) {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.role = 'menuitem';
+      item.dataset.blockId = definition.id;
+      const name = document.createElement('span');
+      name.className = 'pattern-block-menu-name';
+      name.textContent = definition.name;
+      const desc = document.createElement('span');
+      desc.className = 'pattern-block-menu-desc';
+      desc.textContent = definition.description;
+      item.append(name, desc);
+      item.addEventListener('click', () => {
+        this.hideBlockMenu();
+        this.addBlock(definition.id);
+      });
+      menu.appendChild(item);
+    }
+  }
+
+  /** Drop a fresh block instance into this pattern. */
+  addBlock(definitionId: string): boolean {
+    const definition = getBlockDefinition(definitionId);
+    if (!definition) return false;
+    const set = this.activeSet();
+    const fallback = {
+      x: this.viewBox.x + this.viewBox.w * 0.25,
+      y: this.viewBox.y + this.viewBox.h * 0.25,
+    };
+    const origin = nextBlockOrigin(this.pattern.pieces, fallback);
+    const instance = createBlockInstance(
+      definition,
+      origin,
+      set?.id ?? null,
+      set?.name ?? '',
+      set
+    );
+    this.markBeforeChange();
+    if (!this.pattern.blocks) this.pattern.blocks = [];
+    this.pattern.blocks.push(instance);
+    const generated = generateBlockPieces(definition, instance, set);
+    const { pieces, ownership } = spliceBlockPieces(this.pattern.pieces, instance, generated);
+    this.pattern.pieces = pieces;
+    instance.pieces = ownership;
+    this.selectedBlockId = instance.id;
+    this.cbs.onChange();
+    this.endHistoryGesture();
+    this.syncBlockBar();
+    this.fitView();
+    this.redraw();
+    return true;
+  }
+
+  /**
+   * Light up the geometry the hovered variable controls.
+   *
+   * Drawn over the pieces, as a wide translucent stroke with rings on the
+   * points, so it reads as a lamp held against the outline rather than as yet
+   * another outline competing with the lavender block tint.
+   */
+  private drawBlockHighlight(): void {
+    const driven = this.hoverDriven;
+    if (!driven || driven.size === 0) return;
+    for (const piece of this.pattern.pieces) {
+      const n = piece.points.length;
+      if (n < 2) continue;
+      // An edge counts as driven when *either* end moves: change the hip depth
+      // and the centre line from the waist down is exactly what you moved.
+      const hit = piece.points.map((pt) => driven.has(pt.id));
+      if (!hit.some(Boolean)) continue;
+      for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n;
+        if (!hit[i] && !hit[j]) continue;
+        const a = piece.points[i]!;
+        const b = piece.points[j]!;
+        const { c0, c1 } = edgeHandles(a, b);
+        const path = svgEl('path');
+        path.setAttribute('class', 'pattern-block-driver');
+        path.setAttribute(
+          'd',
+          `M ${a.anchor.x} ${a.anchor.y} C ${c0.x} ${c0.y}, ${c1.x} ${c1.y}, ${b.anchor.x} ${b.anchor.y}`
+        );
+        path.setAttribute('stroke-width', String(this.px(9)));
+        this.svg.appendChild(path);
+      }
+      // Rings last, so no neighbouring edge can cover one.
+      for (const pt of piece.points) {
+        if (!driven.has(pt.id)) continue;
+        const ring = svgEl('circle');
+        ring.setAttribute('cx', String(pt.anchor.x));
+        ring.setAttribute('cy', String(pt.anchor.y));
+        ring.setAttribute('r', String(this.px(7)));
+        ring.setAttribute('class', 'pattern-block-driver-point');
+        ring.setAttribute('stroke-width', String(this.px(2)));
+        this.svg.appendChild(ring);
+      }
+    }
+  }
+
+  /** Hovered variable → the points it moves. Cheap enough to redo per row. */
+  private setHoveredVar(varId: string | null): void {
+    if (this.hoverVarId === varId) return;
+    this.hoverVarId = varId;
+    this.hoverDriven = null;
+    if (varId) {
+      const instance = this.selectedBlock();
+      const definition = instance ? this.blockDefinition(instance) : null;
+      if (instance && definition) {
+        this.hoverDriven = drivenPointIds(
+          definition,
+          instance,
+          this.measurementSet(instance.personId),
+          varId
+        );
+      }
+    }
+    this.redraw();
+  }
+
+  /**
+   * Rebuild a block's pieces from its current variables, in place.
+   *
+   * `structural` marks the edits that change the *shape of a row* — switching
+   * Value/Measure, a divisor, a different measurement, a different person. Those
+   * rebuild the inspector, which throws away the live input and closes the undo
+   * gesture immediately. Typing is not structural: the rows are left alone so
+   * the caret survives, and the gesture stays open so a whole typed entry
+   * collapses into one undo step.
+   */
+  private commitBlockChange(instance: BlockInstance, structural = true): void {
+    const definition = this.blockDefinition(instance);
+    if (!definition) return;
+    const generated = generateBlockPieces(
+      definition,
+      instance,
+      this.measurementSet(instance.personId)
+    );
+    const { pieces, ownership } = spliceBlockPieces(this.pattern.pieces, instance, generated);
+    this.pattern.pieces = pieces;
+    instance.pieces = ownership;
+    this.cbs.onChange();
+    if (structural) {
+      this.endHistoryGesture();
+      this.syncBlockVars();
+    }
+    this.redraw();
+  }
+
+  // — Variable editing —
+
+  private bindingFor(instance: BlockInstance, varId: string): BlockVariableBinding | undefined {
+    return instance.bindings[varId];
+  }
+
+  private setBlockVariableValue(varId: string, cm: number, structural = true): void {
+    const instance = this.selectedBlock();
+    const variable = this.blockVariable(instance, varId);
+    if (!instance || !variable) return;
+    // A typo should not be able to throw the draft off the table.
+    const clamped = clampToDeclared(variable, cm);
+    const existing = instance.bindings[varId];
+    if (existing?.mode === 'value' && existing.cm === clamped) return;
+    this.markBeforeChange();
+    instance.bindings[varId] = { mode: 'value', cm: clamped };
+    this.commitBlockChange(instance, structural);
+  }
+
+  private setBlockVariableMode(varId: string, mode: 'value' | 'measurement'): void {
+    const instance = this.selectedBlock();
+    const definition = instance ? this.blockDefinition(instance) : null;
+    if (!instance || !definition) return;
+    const variable = definition.variables.find((v) => v.id === varId);
+    if (!variable) return;
+    const current = this.bindingFor(instance, varId);
+    if (current?.mode === mode) return;
+    const set = this.measurementSet(instance.personId);
+    this.markBeforeChange();
+    if (mode === 'value') {
+      instance.bindings[varId] = {
+        mode: 'value',
+        cm: current ? bindingValueCm(current, set) : variable.defaultValueCm,
+      };
+    } else {
+      // Start from the declaration's suggestion, else the first measurement this
+      // person actually has, so the row is immediately meaningful.
+      const suggested = variable.suggested ?? {
+        fieldId: this.firstMeasuredField(set) ?? 'waist',
+        divisor: 1 as const,
+        offsetCm: 0,
+      };
+      const live = sourceValueCm(suggested, set);
+      instance.bindings[varId] = {
+        mode: 'measurement',
+        ...suggested,
+        fallbackCm: live ?? (current ? bindingValueCm(current, set) : variable.defaultValueCm),
+      };
+    }
+    this.commitBlockChange(instance);
+  }
+
+  private firstMeasuredField(set: MeasurementSet | null): string | null {
+    if (!set) return null;
+    return MEASUREMENT_FIELDS.find((f) => measurementValueCm(set, f.id) != null)?.id ?? null;
+  }
+
+  private setBlockVariableDivisor(varId: string, divisor: 1 | 2 | 4): void {
+    const instance = this.selectedBlock();
+    const binding = instance ? this.bindingFor(instance, varId) : null;
+    if (!instance || binding?.mode !== 'measurement' || binding.divisor === divisor) return;
+    this.markBeforeChange();
+    binding.divisor = divisor;
+    const live = sourceValueCm(binding, this.measurementSet(instance.personId));
+    if (live != null) binding.fallbackCm = live;
+    this.commitBlockChange(instance);
+  }
+
+  private setBlockVariableOffset(varId: string, offsetCm: number, structural = true): void {
+    const instance = this.selectedBlock();
+    const binding = instance ? this.bindingFor(instance, varId) : null;
+    if (!instance || binding?.mode !== 'measurement' || binding.offsetCm === offsetCm) return;
+    this.markBeforeChange();
+    binding.offsetCm = offsetCm;
+    const live = sourceValueCm(binding, this.measurementSet(instance.personId));
+    if (live != null) binding.fallbackCm = live;
+    this.commitBlockChange(instance, structural);
+  }
+
+  private setBlockVariableField(varId: string, fieldId: string): void {
+    const instance = this.selectedBlock();
+    const binding = instance ? this.bindingFor(instance, varId) : null;
+    if (!instance || binding?.mode !== 'measurement') return;
+    this.markBeforeChange();
+    binding.fieldId = fieldId;
+    const live = sourceValueCm(binding, this.measurementSet(instance.personId));
+    if (live != null) binding.fallbackCm = live;
+    this.commitBlockChange(instance);
+  }
+
+  private onBlockPersonChange(setId: string): void {
+    const instance = this.selectedBlock();
+    if (!instance) return;
+    const set = this.measurementSet(setId);
+    this.markBeforeChange();
+    instance.personId = set?.id ?? null;
+    instance.personName = set?.name ?? '';
+    // Refresh every snapshot against the new person, so the block still draws
+    // correctly if that person is later removed.
+    for (const variable of this.blockDefinition(instance)?.variables ?? []) {
+      const binding = instance.bindings[variable.id];
+      if (binding?.mode !== 'measurement') continue;
+      const live = sourceValueCm(binding, set);
+      if (live != null) binding.fallbackCm = live;
+    }
+    this.cbs.onChange();
+    this.endHistoryGesture();
+    this.syncBlockBar();
+    this.redraw();
+  }
+
+  private detachSelectedBlock(): void {
+    const instance = this.selectedBlock();
+    if (!instance) return;
+    this.markBeforeChange();
+    // The pieces stay exactly as they are — they just stop being generated.
+    this.pattern.blocks = this.blocks().filter((b) => b.id !== instance.id);
+    this.selectedBlockId = null;
+    this.cbs.onChange();
+    this.endHistoryGesture();
+    this.syncBlockBar();
+    this.redraw();
+  }
+
+  private deleteSelectedBlock(): void {
+    const instance = this.selectedBlock();
+    if (!instance) return;
+    this.markBeforeChange();
+    const owned = new Set(instance.pieces.map((e) => e.pieceId));
+    this.pattern.pieces = this.pattern.pieces.filter((piece) => !owned.has(piece.id));
+    this.pattern.blocks = this.blocks().filter((b) => b.id !== instance.id);
+    this.selectedBlockId = null;
+    this.cbs.onChange();
+    this.endHistoryGesture();
+    this.syncBlockBar();
+    this.redraw();
+  }
+
+  // — The inspector ribbon —
+
+  private blockDisplay(cm: number): number {
+    return Number(cmToDisplay(cm, this.unit).toFixed(3));
+  }
+
+  private blockCm(display: number): number {
+    return displayToCm(display, this.unit);
+  }
+
+  /** Nudge size for a length field, in display units. Alt+wheel reads this too. */
+  private blockStep(): number {
+    return this.unit === 'in' ? 0.25 : 0.5;
+  }
+
+  private blockVariable(
+    instance: BlockInstance | null,
+    varId: string
+  ): BlockVariableDecl | null {
+    const definition = instance ? this.blockDefinition(instance) : null;
+    return definition?.variables.find((v) => v.id === varId) ?? null;
+  }
+
+  /**
+   * Read a numeric inspector field back into canonical units.
+   *
+   * The box holds *display* units, so an inches project would otherwise write
+   * "30" straight in as 30 cm. Counts (dart counts) are dimensionless and must
+   * never be converted — a count of 2 is 2 in either system.
+   */
+  private blockFieldCm(varId: string, input: HTMLInputElement): number | null {
+    const variable = this.blockVariable(this.selectedBlock(), varId);
+    if (!variable) return null;
+    const raw = Number.parseFloat(input.value);
+    if (!Number.isFinite(raw)) return null;
+    if (variable.kind === 'count') return Math.round(raw);
+    return this.blockCm(raw);
+  }
+
+  /** Restore a field's text to the value the block is actually using. */
+  private syncBlockField(varId: string, input: HTMLInputElement): void {
+    const instance = this.selectedBlock();
+    const variable = this.blockVariable(instance, varId);
+    const binding = instance?.bindings[varId];
+    if (!instance || !variable || !binding) return;
+    const cm = clampToDeclared(
+      variable,
+      bindingValueCm(binding, this.measurementSet(instance.personId))
+    );
+    input.value = String(variable.kind === 'count' ? Math.round(cm) : this.blockDisplay(cm));
+  }
+
+  private blockFieldLabel(fieldId: string): string {
+    return MEASUREMENT_FIELDS.find((f) => f.id === fieldId)?.label ?? fieldId;
+  }
+
+  /** Full rebuild — visibility, person select and every variable row. */
+  private syncBlockBar(): void {
+    const instance = this.selectedBlock();
+    const definition = instance ? this.blockDefinition(instance) : null;
+    if (!instance || !definition) {
+      this.blockBar.hidden = true;
+      return;
+    }
+    this.blockBar.hidden = false;
+    const nameEl = this.blockBar.querySelector('[data-block-name]') as HTMLElement;
+    nameEl.textContent = definition.name;
+
+    const sets = this.cbs.getMeasurementLibrary?.()?.sets ?? [];
+    this.fillOptions(
+      this.blockPersonSelect,
+      sets.length > 0
+        ? sets.map((s) => ({ value: s.id, label: s.name }))
+        : [{ value: '', label: 'No people yet' }],
+      instance.personId ?? sets[0]?.id ?? ''
+    );
+
+    this.blockSourceNote.textContent = definition.source ?? '';
+    this.syncBlockVars();
+  }
+
+  /** Rebuild the variable rows. Cheap enough to redo on a mode change. */
+  private syncBlockVars(): void {
+    const instance = this.selectedBlock();
+    const definition = instance ? this.blockDefinition(instance) : null;
+    const host = this.blockVarsHost;
+    host.innerHTML = '';
+    // The rows that were hovered are gone, so the highlight has to go too.
+    this.hoverVarId = null;
+    this.hoverDriven = null;
+    if (!instance || !definition) return;
+
+    const set = this.measurementSet(instance.personId);
+    let currentGroup = '';
+    for (const variable of definition.variables) {
+      if (variable.group !== currentGroup) {
+        currentGroup = variable.group;
+        const head = document.createElement('div');
+        head.className = 'pattern-block-group';
+        head.textContent = currentGroup;
+        host.appendChild(head);
+      }
+
+      const binding = instance.bindings[variable.id];
+      const isMeasurement = binding?.mode === 'measurement';
+      const row = document.createElement('div');
+      row.className = 'pattern-block-var';
+      row.dataset.varId = variable.id;
+      row.title = variable.note ?? '';
+
+      const top = document.createElement('div');
+      top.className = 'pattern-block-var-top';
+      const label = document.createElement('span');
+      label.className = 'pattern-block-var-label';
+      label.textContent = variable.label;
+      const readout = document.createElement('span');
+      readout.className = 'pattern-block-var-readout';
+      readout.dataset.blockReadout = variable.id;
+      top.append(label, readout);
+      row.appendChild(top);
+
+      const controls = document.createElement('div');
+      controls.className = 'pattern-block-var-controls';
+
+      const mode = document.createElement('div');
+      mode.className = 'pattern-block-mode';
+      mode.setAttribute('role', 'group');
+      for (const [id, text] of [
+        ['value', 'Value'],
+        ['measurement', 'Measure'],
+      ] as const) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.dataset.blockMode = id;
+        btn.textContent = text;
+        btn.classList.toggle('is-active', (id === 'measurement') === isMeasurement);
+        mode.appendChild(btn);
+      }
+      controls.appendChild(mode);
+
+      if (!isMeasurement) {
+        // A count is a count in any unit — only lengths convert. Converting a
+        // dart count through inches is how you end up with a max of 1.181.
+        const isCount = variable.kind === 'count';
+        const current = clampToDeclared(
+          variable,
+          bindingValueCm(
+            binding ?? { mode: 'value', cm: variable.defaultValueCm },
+            set
+          )
+        );
+        const input = document.createElement('input');
+        // Deliberately *not* type="number": Chromium gives it a spinbutton role
+        // that cannot be selected or caret-edited (Ctrl+A is ignored entirely),
+        // so retyping a value appends into the middle of the old one. A text
+        // field with a numeric keyboard hint behaves, and the parse and clamp
+        // are ours anyway.
+        input.type = 'text';
+        input.inputMode = isCount ? 'numeric' : 'decimal';
+        input.autocomplete = 'off';
+        input.spellcheck = false;
+        input.className = 'pattern-block-input';
+        input.dataset.blockValue = '';
+        input.dataset.numberInput = '';
+        input.step = String(isCount ? 1 : this.blockStep());
+        input.min = String(isCount ? variable.minCm : this.blockDisplay(variable.minCm));
+        input.max = String(isCount ? variable.maxCm : this.blockDisplay(variable.maxCm));
+        input.value = String(isCount ? Math.round(current) : this.blockDisplay(current));
+        input.setAttribute('aria-label', variable.label);
+        controls.appendChild(input);
+      } else {
+        const select = document.createElement('select');
+        select.className = 'pattern-block-select';
+        select.dataset.blockField = '';
+        select.setAttribute('aria-label', `${variable.label} measurement`);
+        const entries = MEASUREMENT_FIELDS.map((field) => {
+          const live = measurementValueCm(set, field.id);
+          return {
+            value: field.id,
+            label:
+              live == null
+                ? `${field.label} · not measured`
+                : `${field.label} · ${formatLength(live, this.unit, 1)}`,
+          };
+        });
+        this.fillOptions(select, entries, binding.fieldId);
+        controls.appendChild(select);
+
+        const divisor = document.createElement('div');
+        divisor.className = 'pattern-block-div';
+        divisor.setAttribute('role', 'group');
+        for (const [value, text] of [
+          [1, '×1'],
+          [2, '½'],
+          [4, '¼'],
+        ] as const) {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.dataset.blockDiv = String(value);
+          btn.textContent = text;
+          btn.classList.toggle('is-active', binding.divisor === value);
+          divisor.appendChild(btn);
+        }
+        controls.appendChild(divisor);
+
+        const ease = document.createElement('label');
+        ease.className = 'pattern-block-ease';
+        ease.title = `Ease added after dividing, in ${this.unit === 'in' ? 'inches' : 'cm'}`;
+        const sign = document.createElement('span');
+        sign.textContent = '+';
+        const offset = document.createElement('input');
+        offset.type = 'text';
+        offset.inputMode = 'decimal';
+        offset.autocomplete = 'off';
+        offset.spellcheck = false;
+        offset.dataset.blockOffset = '';
+        offset.dataset.numberInput = '';
+        offset.step = String(this.blockStep());
+        offset.value = String(this.blockDisplay(binding.offsetCm));
+        offset.setAttribute('aria-label', `${variable.label} ease`);
+        ease.append(sign, offset);
+        controls.appendChild(ease);
+      }
+
+      row.appendChild(controls);
+      host.appendChild(row);
+    }
+    this.updateBlockReadouts();
+  }
+
+  /** Cheap refresh — only the numbers change while typing. */
+  private updateBlockReadouts(): void {
+    const instance = this.selectedBlock();
+    const definition = instance ? this.blockDefinition(instance) : null;
+    if (!instance || !definition) return;
+    const set = this.measurementSet(instance.personId);
+    const values = resolveBlockValues(definition, instance, set);
+    for (const variable of definition.variables) {
+      const el = this.blockVarsHost.querySelector(
+        `[data-block-readout="${variable.id}"]`
+      ) as HTMLElement | null;
+      if (!el) continue;
+      const binding = instance.bindings[variable.id];
+      if (variable.kind === 'count') {
+        el.textContent = String(Math.round(values[variable.id] ?? 0));
+      } else {
+        el.textContent = formatLength(values[variable.id] ?? 0, this.unit, 1);
+      }
+      el.classList.toggle(
+        'is-unmeasured',
+        binding?.mode === 'measurement' && sourceValueCm(binding, set) == null
+      );
+    }
+  }
+
+  /** Clicking a generated piece selects its block rather than its points. */
+  private onBlockPointerDown(e: PointerEvent, p: Vec2, instance: BlockInstance): void {
+    this.setSelectedBlock(instance.id);
+    this.markBeforeChange();
+    this.drag = {
+      type: 'blockMove',
+      id: instance.id,
+      start: p,
+      origin: { ...instance.origin },
+    };
+    this.svg.setPointerCapture(e.pointerId);
+    e.preventDefault();
+    this.redraw();
+  }
+
+  /**
+   * A small run of text that keeps its own upright orientation while its
+   * position follows the (possibly upside-down) ruler.
+   */
+  private rulerText(text: string, x: number, y: number, cls: string, flip: boolean): SVGGElement {    const g = svgEl('g');
+    g.setAttribute('transform', `translate(${x} ${y})${flip ? ' rotate(180)' : ''}`);
+    const t = svgEl('text');
+    t.setAttribute('class', cls);
+    t.setAttribute('font-size', String(this.px(9)));
+    t.setAttribute('text-anchor', 'middle');
+    t.setAttribute('dominant-baseline', 'middle');
+    // Halo so the text stays legible over the grid and piece fills.
+    t.setAttribute('stroke-width', String(this.px(3)));
+    t.setAttribute('paint-order', 'stroke');
+    t.textContent = text;
+    g.appendChild(t);
+    return g;
+  }
+
+  /**
+   * Ruler scale marks. Returns the label / handle groups, which the caller
+   * appends *after* the pattern so the readings stay legible on top of a piece
+   * while the scale itself stays behind it.
+   */
+  private drawRulers(): SVGGElement[] {
+    const list = this.rulers();
+    const draft = this.drag?.type === 'rulerCreate' ? this.drag : null;
+    const overlay: SVGGElement[] = [];
+    if (list.length === 0) {
+      if (draft) this.drawRulerDraft(draft);
+      return overlay;
+    }
+
+    const grad = rulerGraduations(this.unit, this.viewScale());
+    const majorEvery = Math.max(1, Math.round(grad.majorCm / grad.minorCm));
+    // Whole numbers once the labelled step reaches a whole unit (1 cm / 1 in).
+    const majorDisplay = this.unit === 'in' ? grad.majorCm / 2.54 : grad.majorCm;
+    const tickDigits = majorDisplay >= 1 ? 0 : 1;
+
+    for (const ruler of list) {
+      const length = this.rulerDrawnLength(ruler);
+      if (!(length > 0.05)) continue;
+      const selected = this.selectedRulerId === ruler.id;
+      const hovered = this.hoverRulerId === ruler.id;
+      const flip = rulerTextFlipped(ruler.angle);
+      const { a } = rulerEndpoints(ruler, length);
+
+      const group = svgEl('g');
+      group.setAttribute(
+        'class',
+        `pattern-ruler${selected ? ' is-selected' : ''}${hovered ? ' is-hovered' : ''}`
+      );
+      group.setAttribute('transform', `translate(${a.x} ${a.y}) rotate(${ruler.angle})`);
+      // Hit-testing is analytic, so the artwork must never swallow pointer events.
+      group.setAttribute('pointer-events', 'none');
+
+      group.appendChild(svgLine(0, 0, length, 0, 'pattern-ruler-line', this.px(selected ? 2.2 : 1.6)));
+
+      const cap = this.px(9);
+      group.appendChild(svgLine(0, -cap / 2, 0, cap / 2, 'pattern-ruler-cap', this.px(1.4)));
+      group.appendChild(svgLine(length, -cap / 2, length, cap / 2, 'pattern-ruler-cap', this.px(1.4)));
+
+      // Graduations hang below the axis so the label above stays clear.
+      const tickSw = this.px(selected ? 1.1 : 0.9);
+      const ticks = Math.floor(length / grad.minorCm + 1e-6);
+      for (let i = 0; i <= ticks; i++) {
+        const v = i * grad.minorCm;
+        const isMajor = i % majorEvery === 0;
+        const h = isMajor ? this.px(7) : this.px(3.4);
+        group.appendChild(
+          svgLine(v, 0, v, h, isMajor ? 'pattern-ruler-tick-major' : 'pattern-ruler-tick', tickSw)
+        );
+        if (isMajor && selected) {
+          // Only the selected ruler is worth numbering — otherwise it's noise.
+          group.appendChild(
+            this.rulerText(
+              formatLength(v, this.unit, tickDigits),
+              v,
+              h + this.px(9),
+              'pattern-ruler-number',
+              flip
+            )
+          );
+        }
+      }
+      this.svg.appendChild(group);
+
+      // Readings and grab handles ride above the pattern.
+      const top = svgEl('g');
+      top.setAttribute(
+        'class',
+        `pattern-ruler-top${selected ? ' is-selected' : ''}${hovered ? ' is-hovered' : ''}`
+      );
+      top.setAttribute('transform', `translate(${a.x} ${a.y}) rotate(${ruler.angle})`);
+      top.setAttribute('pointer-events', 'none');
+
+      const label = rulerLabel(
+        ruler,
+        this.unit,
+        length,
+        this.measurementSet(ruler.personId)?.name ?? ruler.personName
+      );
+      const midX = length / 2;
+      top.appendChild(this.rulerText(label.primary, midX, -this.px(21), 'pattern-ruler-name', flip));
+      top.appendChild(
+        this.rulerText(label.secondary, midX, -this.px(10), 'pattern-ruler-value', flip)
+      );
+
+      if (selected) {
+        for (const x of [0, length]) {
+          const handle = svgEl('circle');
+          handle.setAttribute('cx', String(x));
+          handle.setAttribute('cy', '0');
+          handle.setAttribute('r', String(this.px(4)));
+          handle.setAttribute('class', 'pattern-ruler-handle');
+          handle.setAttribute('stroke-width', String(this.px(1.4)));
+          top.appendChild(handle);
+        }
+      }
+      overlay.push(top);
+    }
+
+    if (draft) this.drawRulerDraft(draft);
+    return overlay;
+  }
+
+  private drawRulerDraft(drag: Extract<DragKind, { type: 'rulerCreate' }>): void {
+    const dx = drag.current.x - drag.start.x;
+    const dy = drag.current.y - drag.start.y;
+    const length = Math.hypot(dx, dy);
+    if (!(length > 0.2)) return;
+    const deg = rulerAngle(drag.start, drag.current, drag.snap);
+    const th = (deg * Math.PI) / 180;
+    const end = { x: drag.start.x + Math.cos(th) * length, y: drag.start.y + Math.sin(th) * length };
+    const line = svgLine(
+      drag.start.x,
+      drag.start.y,
+      end.x,
+      end.y,
+      'pattern-ruler-draft',
+      this.px(1.6)
+    );
+    line.setAttribute('stroke-dasharray', `${this.px(6)} ${this.px(4)}`);
+    line.setAttribute('pointer-events', 'none');
+    this.svg.appendChild(line);
+
+    const mid = { x: (drag.start.x + end.x) / 2, y: (drag.start.y + end.y) / 2 };
+    const text = this.rulerText(
+      formatLength(length, this.unit, 1),
+      mid.x,
+      mid.y - this.px(12),
+      'pattern-ruler-value',
+      false
+    );
+    text.setAttribute('pointer-events', 'none');
+    this.svg.appendChild(text);
   }
 
   private makePieceId = (): string => uid('pt');
@@ -2511,6 +4359,12 @@ export class PatternEditor {
   }
 
   private handleDeleteKey(): void {
+    // A selected ruler is the only thing "in hand" — delete that first.
+    if (this.selectedRulerId && this.selectedIds.size === 0) {
+      this.deleteSelectedRuler();
+      return;
+    }
+
     const piece = this.activePiece();
     if (!piece) return;
 
@@ -2558,6 +4412,36 @@ export class PatternEditor {
     const pointId = target.dataset?.pointId;
     const pieceId = target.dataset?.pieceId;
     const p = this.svgPoint(e);
+
+    // The ruler tool owns every gesture: empty canvas starts a new ruler, and a
+    // ruler under the cursor can be picked up, slid or turned.
+    if (this.tool === 'ruler') {
+      this.onRulerDown(e, p);
+      return;
+    }
+
+    // The move tool can pick a ruler up off the canvas too — but only when the
+    // click is not landing on a pattern point or handle, which take precedence.
+    if (this.tool === 'move' && !kind) {
+      const rulerHit = this.findRulerHit(p);
+      if (rulerHit) {
+        this.onRulerDown(e, p, rulerHit);
+        return;
+      }
+    }
+
+    // A generated block piece is edited through its variables, not its points:
+    // clicking selects the block, dragging moves the whole draft. Regeneration
+    // would otherwise discard whatever you did to an individual point.
+    const block = this.blockForPiece(pieceId);
+    if (block) {
+      this.onBlockPointerDown(e, p, block);
+      return;
+    }
+
+    // Anything else gives the ruler up: a ruler is only "in hand" while nothing
+    // else is being edited, so its settings ribbon must not linger.
+    this.setRulerSelection(null);
 
     if (this.tool === 'pen') {
       this.onPenDown(e, p);
@@ -3332,6 +5216,21 @@ export class PatternEditor {
       return;
     }
 
+    // Hover feedback for rulers (ruler + move tools only).
+    if (!this.drag && (this.tool === 'ruler' || this.tool === 'move')) {
+      const hit = this.findRulerHit(this.svgPoint(e));
+      const next = hit?.id ?? null;
+      if (next !== this.hoverRulerId) {
+        this.hoverRulerId = next;
+        this.redraw();
+      }
+      if (this.tool === 'ruler') {
+        this.svg.style.cursor = hit ? 'move' : 'crosshair';
+      } else if (this.svg.style.cursor !== (hit ? 'move' : 'default')) {
+        this.svg.style.cursor = hit ? 'move' : 'default';
+      }
+    }
+
     if (!this.drag) return;
     const p = this.svgPoint(e);
 
@@ -3340,6 +5239,71 @@ export class PatternEditor {
       this.viewBox.x = this.drag.startView.x - (e.clientX - this.drag.startClient.x) / scale;
       this.viewBox.y = this.drag.startView.y - (e.clientY - this.drag.startClient.y) / scale;
       this.redraw();
+      return;
+    }
+
+    if (this.drag.type === 'blockMove') {
+      const d = this.drag;
+      const instance = this.blocks().find((b) => b.id === d.id);
+      if (!instance) return;
+      instance.origin = {
+        x: d.origin.x + (p.x - d.start.x),
+        y: d.origin.y + (p.y - d.start.y),
+      };
+      const definition = this.blockDefinition(instance);
+      if (definition) {
+        const generated = generateBlockPieces(
+          definition,
+          instance,
+          this.measurementSet(instance.personId)
+        );
+        const { pieces, ownership } = spliceBlockPieces(
+          this.pattern.pieces,
+          instance,
+          generated
+        );
+        this.pattern.pieces = pieces;
+        instance.pieces = ownership;
+      }
+      this.redraw();
+      this.cbs.onChange();
+      return;
+    }
+
+    if (this.drag.type === 'rulerCreate') {
+      this.drag.current = p;
+      this.drag.snap = e.shiftKey;
+      this.redraw();
+      return;
+    }
+
+    if (this.drag.type === 'rulerMove') {
+      const d = this.drag;
+      const ruler = this.rulers().find((r) => r.id === d.id);
+      if (!ruler) return;
+      ruler.center = { x: d.origin.x + (p.x - d.start.x), y: d.origin.y + (p.y - d.start.y) };
+      this.redraw();
+      this.notifyRulerChange();
+      return;
+    }
+
+    if (this.drag.type === 'rulerTurn') {
+      const d = this.drag;
+      const ruler = this.rulers().find((r) => r.id === d.id);
+      if (!ruler) return;
+      const dx = p.x - ruler.center.x;
+      const dy = p.y - ruler.center.y;
+      // Dragging tip A aims the ruler's +x axis back through the centre, so the
+      // tip stays under the cursor instead of jumping to the far end.
+      let deg = (Math.atan2(dy, dx) * 180) / Math.PI + (d.which === 'a' ? 180 : 0);
+      if (e.shiftKey) deg = Math.round(deg / 15) * 15;
+      ruler.angle = deg;
+      // Freed of a measurement, the ruler can also be sized by its tip.
+      if (ruler.measurementId === null) {
+        setRulerDrawnLength(ruler, Math.max(1, Math.hypot(dx, dy) * 2));
+      }
+      this.redraw();
+      this.notifyRulerChange();
       return;
     }
 
@@ -3513,6 +5477,13 @@ export class PatternEditor {
 
     if (finished.type === 'drawShape') {
       this.finishDrawShape(finished);
+      this.redraw();
+      return;
+    }
+
+    if (finished.type === 'rulerCreate') {
+      this.commitRulerCreate(finished);
+      this.endHistoryGesture();
       this.redraw();
       return;
     }

@@ -45,7 +45,11 @@ function txDone(tx: IDBTransaction): Promise<void> {
   });
 }
 
-export type MetaKey = 'activeProjectId' | 'storageVersion' | 'migratedFromLocalStorage';
+export type MetaKey =
+  | 'activeProjectId'
+  | 'storageVersion'
+  | 'migratedFromLocalStorage'
+  | 'measurementSets';
 
 export async function getMeta(key: MetaKey): Promise<string | null> {
   const db = await openDb();

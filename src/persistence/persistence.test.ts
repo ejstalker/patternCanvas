@@ -3,6 +3,8 @@ import { normalizeProject, parseProject, serializeProject } from './projectCodec
 import { documentToSavePayload, manifestToDocument } from './manifestCodec';
 import { packMeshGeometry, unpackMeshGeometry, packPose, unpackPose, type PoseRecord } from './schema';
 import { createSmallFixture } from './fixtures';
+import { createDefaultProject } from '../project/createDefault';
+import { DEFAULT_DISPLAY_UNIT } from '../project/types';
 import { projectStore } from './ProjectStore';
 import { exportProjectArchiveBytes, importProjectArchive } from './projectArchive';
 
@@ -34,6 +36,49 @@ describe('projectCodec', () => {
     expect(parsed.transforms).toHaveLength(1);
     expect(parsed.transforms[0]!.pieceTransforms[pieceId]).toEqual(expected);
     expect(parsed.meshTransformAssignments).toHaveLength(1);
+  });
+});
+
+describe('display units', () => {
+  it('opens a new project in the default unit', () => {
+    expect(DEFAULT_DISPLAY_UNIT).toBe('in');
+    expect(createDefaultProject().displayUnit).toBe(DEFAULT_DISPLAY_UNIT);
+  });
+
+  it('does not convert a project that already has a unit', () => {
+    // Changing the default must never rewrite a project you already drafted in.
+    const project = createSmallFixture();
+    project.displayUnit = 'cm';
+    const parsed = parseProject(serializeProject(project));
+    expect(parsed.displayUnit).toBe('cm');
+    expect(parseProject(serializeProject(createDefaultProject())).displayUnit).toBe(
+      DEFAULT_DISPLAY_UNIT
+    );
+  });
+
+  it('falls back to the default when a file carries no usable unit', () => {
+    const project = createSmallFixture();
+    const raw = JSON.parse(serializeProject(project)) as Record<string, unknown>;
+    delete raw.displayUnit;
+    expect(normalizeProject(raw as never).displayUnit).toBe(DEFAULT_DISPLAY_UNIT);
+
+    const bogus = JSON.parse(serializeProject(project)) as Record<string, unknown>;
+    bogus.displayUnit = 'furlongs';
+    expect(normalizeProject(bogus as never).displayUnit).toBe(DEFAULT_DISPLAY_UNIT);
+  });
+
+  it('survives the compressed save payload', async () => {
+    const project = createSmallFixture();
+    project.displayUnit = 'in';
+    const payload = await documentToSavePayload(project, { projectId: project.id, revision: 1 });
+    const hydrated = manifestToDocument(
+      payload.manifest,
+      new Map(payload.assets.map((a) => [a.id, a.blob])),
+      new Map(payload.poses.map((p) => [p.id, p])),
+      new Map(payload.meshCaches.map((m) => [m.id, m])),
+      (_id, blob) => URL.createObjectURL(blob)
+    );
+    expect(hydrated.displayUnit).toBe('in');
   });
 });
 

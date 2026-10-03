@@ -1,6 +1,6 @@
 // vite.config.js
 import { defineConfig, type Plugin } from 'vite';
-import { resolve, join, normalize } from 'path';
+import { resolve, join, normalize, sep } from 'path';
 import { promises as fs } from 'fs';
 import type { IncomingMessage, ServerResponse } from 'http';
 
@@ -8,10 +8,10 @@ function refPplPlugin(): Plugin {
   const refPplDir = resolve(__dirname, 'refPpl');
 
   const safePath = (name: string): string | null => {
-    const decoded = decodeURIComponent(name);
-    if (decoded.includes('..') || decoded.includes('/') || decoded.includes('\\')) return null;
+    const decoded = decodeURIComponent(name).replace(/\\/g, '/');
+    if (decoded.includes('..') || decoded.startsWith('/')) return null;
     const full = normalize(join(refPplDir, decoded));
-    if (!full.startsWith(refPplDir)) return null;
+    if (full !== refPplDir && !full.startsWith(refPplDir + sep)) return null;
     return full;
   };
 
@@ -19,6 +19,8 @@ function refPplPlugin(): Plugin {
     if (name.endsWith('.sdf')) return 'application/octet-stream';
     if (name.endsWith('.obj')) return 'text/plain; charset=utf-8';
     if (name.endsWith('.mtl')) return 'text/plain; charset=utf-8';
+    if (name.endsWith('.target')) return 'text/plain; charset=utf-8';
+    if (name.endsWith('.json')) return 'application/json; charset=utf-8';
     return 'application/octet-stream';
   };
 
@@ -114,22 +116,28 @@ function refPplPlugin(): Plugin {
     void handleRefPpl(req, res, next);
   };
 
-  const copyRefPplToDist = async (outDir: string) => {
-    const dest = join(outDir, 'refPpl');
-    await fs.mkdir(dest, { recursive: true });
+  const copyRefPplDir = async (outDir: string, rel = ''): Promise<void> => {
+    const srcDir = join(refPplDir, rel);
+    const destDir = join(outDir, 'refPpl', rel);
     let entries: string[] = [];
     try {
-      entries = await fs.readdir(refPplDir);
+      entries = await fs.readdir(srcDir);
     } catch {
       return;
     }
+    await fs.mkdir(destDir, { recursive: true });
     for (const entry of entries) {
-      const src = join(refPplDir, entry);
+      const src = join(srcDir, entry);
       const stat = await fs.stat(src);
-      if (!stat.isFile()) continue;
-      await fs.copyFile(src, join(dest, entry));
+      if (stat.isDirectory()) {
+        await copyRefPplDir(outDir, join(rel, entry));
+      } else if (stat.isFile()) {
+        await fs.copyFile(src, join(destDir, entry));
+      }
     }
   };
+
+  const copyRefPplToDist = (outDir: string) => copyRefPplDir(outDir);
 
   return {
     name: 'refPpl',

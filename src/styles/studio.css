@@ -12,6 +12,13 @@
   --active: #2f6f4e;
   --font: "IBM Plex Sans", "Segoe UI", sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, monospace;
+  /* Shared by the drape's "Draw pattern points" markers and the remesh view. */
+  --point-marker-fill: #ffd166;
+  --point-marker-stroke: #2f2408;
+  /* Generated block geometry — outlines, points and the group container. */
+  --block-tint: #bda6f0;
+  /* The "this number moves that" highlight, distinct from selection and readouts. */
+  --block-highlight: #ffc65c;
 }
 
 * {
@@ -190,22 +197,36 @@ body {
   width: 100%;
   height: 100%;
   position: relative;
-  background: #f7f3ec;
+  background: var(--bg);
 }
 
 .mesh-svg {
   width: 100%;
   height: 100%;
   display: block;
+  cursor: grab;
+  touch-action: none;
+}
+
+.mesh-preview.is-panning .mesh-svg {
+  cursor: grabbing;
+}
+
+/* Pattern anchor → mesh vertex markers, matching the drape viewport's
+   "Draw pattern points" tool. */
+.mesh-point-marker {
+  fill: var(--point-marker-fill);
+  stroke: var(--point-marker-stroke);
+  pointer-events: none;
 }
 
 .mesh-tri {
-  fill: #e8dcc8;
+  fill: #35302a;
   stroke: none;
 }
 
 .mesh-edge {
-  stroke: #2c241c;
+  stroke: #c2b9aa;
   stroke-width: 0.18;
   fill: none;
 }
@@ -639,22 +660,50 @@ body {
   position: relative;
 }
 
-.pattern-point-bar {
-  display: none;
-  flex-shrink: 0;
+/*
+ * Contextual ribbons over the pattern canvas.
+ *
+ * One slot at the top-left carries whatever is selected — the point options or
+ * the ruler settings — and the avatar's mode controls sit at the bottom.
+ * They are all `[[hidden]]`-driven, and each needs an explicit rule because the
+ * `display: flex` below would otherwise beat the UA `[hidden] { display: none }`.
+ */
+.pattern-point-bar,
+.pattern-ruler-bar,
+.pattern-block-bar,
+.pattern-avatar-bar,
+.pattern-xray-bar {
+  position: absolute;
+  z-index: 4;
+  display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 5px 10px;
-  background: var(--bg-elev);
-  border-bottom: 1px solid var(--border);
-  z-index: 3;
-  font-size: 11px;
-  font-family: var(--mono);
-  color: var(--muted, #8a8278);
+  gap: 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--bg-elev) 92%, transparent);
+  backdrop-filter: blur(4px);
+  font: 11px var(--mono);
+  color: var(--ink);
+  pointer-events: auto;
+  max-width: calc(100% - 16px);
 }
 
-.pattern-point-bar.visible {
-  display: flex;
+.pattern-point-bar[hidden],
+.pattern-ruler-bar[hidden],
+.pattern-block-bar[hidden],
+.pattern-avatar-bar[hidden],
+.pattern-xray-bar[hidden] {
+  display: none !important;
+}
+
+/* Selection chrome: the same top-left slot, never both at once (selecting a
+   ruler clears the point selection, and vice versa). */
+.pattern-point-bar {
+  top: 8px;
+  left: 8px;
+  gap: 14px;
+  color: var(--muted, #8a8278);
 }
 
 .pattern-point-bar label {
@@ -720,7 +769,10 @@ body {
   display: none !important;
 }
 
-.pattern-tool-flyout-menu button {
+/* NOTE: these carry an extra `.pattern-toolbar` so they beat the rail's own
+   `.pattern-toolbar button { width: 28px; height: 28px; padding: 0 }`, which
+   appears later in this file and would otherwise squash every flyout row. */
+.pattern-toolbar .pattern-tool-flyout-menu button {
   width: 100%;
   height: auto;
   padding: 5px 8px;
@@ -729,10 +781,157 @@ body {
   white-space: nowrap;
 }
 
-.pattern-tool-flyout-menu button.is-active {
+.pattern-toolbar .pattern-tool-flyout-menu button.is-active {
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
+}
+
+/* Hold-open measurement picker under the ruler tool. */
+.pattern-tool-flyout-wide .pattern-tool-flyout-menu {
+  width: 272px;
+  min-width: 0;
+  max-height: min(62vh, 440px);
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+}
+
+.pattern-ruler-menu-search {
+  flex-shrink: 0;
+  padding: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.pattern-ruler-menu-search input {
+  width: 100%;
+  padding: 5px 7px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 11px var(--mono);
+}
+
+.pattern-ruler-menu-search input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.pattern-ruler-menu-tree {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 4px 6px;
+}
+
+.pattern-ruler-menu-empty {
+  padding: 14px 10px;
+  color: var(--muted);
+  font: 11px/1.5 var(--mono);
+  text-align: center;
+}
+
+.pattern-ruler-menu-divider {
+  height: 1px;
+  margin: 4px 6px 6px;
+  background: var(--border);
+}
+
+/* Person headers stick to the top while you scroll their measurements. */
+.pattern-ruler-person {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px 4px;
+  background: var(--bg-elev);
+  color: var(--muted);
+  font: 600 10px/1 var(--font);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.pattern-ruler-person-unit {
+  margin-left: auto;
+  text-transform: none;
+  letter-spacing: 0;
+  font: 10px var(--mono);
+  opacity: 0.7;
+}
+
+/* The extra `.pattern-toolbar` matters: the rail's own
+   `.pattern-toolbar button { width: 28px; height: 28px; padding: 0 }` sits
+   further down this file and would otherwise squash every picker row. */
+.pattern-toolbar .pattern-ruler-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  height: auto;
+  padding: 5px 8px;
+  font: 11px var(--mono);
+  text-align: left;
+}
+
+.pattern-ruler-item-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pattern-ruler-item-value {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.pattern-toolbar .pattern-ruler-item:hover:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.pattern-toolbar .pattern-ruler-item:hover:not(:disabled) .pattern-ruler-item-value,
+.pattern-toolbar .pattern-ruler-item:hover:not(:disabled) mark {
+  color: #fff;
+}
+
+/* A field this person has not been measured for: visible, not selectable. */
+.pattern-toolbar .pattern-ruler-item:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.pattern-toolbar .pattern-ruler-item:disabled:hover {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--ink);
+}
+
+.pattern-ruler-item mark,
+.pattern-ruler-person mark {
+  background: transparent;
+  color: var(--point-marker-fill);
+  font-weight: 700;
+}
+
+/* Armed with a measurement from the picker — the next drag uses it. */
+.pattern-toolbar button.is-armed {
+  position: relative;
+}
+
+.pattern-toolbar button.is-armed::after {
+  content: '';
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--point-marker-fill);
 }
 
 .pattern-toolbar-spacer {
@@ -973,7 +1172,7 @@ body {
   min-width: 0;
   min-height: 0;
   position: relative;
-  background: #f4efe6;
+  background: var(--bg);
 }
 
 .pattern-avatar-svg {
@@ -988,21 +1187,9 @@ body {
 }
 
 .pattern-xray-bar {
-  position: absolute;
   top: 8px;
   right: 8px;
-  z-index: 4;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 8px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: color-mix(in srgb, var(--bg-elev) 92%, transparent);
-  backdrop-filter: blur(4px);
-  font-size: 12px;
-  color: var(--ink);
-  pointer-events: auto;
+  font: 12px var(--font);
 }
 
 .pattern-xray-bar-label {
@@ -1045,21 +1232,9 @@ body {
 }
 
 .pattern-avatar-bar {
-  position: absolute;
-  top: 8px;
+  bottom: 8px;
   left: 8px;
-  z-index: 4;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 8px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: color-mix(in srgb, var(--bg-elev) 92%, transparent);
-  backdrop-filter: blur(4px);
-  font-size: 12px;
-  color: var(--ink);
-  pointer-events: auto;
+  font: 12px var(--font);
 }
 
 .pattern-avatar-bar-label {
@@ -1120,28 +1295,28 @@ body {
 
 .pattern-knife-point {
   fill: var(--accent);
-  stroke: #fff;
+  stroke: var(--bg);
   pointer-events: none;
 }
 
 .pattern-knife-hit {
   fill: #c45c26;
-  stroke: #fff;
+  stroke: var(--bg);
   opacity: 0.7;
   pointer-events: none;
 }
 
 .pattern-knife-hit-ok {
-  fill: #2f6f4e;
-  stroke: #fff;
+  fill: #3f9e70;
+  stroke: var(--bg);
   pointer-events: none;
 }
 
 .pattern-avatar-mesh {
-  fill: #6a7078;
-  fill-opacity: 0.15;
-  stroke: #5a6068;
-  stroke-opacity: 0.2;
+  fill: #c3cbd6;
+  fill-opacity: 0.14;
+  stroke: #9aa4b2;
+  stroke-opacity: 0.28;
   stroke-width: 0.12;
   stroke-linejoin: round;
 }
@@ -1207,44 +1382,101 @@ body {
 }
 
 .pattern-handle-line {
-  stroke: #3d7ea6;
+  stroke: #6ea8fe;
   fill: none;
   pointer-events: none;
 }
 
 .pattern-handle {
-  fill: #fff;
-  stroke: #3d7ea6;
+  fill: var(--bg);
+  stroke: #6ea8fe;
   cursor: grab;
 }
 
 .pattern-handle:hover {
-  fill: #3d7ea6;
+  fill: #6ea8fe;
 }
 
 
+/* Stroke widths are set per line in pattern units (see `buildGridGroup`), so
+   they stay a constant pixel weight as the viewBox scales. The whole grid sits
+   at low opacity so it reads as a hint rather than a wash. */
+.pattern-grid {
+  opacity: 0.08;
+}
+
 .pattern-grid line {
-  stroke: #d9d0c3;
+  fill: none;
+}
+
+/* 1 cm / 1 in — faint, just enough to read scale. */
+.pattern-grid-minor {
+  stroke: #9a9184;
+}
+
+/* 10 cm / 1 ft — the line you actually count against. */
+.pattern-grid-major {
+  stroke: #e8dfd0;
 }
 
 .pattern-fill {
-  fill: #e8dcc8;
-  stroke: #2c241c;
+  fill: #35302a;
+  stroke: #c2b9aa;
+}
+
+/* Generated geometry is tinted lavender so drafted blocks read as components
+   rather than as pieces you drew. */
+.pattern-fill.is-block {
+  stroke: var(--block-tint);
+}
+
+/* The dotted container drawn around a block that drafts more than one piece. */
+.pattern-block-outline {
+  fill: none;
+  stroke: var(--block-tint);
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.pattern-block-outline.is-selected {
+  opacity: 0.75;
+}
+
+/* Hovering a variable: a lamp held against the geometry that number moves.
+   Amber, because it has to be legible over the lavender block tint without
+   being mistaken for a selection (blue) or a readout (yellow). */
+.pattern-block-driver {
+  fill: none;
+  stroke: var(--block-highlight);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.pattern-block-driver-point {
+  fill: none;
+  stroke: var(--block-highlight);
+  pointer-events: none;
 }
 
 .pattern-point {
   fill: #c45c26;
-  stroke: #fff;
+  stroke: var(--bg);
   cursor: grab;
 }
 
+.pattern-point.is-block {
+  fill: var(--block-tint);
+}
+
 .pattern-point.selected {
-  fill: #3d7ea6;
+  fill: #6ea8fe;
 }
 
 .pattern-marquee {
-  fill: rgba(61, 126, 166, 0.12);
-  stroke: #3d7ea6;
+  fill: rgba(110, 168, 254, 0.18);
+  stroke: #6ea8fe;
   pointer-events: none;
 }
 
@@ -1255,14 +1487,14 @@ body {
 }
 
 .pattern-selection-box {
-  fill: rgba(61, 126, 166, 0.06);
-  stroke: #3d7ea6;
+  fill: rgba(110, 168, 254, 0.1);
+  stroke: #6ea8fe;
   cursor: move;
 }
 
 .pattern-scale-handle {
-  fill: #fff;
-  stroke: #3d7ea6;
+  fill: var(--bg);
+  stroke: #6ea8fe;
   cursor: nwse-resize;
 }
 
@@ -1284,7 +1516,7 @@ body {
 }
 
 .pattern-length {
-  fill: #5a5046;
+  fill: var(--muted);
   text-anchor: middle;
   font-family: var(--mono);
   pointer-events: none;
@@ -1293,7 +1525,435 @@ body {
 }
 
 .pattern-grain {
-  stroke: #3d7ea6;
+  stroke: #6ea8fe;
+}
+
+.pattern-grain.is-block {
+  stroke: var(--block-tint);
+}
+
+/* ── Rulers ─────────────────────────────────────────────────────────────────
+   Drafting reference lines pinned over the pattern. They carry their person
+   and measurement as text, so they read as a physical ruler left on the table
+   rather than as geometry. Artwork is pointer-events:none — the editor hit
+   tests them analytically. */
+.pattern-ruler,
+.pattern-ruler-top {
+  color: #cfc7b8;
+}
+
+.pattern-ruler-line,
+.pattern-ruler-cap {
+  stroke: currentColor;
+  fill: none;
+  stroke-linecap: round;
+}
+
+.pattern-ruler-tick,
+.pattern-ruler-tick-major {
+  stroke: currentColor;
+  stroke-linecap: round;
+}
+
+.pattern-ruler-tick {
+  opacity: 0.5;
+}
+
+.pattern-ruler-tick-major {
+  opacity: 0.85;
+}
+
+.pattern-ruler-name,
+.pattern-ruler-value,
+.pattern-ruler-number {
+  fill: currentColor;
+  font-family: var(--mono);
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+  /* The halo is stroked in the drafting-surface colour so the label survives
+     the grid and the piece fill underneath it. */
+  stroke: var(--bg);
+  stroke-linejoin: round;
+}
+
+.pattern-ruler-name {
+  opacity: 0.78;
+  letter-spacing: 0.02em;
+}
+
+.pattern-ruler-value {
+  opacity: 0.95;
+  font-weight: 600;
+}
+
+.pattern-ruler-number {
+  opacity: 0.7;
+}
+
+.pattern-ruler.is-hovered,
+.pattern-ruler-top.is-hovered {
+  color: #e6ded0;
+}
+
+.pattern-ruler.is-selected,
+.pattern-ruler-top.is-selected {
+  color: #6ea8fe;
+}
+
+.pattern-ruler-handle {
+  fill: var(--bg);
+  stroke: #6ea8fe;
+}
+
+.pattern-ruler-draft {
+  stroke: #6ea8fe;
+  fill: none;
+  opacity: 0.8;
+}
+
+/* Ruler settings take over the same top-left slot while a ruler is selected. */
+.pattern-ruler-bar {
+  top: 8px;
+  left: 8px;
+  flex-wrap: wrap;
+  gap: 8px;
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.35);
+}
+
+.pattern-ruler-bar[hidden] {
+  display: none !important;
+}
+
+/* ---------------------------------------------------------------------------
+ * Block inspector — the variable editor for a parametric block instance.
+ * Same top-left slot as the point and ruler ribbons; the three are mutually
+ * exclusive by selection.
+ * ------------------------------------------------------------------------- */
+.pattern-block-bar {
+  top: 8px;
+  left: 8px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  width: 348px;
+  max-height: calc(100% - 16px);
+  padding: 7px 8px;
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.35);
+}
+
+.pattern-block-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pattern-block-name {
+  font: 600 12px var(--font);
+  letter-spacing: 0.01em;
+}
+
+.pattern-block-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.pattern-block-field select {
+  max-width: 120px;
+  padding: 2px 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  font: 11px var(--mono);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.pattern-block-detach,
+.pattern-block-delete {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  font: 11px var(--mono);
+  cursor: pointer;
+}
+
+.pattern-block-detach:hover {
+  border-color: var(--accent);
+}
+
+.pattern-block-delete {
+  color: #c45c4a;
+}
+
+.pattern-block-delete:hover {
+  background: #a33b2c;
+  border-color: #a33b2c;
+  color: #fff;
+}
+
+.pattern-block-vars {
+  overflow-y: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.pattern-block-group {
+  margin-top: 3px;
+  color: var(--muted);
+  font: 600 9.5px var(--font);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.pattern-block-var {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 3px 4px;
+  border-radius: 4px;
+}
+
+.pattern-block-var:hover {
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
+}
+
+.pattern-block-var-top {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.pattern-block-var-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pattern-block-var-readout {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--point-marker-fill);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A measurement this person has not taken: the block is using its snapshot. */
+.pattern-block-var-readout.is-unmeasured {
+  color: #c9a227;
+}
+
+.pattern-block-var-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.pattern-block-mode,
+.pattern-block-div {
+  display: inline-flex;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.pattern-block-mode button,
+.pattern-block-div button {
+  padding: 2px 7px;
+  border: none;
+  border-radius: 0;
+  background: var(--panel);
+  color: var(--muted);
+  font: 10px var(--mono);
+  cursor: pointer;
+}
+
+.pattern-block-mode button + button,
+.pattern-block-div button + button {
+  border-left: 1px solid var(--border);
+}
+
+.pattern-block-mode button.is-active,
+.pattern-block-div button.is-active {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* These are text fields carrying numeric data: a real number input cannot be
+   selected or caret-edited, so the values are parsed and clamped in the editor. */
+.pattern-block-input,
+.pattern-block-ease input {
+  width: 68px;
+  flex-shrink: 0;
+  padding: 2px 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 11px var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.pattern-block-select {
+  flex: 1 1 110px;
+  min-width: 96px;
+  padding: 2px 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  font: 11px var(--mono);
+}
+
+.pattern-block-ease {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  color: var(--muted);
+}
+
+.pattern-block-ease input {
+  width: 54px;
+  flex-shrink: 0;
+}
+
+.pattern-block-source {
+  font-size: 9.5px;
+  line-height: 1.4;
+  border-top: 1px solid var(--border);
+  padding-top: 5px;
+}
+
+/* The placement menu in the tool rail. */
+.pattern-tool-flyout-wide .pattern-block-menu {
+  width: 268px;
+  min-width: 0;
+  padding: 5px;
+  gap: 3px;
+}
+
+.pattern-block-menu-hint,
+.pattern-block-menu-empty {
+  padding: 4px 6px 6px;
+  color: var(--muted);
+  font: 10.5px/1.45 var(--mono);
+}
+
+.pattern-toolbar .pattern-block-menu button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  height: auto;
+  padding: 6px 8px;
+  white-space: normal;
+}
+
+.pattern-block-menu-name {
+  font: 600 11px var(--mono);
+}
+
+.pattern-block-menu-desc {
+  color: var(--muted);
+  font: 10.5px/1.4 var(--mono);
+}
+
+.pattern-toolbar .pattern-block-menu button:hover .pattern-block-menu-desc {
+  color: #fff;
+}
+
+.pattern-ruler-bar-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+
+.pattern-ruler-bar-label svg {
+  display: block;
+}
+
+.pattern-ruler-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+}
+
+.pattern-ruler-field select {
+  max-width: 190px;
+  padding: 2px 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  font: 11px var(--mono);
+}
+
+.pattern-ruler-scale {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.pattern-ruler-scale button {
+  padding: 3px 9px;
+  border: none;
+  border-radius: 0;
+  background: var(--panel);
+  color: var(--muted);
+  font: 11px var(--mono);
+  cursor: pointer;
+}
+
+.pattern-ruler-scale button + button {
+  border-left: 1px solid var(--border);
+}
+
+.pattern-ruler-scale button.is-active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.pattern-ruler-readout {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.pattern-ruler-delete {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: #c45c4a;
+  font: 11px var(--mono);
+  cursor: pointer;
+}
+
+.pattern-ruler-delete:hover {
+  background: #a33b2c;
+  border-color: #a33b2c;
+  color: #fff;
 }
 
 /* Sewing seams (Marvelous Designer–style edge bindings) */
@@ -1323,7 +1983,7 @@ body {
 }
 
 .pattern-seam-multi-target {
-  stroke: #3d7ea6;
+  stroke: #6ea8fe;
 }
 
 .pattern-seam-hover {
@@ -1498,8 +2158,8 @@ body {
   margin: -6.5px 0 0 -6.5px;
   padding: 0;
   border-radius: 50%;
-  border: 1.5px solid #2f2408;
-  background: rgba(255, 209, 102, 0.95);
+  border: 1.5px solid var(--point-marker-stroke);
+  background: var(--point-marker-fill);
   box-shadow: 0 0 5px rgba(0, 0, 0, 0.45);
   pointer-events: auto;
   cursor: pointer;
@@ -1507,7 +2167,7 @@ body {
 }
 
 .pattern-point-marker:hover {
-  background: #ffd166;
+  background: var(--point-marker-fill);
   border-color: #f1cf65;
   width: 16px;
   height: 16px;
@@ -1988,6 +2648,269 @@ body {
   width: min(420px, 100%);
 }
 
+/* ---------------------------------------------------------------------------
+ * Body measurements — people down the left, their numbers on the right.
+ * ------------------------------------------------------------------------- */
+
+.measure-modal {
+  width: min(980px, 100%);
+  height: min(84vh, 780px);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.measure-modal .studio-modal-header {
+  flex: 0 0 auto;
+  padding: 16px 20px 12px;
+  margin-bottom: 0;
+}
+
+.measure-layout {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 210px 1fr;
+}
+
+.measure-sets {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
+}
+
+.measure-sets-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 10px 8px 14px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.measure-sets-buttons {
+  display: flex;
+  gap: 3px;
+}
+
+.measure-sets-buttons button {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.measure-sets-buttons button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.measure-sets-buttons button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.measure-sets-buttons button.is-danger:hover:not(:disabled) {
+  border-color: #c45c4a;
+  color: #f0a091;
+}
+
+.measure-set-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.measure-set-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+
+.measure-set-tab:hover {
+  background: #3a342c;
+}
+
+.measure-set-tab.is-active {
+  background: #3a342c;
+  border-color: var(--accent);
+}
+
+.measure-set-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.measure-set-tab.is-active .measure-set-name {
+  color: #f1cf65;
+}
+
+.measure-set-count {
+  font: 10px var(--mono);
+  color: var(--muted);
+}
+
+.measure-fields {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.measure-fields-head {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.measure-name {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.measure-name input {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--ink);
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 13px;
+}
+
+.measure-unit {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.measure-unit select {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--ink);
+  padding: 5px 6px;
+  font: inherit;
+  font-size: 13px;
+}
+
+.measure-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 20px 16px;
+}
+
+.measure-group h4 {
+  margin: 16px 0 8px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.measure-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 6px 18px;
+}
+
+.measure-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 3px 0;
+  font-size: 13px;
+  cursor: help;
+}
+
+.measure-field-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+}
+
+.measure-field-input {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.measure-field input {
+  width: 74px;
+  text-align: right;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--ink);
+  padding: 4px 6px;
+  font: 13px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.measure-field input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.measure-field-unit {
+  width: 20px;
+  font: 11px var(--mono);
+  color: var(--muted);
+}
+
+.measure-actions {
+  flex: 0 0 auto;
+  align-items: center;
+  margin: 0;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border);
+}
+
+.measure-hint {
+  margin-right: auto;
+  font-size: 12px;
+}
+
 .studio-modal-header {
   display: flex;
   align-items: center;
@@ -2191,7 +3114,10 @@ body {
  */
 .canvas-node:not(.is-expanded) .pattern-toolbar,
 .canvas-node:not(.is-expanded) .pattern-xray-bar,
-.canvas-node:not(.is-expanded) .pattern-avatar-bar {
+.canvas-node:not(.is-expanded) .pattern-avatar-bar,
+.canvas-node:not(.is-expanded) .pattern-point-bar,
+.canvas-node:not(.is-expanded) .pattern-block-bar,
+.canvas-node:not(.is-expanded) .pattern-ruler-bar {
   display: none !important;
 }
 
