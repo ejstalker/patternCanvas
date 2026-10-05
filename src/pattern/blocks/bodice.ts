@@ -1,5 +1,11 @@
 import type { BlockVariableDecl, Vec2 } from '../../project/types';
-import type { BlockDefinition, BlockPieceSpec, BlockPointSpec } from './spec';
+import { mirroredPiece } from './spec';
+import type {
+  BlockDefinition,
+  BlockPieceSpec,
+  BlockPointSpec,
+  BlockSeamSpec,
+} from './spec';
 
 /**
  * Front and back bodice blocks.
@@ -39,6 +45,8 @@ const UNDERARM_EASE_CM = 1.27;
 const FRONT_DART_INTAKE_CM = 2.54;
 /** 1 1/2" back waist dart. */
 const BACK_DART_INTAKE_CM = 3.81;
+/** How far the mirrored half stands off the half it mirrors. */
+const BODICE_GAP_CM = 6;
 /**
  * Where the scye's hollow sits, and how hard its ends are turned.
  *
@@ -495,6 +503,33 @@ function dartVariables(
   ];
 }
 
+/**
+ * The seams that make one garment out of a bodice front and a bodice back.
+ *
+ * Both blocks declare the same list. A front on its own has nothing to sew — its
+ * other half is its mirror, joined to it at a fold — so each of these names the
+ * other block, and whichever of the two is placed second is the one that can
+ * make them. Both halves are covered, the mirror pair included.
+ */
+function torsoSeams(): BlockSeamSpec[] {
+  const seams: BlockSeamSpec[] = [];
+  for (const [fromKey, toKey] of [
+    ['underarm', 'waistSide'],
+    ['neckShoulder', 'shoulderTip'],
+  ] as const) {
+    for (const [front, back] of [
+      ['bodiceFront', 'bodiceBack'],
+      ['bodiceFrontMirror', 'bodiceBackMirror'],
+    ] as const) {
+      seams.push({
+        a: { definitionId: 'bodiceFront', role: front, fromKey, toKey },
+        b: { definitionId: 'bodiceBack', role: back, fromKey, toKey },
+      });
+    }
+  }
+  return seams;
+}
+
 const FRONT_DEFAULTS: TorsoGeometry = {
   neckWidth: 7.3,
   neckDepth: 7,
@@ -534,9 +569,8 @@ export const BODICE_FRONT_BLOCK: BlockDefinition = {
   name: 'Bodice front',
   category: 'bodice',
   description:
-    'Fitted front bodice with a bust-point waist dart. One width, set from the bust.',
+    'Fitted front bodice with a bust-point waist dart, drafted with its mirrored half. One width, set from the bust.',
   source: 'Drafting the Bodice Front — dresspatternmaking.com, upper-bust system',
-  roles: ['bodiceFront'],
   variables: [
     ...necklineVariables(FRONT_DEFAULTS.neckDepth, 16, FRONT_DEFAULTS.neckCurve),
     ...bodyVariables(
@@ -553,7 +587,14 @@ export const BODICE_FRONT_BLOCK: BlockDefinition = {
       'How much the dart takes out — roughly the bust width less the waist width.'
     ),
   ],
-  build: (values, origin) => [buildTorso(readGeometry(values, FRONT_DEFAULTS), 'front', origin)],
+  roles: ['bodiceFront', 'bodiceFrontMirror'],
+  seams: torsoSeams,
+  build: (values, origin) => {
+    // A bodice is drafted from the centre front out to the side seam — half a
+    // body — so the draft is not finished until the other half is beside it.
+    const piece = buildTorso(readGeometry(values, FRONT_DEFAULTS), 'front', origin);
+    return [piece, mirroredPiece(piece, 'bodiceFrontMirror', BODICE_GAP_CM)];
+  },
 };
 
 export const BODICE_BACK_BLOCK: BlockDefinition = {
@@ -561,9 +602,10 @@ export const BODICE_BACK_BLOCK: BlockDefinition = {
   name: 'Bodice back',
   category: 'bodice',
   description:
-    'Fitted back bodice with a waist dart and a shallow scoop neck, drafted off the same skeleton as the front.',
+    'Fitted back bodice with a waist dart and a shallow scoop neck, drafted with its mirrored half off the same skeleton as the front.',
   source: 'Drafting the Bodice Front — dresspatternmaking.com, upper-bust system',
-  roles: ['bodiceBack'],
+  roles: ['bodiceBack', 'bodiceBackMirror'],
+  seams: torsoSeams,
   variables: [
     ...necklineVariables(BACK_DEFAULTS.neckDepth, 12, BACK_DEFAULTS.neckCurve),
     ...bodyVariables(
@@ -582,5 +624,8 @@ export const BODICE_BACK_BLOCK: BlockDefinition = {
       'How much the dart takes out. The back waist usually needs a wider dart than the front.'
     ),
   ],
-  build: (values, origin) => [buildTorso(readGeometry(values, BACK_DEFAULTS), 'back', origin)],
+  build: (values, origin) => {
+    const piece = buildTorso(readGeometry(values, BACK_DEFAULTS), 'back', origin);
+    return [piece, mirroredPiece(piece, 'bodiceBackMirror', BODICE_GAP_CM)];
+  },
 };

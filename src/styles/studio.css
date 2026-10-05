@@ -2171,6 +2171,95 @@ body {
   color: #f1cf65;
 }
 
+/* Sew tool — third in the column, under Move/Rotate and Snap to quadrant. */
+.sim-sew-toggle {
+  position: absolute;
+  top: 64px;
+  left: 8px;
+  z-index: 6;
+  padding: 4px 9px;
+  border-radius: 4px;
+  border: 1px solid rgba(242, 235, 227, 0.25);
+  background: rgba(28, 26, 23, 0.82);
+  color: #f2ebe3;
+  cursor: pointer;
+  font: 11px var(--mono);
+  white-space: nowrap;
+  user-select: none;
+}
+
+.sim-sew-toggle:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.sim-sew-toggle.is-active {
+  border-color: #d4a017;
+  background: rgba(212, 160, 23, 0.18);
+  color: #f1cf65;
+}
+
+.sim-sew-toggle:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/*
+ * The drape viewport's tools are one row of Moves plus the points toggle, so its
+ * sew button sits on the next row rather than under a whole column of its own.
+ */
+.node-simViewport .sim-sew-toggle {
+  top: 36px;
+  left: 8px;
+}
+
+/* Cloth edge highlight for the sew tool: layout-space lines over the fabric. */
+.cloth-edge-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  overflow: hidden;
+  pointer-events: none;
+  user-select: none;
+}
+
+.cloth-edge-layer {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.cloth-edge-line {
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.cloth-edge-line.is-hover {
+  stroke: rgba(255, 198, 92, 0.95);
+  stroke-width: 3.5;
+  stroke-dasharray: 7 4;
+  filter: drop-shadow(0 0 4px rgba(0, 0, 0, 0.7));
+}
+
+.cloth-edge-line.is-source {
+  stroke: rgba(212, 160, 23, 1);
+  stroke-width: 5;
+  filter: drop-shadow(0 0 4px rgba(0, 0, 0, 0.7));
+}
+
+/* The end the edge is read from — the one that pairs with the other edge's end. */
+.cloth-edge-start {
+  fill: #f1cf65;
+  stroke: rgba(28, 26, 23, 0.9);
+  stroke-width: 1.5;
+  filter: drop-shadow(0 0 3px rgba(0, 0, 0, 0.7));
+}
+
+.cloth-edge-start.is-hover {
+  fill: #ffc65c;
+  opacity: 0.8;
+}
+
 /* "Draw pattern points" — sits to the right of the Move/Rotate toggle. */
 .sim-points-toggle {
   position: absolute;
@@ -3519,6 +3608,7 @@ body {
  */
 .node-simViewport:not(.is-expanded) .sim-transform-toggle,
 .node-simViewport:not(.is-expanded) .sim-points-toggle,
+.node-simViewport:not(.is-expanded) .sim-sew-toggle,
 .node-simViewport:not(.is-expanded) .viewport-gnomon {
   display: none !important;
 }

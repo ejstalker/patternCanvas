@@ -1,7 +1,13 @@
-import type { BlockInstance, PatternDocument, PatternPiece, Vec2 } from '../../project/types';
+import type { BlockInstance, PatternDocument, PatternPiece, SeamEdgeRef, Vec2 } from '../../project/types';
 import type { MeasurementSet } from '../../project/measurements';
 import { defaultBindings, resolveBlockValues } from './resolve';
-import { materializePiece, type BlockDefinition } from './spec';
+import {
+  materializePiece,
+  blockPieceId,
+  blockPointId,
+  type BlockDefinition,
+  type BlockEdgeKey,
+} from './spec';
 
 /**
  * Turning a definition plus an instance into real pattern pieces.
@@ -13,6 +19,98 @@ import { materializePiece, type BlockDefinition } from './spec';
  */
 
 export type GeneratedPiece = { role: string; piece: PatternPiece };
+
+/** One seam a block wants made, as real edge references. */
+export type GeneratedSeam = { a: SeamEdgeRef; b: SeamEdgeRef };
+
+/** A block placed on the canvas: its instance and the definition behind it. */
+export type PlacedBlock = { instance: BlockInstance; definition: BlockDefinition };
+
+/**
+ * The seams a block wants, with ids attached — and only the ones it can
+ * actually make.
+ *
+ * `partner` finds the placed block of another definition, and returning null
+ * drops the seam. That is what lets a bodice front and back each declare the
+ * seam between them: the one placed first finds nothing on the other side and
+ * quietly does nothing, and the one placed second makes every seam across the
+ * pair. Two blocks of the same definition are not told apart — the first placed
+ * is taken as the partner.
+ *
+ * Each edge is written the way the piece itself winds it, which is the only form
+ * the rest of the app can read: `edgeIndexForPointIds` and everything built on
+ * it — validity, sampling, connectors, the mesh — match `fromPointId` followed
+ * by `toPointId` around the outline and call a reference named the other way
+ * round stale.
+ *
+ * The direction the seam was declared in is carried by `t0`/`t1` instead. That
+ * is what pairs the ends up, and it matters for the mirrored halves: a mirror is
+ * wound in reverse, so the same edge is named backwards on it, and both sides of
+ * a seam read from `fromKey` to `toKey` only if the reversed one is given a
+ * span running 1 → 0.
+ */
+export function generateBlockSeams(
+  definition: BlockDefinition,
+  instance: BlockInstance,
+  set: MeasurementSet | null | undefined,
+  partner: (definitionId: string) => PlacedBlock | null
+): GeneratedSeam[] {
+  if (!definition.seams) return [];
+
+  // Point keys per role, so an edge can be recognised whichever way it is named.
+  const winding = new Map<string, string[]>();
+  const keysFor = (def: BlockDefinition, source: BlockInstance, role: string): string[] => {
+    const key = `${source.id}:${role}`;
+    const hit = winding.get(key);
+    if (hit) return hit;
+    const spec = def
+      .build(resolveBlockValues(def, source, set), { x: 0, y: 0 })
+      .find((piece) => piece.role === role);
+    const keys = spec ? spec.points.map((point) => point.key) : [];
+    winding.set(key, keys);
+    return keys;
+  };
+
+  const resolve = (edge: BlockEdgeKey): SeamEdgeRef | null => {
+    const foreign = edge.definitionId && edge.definitionId !== definition.id;
+    const other = foreign ? partner(edge.definitionId!) : null;
+    if (foreign && !other) return null;
+    const def = other?.definition ?? definition;
+    const source = other?.instance ?? instance;
+
+    const keys = keysFor(def, source, edge.role);
+    const n = keys.length;
+    if (n < 2) return null;
+    const from = keys.indexOf(edge.fromKey);
+    const to = keys.indexOf(edge.toKey);
+    if (from < 0 || to < 0) return null;
+    const forward = (from + 1) % n === to;
+    const backward = (to + 1) % n === from;
+    if (!forward && !backward) return null;
+
+    // Ids in winding order, direction in the span. `t0` is whichever of the two
+    // the span starts at, so each side of a seam runs fromKey → toKey.
+    const [woundFrom, woundTo] = forward
+      ? [edge.fromKey, edge.toKey]
+      : [edge.toKey, edge.fromKey];
+    return {
+      pieceId: blockPieceId(source.id, edge.role),
+      fromPointId: blockPointId(source.id, edge.role, woundFrom),
+      toPointId: blockPointId(source.id, edge.role, woundTo),
+      t0: forward ? 0 : 1,
+      t1: forward ? 1 : 0,
+    };
+  };
+
+  const values = resolveBlockValues(definition, instance, set);
+  const out: GeneratedSeam[] = [];
+  for (const seam of definition.seams(values)) {
+    const a = resolve(seam.a);
+    const b = resolve(seam.b);
+    if (a && b) out.push({ a, b });
+  }
+  return out;
+}
 
 /** Rebuild a block's outlines from its resolved variables. */
 export function generateBlockPieces(
@@ -27,7 +125,6 @@ export function generateBlockPieces(
 }
 
 let seq = 0;
-
 function blockId(): string {
   seq += 1;
   return `blk_${Date.now().toString(36)}_${seq.toString(36)}`;

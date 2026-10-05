@@ -244,11 +244,20 @@ export class MoveGizmo {
   }
 }
 
-/** Project a world point to CSS pixels relative to the canvas element (layout box). */
+/**
+ * Project a world point to CSS pixels relative to the canvas element (layout box).
+ *
+ * Typed against the pieces it actually reads rather than Camera/HTMLCanvasElement,
+ * so overlays that only ever see a viewport through accessors can still use it.
+ */
 export function worldToCanvasPx(
   world: vec3,
-  camera: Camera,
-  canvas: HTMLCanvasElement
+  camera: { getViewProjectMtx(): mat4 },
+  canvas: {
+    clientWidth: number;
+    clientHeight: number;
+    getBoundingClientRect(): { width: number; height: number };
+  }
 ): { x: number; y: number; behind: boolean } | null {
   const vp = camera.getViewProjectMtx();
   const clip = vec4.fromValues(world[0], world[1], world[2], 1);

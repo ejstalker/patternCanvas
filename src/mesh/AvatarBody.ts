@@ -25,8 +25,25 @@ export class AvatarBody {
   private boundsMax: vec3 = vec3.create();
 
   private collisionTris: CollisionTri[] = [];
-  private grid = new Map<string, number[]>();
+  private grid = new Map<number, number[]>();
   private cellSize = 1.0;
+  /**
+   * Scratch for `queryCandidates`.
+   *
+   * Collision is resolved per particle per substep — tens of thousands of times
+   * a frame — so the query runs on reused buffers: a stamp per triangle instead
+   * of a `Set` of indices, and one shared output array instead of two fresh
+   * allocations per call. It also means the result is only valid until the next
+   * query, which is how the only caller uses it.
+   */
+  private triStamp = new Int32Array(0);
+  private triStampGeneration = 0;
+  private candidateScratch: number[] = [];
+  private readonly closestScratch = vec3.create();
+  private readonly toParticleScratch = vec3.create();
+  private readonly normalVelScratch = vec3.create();
+  private readonly bestPointScratch = vec3.create();
+  private readonly bestNormalScratch = vec3.create();
   private sdfVolume: SdfVolume | null = null;
 
   private constructor() {}
@@ -242,8 +259,18 @@ export class AvatarBody {
     this.indexBuffer.unmap();
   }
 
-  private cellKey(ix: number, iy: number, iz: number): string {
-    return `${ix},${iy},${iz}`;
+  /**
+   * Exact integer key for a cell.
+   *
+   * Three 17-bit fields, so any cell index a body can produce (±65k) packs into
+   * one number that fits a double exactly. A `Map` keyed by a number avoids the
+   * template string this used to build — one per cell visited, and the query
+   * visits up to `(2r+1)³` of them for every particle every substep.
+   */
+  private cellKey(ix: number, iy: number, iz: number): number {
+    const BIAS = 1 << 16;
+    const SPAN = 1 << 17;
+    return ((ix + BIAS) * SPAN + (iy + BIAS)) * SPAN + (iz + BIAS);
   }
 
   private cellIndex(p: vec3): [number, number, number] {
@@ -315,19 +342,27 @@ export class AvatarBody {
     }
   }
 
-  private queryCandidates(p: vec3, radius: number): number[] {
+  private queryCandidates(p: vec3, radius: number): readonly number[] {
     const r = Math.ceil(radius / this.cellSize) + 1;
-    const [cx, cy, cz] = this.cellIndex(p);
-    const seen = new Set<number>();
-    const out: number[] = [];
+    const cx = Math.floor(p[0] / this.cellSize);
+    const cy = Math.floor(p[1] / this.cellSize);
+    const cz = Math.floor(p[2] / this.cellSize);
+    const out = this.candidateScratch;
+    out.length = 0;
+    if (this.triStamp.length !== this.collisionTris.length) {
+      this.triStamp = new Int32Array(this.collisionTris.length);
+      this.triStampGeneration = 0;
+    }
+    const stamp = ++this.triStampGeneration;
+    const stamps = this.triStamp;
     for (let ix = cx - r; ix <= cx + r; ix++) {
       for (let iy = cy - r; iy <= cy + r; iy++) {
         for (let iz = cz - r; iz <= cz + r; iz++) {
           const bucket = this.grid.get(this.cellKey(ix, iy, iz));
           if (!bucket) continue;
           for (const ti of bucket) {
-            if (seen.has(ti)) continue;
-            seen.add(ti);
+            if (stamps[ti] === stamp) continue;
+            stamps[ti] = stamp;
             out.push(ti);
           }
         }
@@ -363,11 +398,13 @@ export class AvatarBody {
     const searchRadius = margin + 0.75;
     const candidates = this.queryCandidates(pos, searchRadius);
 
-    const closest = vec3.create();
-    const toParticle = vec3.create();
+    // Reused, not allocated: this runs on every particle of every substep.
+    const closest = this.closestScratch;
+    const toParticle = this.toParticleScratch;
+    const bestPoint = this.bestPointScratch;
+    const bestNormal = this.bestNormalScratch;
+    let found = false;
     let bestDistSq = searchRadius * searchRadius;
-    let bestPoint: vec3 | null = null;
-    let bestNormal: vec3 | null = null;
 
     for (const ti of candidates) {
       const tri = this.collisionTris[ti];
@@ -375,31 +412,30 @@ export class AvatarBody {
       const dSq = vec3.squaredDistance(pos, closest);
       if (dSq >= bestDistSq) continue;
       bestDistSq = dSq;
-      bestPoint = vec3.clone(closest);
-      bestNormal = vec3.clone(tri.normal);
+      found = true;
+      vec3.copy(bestPoint, closest);
+      vec3.copy(bestNormal, tri.normal);
       vec3.sub(toParticle, pos, closest);
       if (vec3.dot(bestNormal, toParticle) < 0) vec3.negate(bestNormal, bestNormal);
     }
 
-    if (!bestPoint || !bestNormal || bestDistSq >= margin * margin) return;
+    if (!found || bestDistSq >= margin * margin) return;
 
     vec3.scaleAndAdd(pos, bestPoint, bestNormal, margin);
 
     const vel = p.getVelocity();
     const velDotNormal = vec3.dot(vel, bestNormal);
     if (velDotNormal < 0) {
-      const correction = vec3.create();
-      vec3.scale(correction, bestNormal, velDotNormal);
-      vec3.sub(vel, vel, correction);
+      // Remove the closing component of the velocity; then friction on the rest.
+      vec3.scaleAndAdd(vel, vel, bestNormal, -velDotNormal);
     }
 
     const vDotN = vec3.dot(vel, bestNormal);
-    const normalVel = vec3.create();
+    const normalVel = this.normalVelScratch;
     vec3.scale(normalVel, bestNormal, vDotN);
-    const tangentVel = vec3.create();
-    vec3.sub(tangentVel, vel, normalVel);
-    vec3.scale(tangentVel, tangentVel, p.getContactFrictionRetain());
-    vec3.add(vel, normalVel, tangentVel);
+    vec3.sub(vel, vel, normalVel);
+    vec3.scale(vel, vel, p.getContactFrictionRetain());
+    vec3.add(vel, vel, normalVel);
   }
 
   getModelMatrix(): mat4 {

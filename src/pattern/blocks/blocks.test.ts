@@ -9,13 +9,21 @@ import { bindingValueCm, clampToDeclared, defaultBindings, resolveBlockValues, s
 import {
   createBlockInstance,
   generateBlockPieces,
+  generateBlockSeams,
   nextBlockOrigin,
   spliceBlockPieces,
 } from './generate';
 import { drivenPointIds } from './driven';
+import {
+  edgeLengthByPointIds,
+  pointOnEdgeAtArcFractionInSpan,
+  sampleEdgeByPointIds,
+} from '../geometry';
 import { materializePiece, blockPieceId, blockPointId } from './spec';
 import { SKIRT_BLOCK, dartLayout } from './skirt';
+import { BODICE_BACK_BLOCK, BODICE_FRONT_BLOCK } from './bodice';
 import { BLOCK_DEFINITIONS, blockDefinitionsByCategory, getBlockDefinition } from './registry';
+import type { BlockDefinition } from './spec';
 
 const MEASUREMENT_IDS = new Set(MEASUREMENT_FIELDS.map((field) => field.id));
 
@@ -144,9 +152,91 @@ describe('dart layout', () => {
 describe('skirt block geometry', () => {
   const values = resolveBlockValues(SKIRT_BLOCK, instance(), null);
 
-  it('produces back, front and waistband in that order', () => {
+  it('produces each panel with its mirrored half, then a band for each panel', () => {
     const pieces = SKIRT_BLOCK.build(values, { x: 0, y: 0 });
-    expect(pieces.map((p) => p.role)).toEqual(['skirtBack', 'skirtFront', 'waistband']);
+    expect(pieces.map((p) => p.role)).toEqual([
+      'skirtBack',
+      'skirtBackMirror',
+      'skirtFront',
+      'skirtFrontMirror',
+      'waistbandBack',
+      'waistbandBackMirror',
+      'waistbandFront',
+      'waistbandFrontMirror',
+    ]);
+  });
+
+  it('puts a band point wherever a dart closes, so the seam is single edges', () => {
+    for (const [role, bandRole, prefix] of [
+      ['skirtBack', 'waistbandBack', 'back'],
+      ['skirtFront', 'waistbandFront', 'front'],
+      // The mirrored half is the same garment turned round, so its band has to
+      // line up with it just the same — otherwise the extra copy is unusable.
+      ['skirtBackMirror', 'waistbandBackMirror', 'back'],
+      ['skirtFrontMirror', 'waistbandFrontMirror', 'front'],
+    ] as const) {
+      for (const count of [1, 2, 3]) {
+        const tuned = { ...values, [`${prefix}DartCount`]: count };
+        const pieces = SKIRT_BLOCK.build(tuned, { x: 0, y: 0 });
+        const panel = pieces.find((p) => p.role === role)!;
+        const band = pieces.find((p) => p.role === bandRole)!;
+        const panelX = (key: string) => panel.points.find((p) => p.key === key)!.anchor.x;
+        const centreX = panelX('centreWaist');
+
+        // The waist runs a band gets sewn to: everything between two darts,
+        // with the notches left out. They are the panel's own edges, so their
+        // flat lengths are what the band has to match.
+        //
+        // Walked out from the centre rather than in winding order: a mirrored
+        // panel is wound the other way, and the runs are the same either way.
+        const waist = panel.points
+          .filter(
+            (p) =>
+              p.key === 'centreWaist' ||
+              p.key === 'waistSide' ||
+              /^dart\d+[ab]$/.test(p.key)
+          )
+          .map((p) => ({ key: p.key, offset: Math.abs(p.anchor.x - centreX) }))
+          .sort((a, b) => a.offset - b.offset);
+
+        const runs: number[] = [];
+        let previous = centreX;
+        for (const point of waist) {
+          if (/^dart\d+b$/.test(point.key)) {
+            // The dart's far leg: closing the dart brings the waist back here,
+            // so the next run is measured from it and not from the near leg.
+            previous = centreX + point.offset;
+            continue;
+          }
+          if (/^dart\d+a$/.test(point.key) || point.key === 'waistSide') {
+            runs.push(Math.abs(centreX + point.offset - previous));
+            previous = centreX + point.offset;
+          }
+        }
+
+        // The band's seam between the centre and the side, sorted out from the
+        // centre the same way — a mirrored band is wound in reverse, so array
+        // order is not seam order.
+        const seamY = Math.min(...band.points.map((p) => p.anchor.y));
+        const bandCentreX = band.points.find((p) => p.key === 'bandCentre')!.anchor.x;
+        const seam = band.points
+          .filter(
+            (p) =>
+              p.anchor.y === seamY &&
+              (p.key === 'bandCentre' ||
+                /^bandDart\d+$/.test(p.key) ||
+                p.key === 'bandSeamEnd')
+          )
+          .map((p) => Math.abs(p.anchor.x - bandCentreX))
+          .sort((a, b) => a - b);
+
+        expect(seam.length, `${role} ${count}`).toBe(runs.length + 1);
+        for (let i = 1; i < seam.length; i++) {
+          const bandRun = seam[i]! - seam[i - 1]!;
+          expect(bandRun, `${role} dart ${count}, run ${i}`).toBeCloseTo(runs[i - 1]!, 6);
+        }
+      }
+    }
   });
 
   it('gives every piece a closed outline of at least four points', () => {
@@ -189,13 +279,27 @@ describe('skirt block geometry', () => {
     }
   });
 
-  it('lays the front panel clear of the back, and the band below both', () => {
-    const [back, front, band] = SKIRT_BLOCK.build(values, { x: 0, y: 0 });
-    const backMax = Math.max(...back!.points.map((p) => p.anchor.x));
-    const frontMin = Math.min(...front!.points.map((p) => p.anchor.x));
-    expect(frontMin).toBeGreaterThan(backMax);
-    const skirtMinY = Math.min(...band!.points.map((p) => p.anchor.y));
-    expect(skirtMinY).toBeGreaterThan(values.skirtLength);
+  it('lays each panel clear of the next, and both bands below the lot', () => {
+    const pieces = SKIRT_BLOCK.build(values, { x: 0, y: 0 });
+    const spanOf = (role: string) => {
+      const xs = pieces.find((p) => p.role === role)!.points.map((p) => p.anchor.x);
+      return { min: Math.min(...xs), max: Math.max(...xs) };
+    };
+    const row = ['skirtBack', 'skirtBackMirror', 'skirtFront', 'skirtFrontMirror'];
+    for (let i = 1; i < row.length; i++) {
+      expect(spanOf(row[i]!).min, row[i]).toBeGreaterThan(spanOf(row[i - 1]!).max);
+    }
+    for (const role of ['waistbandBack', 'waistbandBackMirror', 'waistbandFront', 'waistbandFrontMirror']) {
+      const band = pieces.find((p) => p.role === role)!;
+      expect(Math.min(...band.points.map((p) => p.anchor.y)), role).toBeGreaterThan(
+        values.skirtLength
+      );
+    }
+    // The bands pair up along their row exactly as the panels do.
+    const bandRow = ['waistbandBack', 'waistbandBackMirror', 'waistbandFront', 'waistbandFrontMirror'];
+    for (let i = 1; i < bandRow.length; i++) {
+      expect(spanOf(bandRow[i]!).min, bandRow[i]).toBeGreaterThan(spanOf(bandRow[i - 1]!).max);
+    }
   });
 
   it('follows the origin it is given', () => {
@@ -209,11 +313,236 @@ describe('skirt block geometry', () => {
     // A 96 cm hip should give two panels of a quarter hip plus ease, side by side.
     const set = person({ hip: 96, waist: 73, hipDepth: 20, sideHipDepth: 21 });
     const measured = resolveBlockValues(SKIRT_BLOCK, instance(defaultBindings(SKIRT_BLOCK, set)), set);
-    const [back, front] = SKIRT_BLOCK.build(measured, { x: 0, y: 0 });
+    const built = SKIRT_BLOCK.build(measured, { x: 0, y: 0 });
+    const back = built.find((p) => p.role === 'skirtBack')!;
+    const front = built.find((p) => p.role === 'skirtFront')!;
     expect(measured.hipArcBack).toBeCloseTo(96 / 4 + 1.27, 6);
-    expect(Math.max(...back!.points.map((p) => p.anchor.x))).toBeCloseTo(25.27, 6);
+    expect(Math.max(...back.points.map((p) => p.anchor.x))).toBeCloseTo(25.27, 6);
     expect(measured.hipDepth).toBeCloseTo(20, 6);
-    expect(front!.points.length).toBeGreaterThan(4);
+    expect(front.points.length).toBeGreaterThan(4);
+  });
+});
+
+describe('mirrored halves', () => {
+  const built = (definition: (typeof BLOCK_DEFINITIONS)[number]) =>
+    definition.build(resolveBlockValues(definition, instance(), null), { x: 0, y: 0 });
+
+  const pairsOf = (definition: (typeof BLOCK_DEFINITIONS)[number]) => {
+    const pieces = built(definition);
+    return pieces
+      .filter((piece) => piece.role.endsWith('Mirror'))
+      .map((mirror) => ({
+        mirror,
+        source: pieces.find((p) => p.role === mirror.role.replace(/Mirror$/, ''))!,
+      }));
+  };
+
+  const widthOf = (points: Array<{ anchor: { x: number } }>) => {
+    const xs = points.map((p) => p.anchor.x);
+    return Math.max(...xs) - Math.min(...xs);
+  };
+
+  it('gives every drafted half its opposite half, keyed the same', () => {
+    for (const definition of BLOCK_DEFINITIONS) {
+      const pairs = pairsOf(definition);
+      expect(pairs.length, definition.id).toBeGreaterThan(0);
+      for (const { mirror, source } of pairs) {
+        expect(source, mirror.role).toBeDefined();
+        expect(mirror.name).toBe(`${source.name} (mirrored)`);
+        // Same keys, so the two halves stay comparable point for point and the
+        // hover highlight can name them both.
+        expect([...mirror.points].map((p) => p.key).sort()).toEqual(
+          [...source.points].map((p) => p.key).sort()
+        );
+      }
+    }
+  });
+
+  it('reflects rather than rotates, and winds the same way round', () => {
+    for (const definition of BLOCK_DEFINITIONS) {
+      for (const { mirror, source } of pairsOf(definition)) {
+        // The outline runs the other way round, and every handle swapped ends
+        // with it. Reflecting the anchors alone still draws the right *shape*,
+        // but winds it backwards, which would leave every edge facing the wrong
+        // way for triangulation and for the sew tools.
+        expect([...mirror.points].map((p) => p.key)).toEqual(
+          [...source.points].map((p) => p.key).reverse()
+        );
+        // A reflection plus a translation leaves the heights untouched and the
+        // sum of the x coordinates constant — which is what tells a mirror from
+        // a rotation, however the piece is then set down.
+        let sum: number | null = null;
+        for (const point of mirror.points) {
+          const original = source.points.find((p) => p.key === point.key)!;
+          expect(point.anchor.y, point.key).toBeCloseTo(original.anchor.y, 9);
+          const next = original.anchor.x + point.anchor.x;
+          if (sum === null) sum = next;
+          else expect(next, point.key).toBeCloseTo(sum, 9);
+        }
+      }
+    }
+  });
+
+  it('sets each half down clear of the one it mirrors', () => {
+    for (const definition of BLOCK_DEFINITIONS) {
+      for (const { mirror, source } of pairsOf(definition)) {
+        expect(Math.min(...mirror.points.map((p) => p.anchor.x))).toBeGreaterThan(
+          Math.max(...source.points.map((p) => p.anchor.x))
+        );
+        // Same width, so the pair really is a pair.
+        expect(widthOf(mirror.points)).toBeCloseTo(widthOf(source.points), 9);
+      }
+    }
+  });
+});
+
+describe('automatic seams', () => {
+  /** The seams a definition can make, given which blocks are on the canvas. */
+  const seamsFor = (
+    definition: BlockDefinition,
+    self: string,
+    others: Record<string, string> = {}
+  ) =>
+    generateBlockSeams(definition, { ...instance(), id: self }, null, (definitionId) => {
+      const partnerId = others[definitionId];
+      const partnerDefinition = partnerId ? getBlockDefinition(definitionId) : null;
+      return partnerId && partnerDefinition
+        ? { instance: { ...instance(), id: partnerId }, definition: partnerDefinition }
+        : null;
+    });
+
+  /** Every piece the seams of these blocks could name, by id. */
+  const piecePool = (
+    definition: BlockDefinition,
+    self: string,
+    others: Record<string, string>
+  ) => {
+    const pool = new Map<string, PatternPiece>();
+    const add = (defId: string, instanceId: string) => {
+      const def = getBlockDefinition(defId);
+      if (!def) return;
+      for (const { piece } of generateBlockPieces(def, { ...instance(), id: instanceId }, null)) {
+        pool.set(piece.id, piece);
+      }
+    };
+    add(definition.id, self);
+    for (const [defId, instanceId] of Object.entries(others)) add(defId, instanceId);
+    return pool;
+  };
+
+  it('names edges that exist on the pieces it sews', () => {
+    const cases: Array<[BlockDefinition, string, Record<string, string>]> = [
+      [SKIRT_BLOCK, 's1', {}],
+      [BODICE_FRONT_BLOCK, 'f1', { bodiceBack: 'b1' }],
+      [BODICE_BACK_BLOCK, 'b1', { bodiceFront: 'f1' }],
+    ];
+    for (const [definition, self, others] of cases) {
+      const seams = seamsFor(definition, self, others);
+      expect(seams.length, definition.id).toBeGreaterThan(0);
+      const pool = piecePool(definition, self, others);
+      for (const { a, b } of seams) {
+        for (const ref of [a, b]) {
+          const piece = pool.get(ref.pieceId);
+          expect(piece, ref.pieceId).toBeDefined();
+          // The ids have to follow the piece's own winding: that is how the app
+          // resolves an edge, so a reference named the other way round reads as
+          // stale and neither draws nor sews.
+          expect(
+            sampleEdgeByPointIds(piece!, ref.fromPointId, ref.toPointId),
+            `${ref.pieceId} ${ref.fromPointId}->${ref.toPointId}`
+          ).not.toBeNull();
+          // A whole edge, not part of one.
+          expect(Math.abs(ref.t1 - ref.t0), ref.pieceId).toBeCloseTo(1, 9);
+        }
+      }
+    }
+  });
+
+  it('reads every seam from the point it declares first to the one it declares second', () => {
+    // The mirrored pieces are wound in reverse, so the same edge is named
+    // backwards on them. Left that way the reference reads as stale and nothing
+    // draws or sews; flipped without also swapping the ids, the two ends pair up
+    // crosswise and a waistband gets sewn on back to front. So the span has to
+    // *start* at the key the seam declares first, whichever way the piece winds.
+    const seams = seamsFor(SKIRT_BLOCK, 's1');
+    const declared = SKIRT_BLOCK.seams!(resolveBlockValues(SKIRT_BLOCK, instance(), null));
+    expect(seams).toHaveLength(declared.length);
+    const pool = piecePool(SKIRT_BLOCK, 's1', {});
+
+    for (let i = 0; i < seams.length; i++) {
+      for (const side of ['a', 'b'] as const) {
+        const key = declared[i][side];
+        const ref = seams[i][side];
+        const piece = pool.get(ref.pieceId)!;
+        const along = (s: number) =>
+          pointOnEdgeAtArcFractionInSpan(
+            piece,
+            ref.fromPointId,
+            ref.toPointId,
+            ref.t0,
+            ref.t1,
+            s
+          )!.pos;
+        const corner = (k: string) =>
+          piece.points.find((p) => p.id === blockPointId('s1', key.role, k))!.anchor;
+
+        const where = `${key.role} ${key.fromKey}→${key.toKey} at edge ${i}`;
+        expect(along(0).x, `${where} starts at`).toBeCloseTo(corner(key.fromKey).x, 6);
+        expect(along(0).y, `${where} starts at`).toBeCloseTo(corner(key.fromKey).y, 6);
+        expect(along(1).x, `${where} ends at`).toBeCloseTo(corner(key.toKey).x, 6);
+        expect(along(1).y, `${where} ends at`).toBeCloseTo(corner(key.toKey).y, 6);
+      }
+    }
+  });
+
+  it('waits for the other block before sewing two of them together', () => {
+    // A bodice front on its own has nothing to sew: its other half is its
+    // mirror, joined at a fold. The seam appears with the back.
+    expect(seamsFor(BODICE_FRONT_BLOCK, 'f1')).toHaveLength(0);
+    expect(seamsFor(BODICE_BACK_BLOCK, 'b1')).toHaveLength(0);
+    // Two sides plus two shoulders, both halves covered.
+    expect(seamsFor(BODICE_BACK_BLOCK, 'b1', { bodiceFront: 'f1' })).toHaveLength(4);
+    expect(seamsFor(BODICE_FRONT_BLOCK, 'f1', { bodiceBack: 'b1' })).toHaveLength(4);
+  });
+
+  it('sews a skirt down both sides and across every waist run', () => {
+    const seams = seamsFor(SKIRT_BLOCK, 's1');
+    const values = resolveBlockValues(SKIRT_BLOCK, instance(), null);
+    const runs =
+      2 * (Math.round(values.backDartCount) + 1) + 2 * (Math.round(values.frontDartCount) + 1);
+    expect(seams).toHaveLength(6 + runs);
+    // No seam runs along a dart notch: a notch is the dart, and a dart is sewn
+    // to itself.
+    for (const { a, b } of seams) {
+      for (const ref of [a, b]) {
+        expect(ref.fromPointId + ref.toPointId).not.toContain('apex');
+      }
+    }
+  });
+
+  it('pairs each waist run with a band edge the same length', () => {
+    const seams = seamsFor(SKIRT_BLOCK, 's1');
+    const pool = piecePool(SKIRT_BLOCK, 's1', {});
+    const length = (ref: (typeof seams)[number]['a']) =>
+      edgeLengthByPointIds(pool.get(ref.pieceId)!, ref.fromPointId, ref.toPointId);
+
+    // Only the waist seams are built to match. A side seam's waist end sits at
+    // the flat waist width, which includes that panel's dart intake, so the two
+    // panels' side seams differ by the difference in their darts — the draft's
+    // own property, not something a seam can fix.
+    const isBand = (seam: (typeof seams)[number]) =>
+      seam.a.pieceId.includes('waistband') || seam.b.pieceId.includes('waistband');
+    const waist = seams.filter(isBand);
+    expect(waist.length).toBeGreaterThan(0);
+    const side = seams.filter((seam) => !isBand(seam));
+    expect(side.length).toBeGreaterThan(0);
+
+    for (const seam of waist) {
+      expect(length(seam.a), `${seam.a.pieceId} ${seam.a.fromPointId}`).toBeCloseTo(
+        length(seam.b),
+        6
+      );
+    }
   });
 });
 
@@ -348,12 +677,13 @@ describe('driven geometry', () => {
   it('does not touch the waistband when a panel changes', () => {
     const ids = driven('hipArcBack')!;
     expect(ids.has('blk1:skirtBack:sideHip')).toBe(true);
-    expect([...ids].some((id) => id.startsWith('blk1:waistband:'))).toBe(false);
+    expect([...ids].some((id) => id.includes('waistband'))).toBe(false);
   });
 
   it('reaches the waistband for a waistband variable', () => {
     const ids = driven('waistbandDepth')!;
-    expect(ids.has('blk1:waistband:band-br')).toBe(true);
+    expect(ids.has('blk1:waistbandBack:bandHemEnd')).toBe(true);
+    expect(ids.has('blk1:waistbandFront:bandHemEnd')).toBe(true);
     expect([...ids].some((id) => id.startsWith('blk1:skirtBack:'))).toBe(false);
   });
 
@@ -467,7 +797,7 @@ describe('block generation', () => {
   it('emits one piece per declared role, in role order', () => {
     const block = instance();
     const generated = generateBlockPieces(SKIRT_BLOCK, block, null);
-    expect(generated.map((g) => g.role)).toEqual(['skirtBack', 'skirtFront', 'waistband']);
+    expect(generated.map((g) => g.role)).toEqual(SKIRT_BLOCK.roles);
     expect(generated.map((g) => g.piece.id)).toEqual(
       SKIRT_BLOCK.roles.map((role) => blockPieceId('blk1', role))
     );
@@ -530,13 +860,18 @@ describe('splicing generated pieces into a pattern', () => {
     const block = instance();
     const generated = generateBlockPieces(SKIRT_BLOCK, block, null);
     const { pieces, ownership } = spliceBlockPieces([other], block, generated);
-    expect(pieces).toHaveLength(4);
+    expect(pieces).toHaveLength(9);
     expect(pieces[0]).toBe(other);
     expect(pieces.slice(1).map((p) => p.id)).toEqual(generated.map((g) => g.piece.id));
     expect(ownership).toEqual([
       { role: 'skirtBack', pieceId: 'blk1:skirtBack' },
+      { role: 'skirtBackMirror', pieceId: 'blk1:skirtBackMirror' },
       { role: 'skirtFront', pieceId: 'blk1:skirtFront' },
-      { role: 'waistband', pieceId: 'blk1:waistband' },
+      { role: 'skirtFrontMirror', pieceId: 'blk1:skirtFrontMirror' },
+      { role: 'waistbandBack', pieceId: 'blk1:waistbandBack' },
+      { role: 'waistbandBackMirror', pieceId: 'blk1:waistbandBackMirror' },
+      { role: 'waistbandFront', pieceId: 'blk1:waistbandFront' },
+      { role: 'waistbandFrontMirror', pieceId: 'blk1:waistbandFrontMirror' },
     ]);
   });
 
@@ -549,7 +884,7 @@ describe('splicing generated pieces into a pattern', () => {
       owned,
       generateBlockPieces(SKIRT_BLOCK, owned, null)
     );
-    expect(second.pieces).toHaveLength(4);
+    expect(second.pieces).toHaveLength(9);
     expect(second.pieces.map((p) => p.id)).toEqual(first.pieces.map((p) => p.id));
     expect(second.pieces[0]).toBe(other);
   });

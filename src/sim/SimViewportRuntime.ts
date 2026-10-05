@@ -22,6 +22,7 @@ import {
 import { loadAvatarBody } from './avatarAsset';
 import type { AvatarBody } from '../mesh/AvatarBody';
 import { SelectionOverlay } from './SelectionOverlay';
+import { ClothSewTool } from './ClothSewTool';
 import { DEFAULT_MESH_SETTINGS, triangulatePattern } from '../mesh/triangulate';
 import {
   buildIncidentTriangles,
@@ -36,7 +37,7 @@ import {
   migrateLegacySimCamera,
   setDefaultSimCamera,
 } from './cameraDefaults';
-import type { MeshGeometry, PatternDocument, SimCameraState, SimInstance, SimParams } from '../project/types';
+import type { MeshGeometry, PatternDocument, SeamEdgeRef, SimCameraState, SimInstance, SimParams } from '../project/types';
 
 export type SimViewportRuntimeOptions = {
   /**
@@ -44,6 +45,13 @@ export type SimViewportRuntimeOptions = {
    * The host is responsible for committing it (undo snapshot, remesh, rebuild).
    */
   onApplyPatternEdit?: (patternId: string, edited: PatternDocument) => void;
+  /**
+   * Two cloth edges were clicked together with the sew tool. The host owns the
+   * pattern, the undo snapshot and the rebuild.
+   */
+  onSewEdges?: (a: SeamEdgeRef, b: SeamEdgeRef) => void;
+  /** Right-clicked an edge that a seam runs along: flop that seam end for end. */
+  onReverseSeam?: (seamId: string) => void;
 };
 
 export type SharedGpu = {
@@ -96,6 +104,9 @@ export class SimViewportRuntime {
   private transformToggle: HTMLButtonElement | null = null;
   /** "Draw pattern points" toggle + its marker layer and mini editor. */
   private pointsToggle: HTMLButtonElement | null = null;
+  /** Sew tool toggle + the shared edge highlighting / picking behaviour. */
+  private sewToggle: HTMLButtonElement | null = null;
+  private sewTool: ClothSewTool | null = null;
   private pointsLayer: HTMLDivElement | null = null;
   private pointOverlay: PatternPointOverlay | null = null;
   private patternPointsEnabled = false;
@@ -175,6 +186,10 @@ export class SimViewportRuntime {
     this.transformToggle = null;
     this.pointsToggle?.remove();
     this.pointsToggle = null;
+    this.sewTool?.destroy();
+    this.sewTool = null;
+    this.sewToggle?.remove();
+    this.sewToggle = null;
     this.pointsLayer?.remove();
     this.pointsLayer = null;
     this.pointOverlay?.destroy();
@@ -238,6 +253,16 @@ export class SimViewportRuntime {
     this.mountTransformToggle();
     this.mountPointsLayer();
     this.mountPointsToggle();
+    this.sewTool = new ClothSewTool({
+      host: this.host,
+      canvas: this.canvas,
+      getCloth: () => this.cloth,
+      getCamera: () => this.camera,
+      getPattern: () => this.pattern,
+      onSewEdges: (a, b) => this.options.onSewEdges?.(a, b),
+      onReverseSeam: (seamId) => this.options.onReverseSeam?.(seamId),
+    });
+    this.mountSewToggle();
     this.bindPointer();
   }
 
@@ -723,6 +748,10 @@ export class SimViewportRuntime {
       this.cloth.applyPose(pose);
     }
     this.cloth.setStrainMapEnabled?.(this.strainMapEnabled);
+    // The outline the sew tool picks against comes from the new mesh's boundary
+    // tags, so it has to be re-indexed whenever the cloth is.
+    this.sewTool?.rebuild(geom);
+    this.syncSewToggle();
     this.setPieceSelected(null);
     this.buildPointMarkerEls();
     this.refreshPointMarkers();
@@ -791,38 +820,44 @@ export class SimViewportRuntime {
     this.canvas.style.cursor = 'grab';
 
     this.canvas.addEventListener('pointerdown', (e) => {
+      // Edges under the pointer are resolved now and acted on at pointerup, so a
+      // drag that started on an edge still orbits and a click still picks.
+      if (this.isSewEnabled()) this.sewTool?.beginPress(e.clientX, e.clientY, e.button);
+
       if (e.button === 1) {
         this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
       } else if (e.button === 2) {
         this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
       } else if (e.button === 0) {
-        // LMB on fabric → select that pattern piece (shift toggles the group).
-        const hit = this.pickCloth(e.clientX, e.clientY);
-        if (hit && this.cloth) {
-          if (e.shiftKey) {
-            // Shift-click toggles membership; never starts a drag so pieces
-            // aren't nudged while building a multi-selection.
-            this.togglePieceSelected(hit.pieceId);
-            this.nav = 'none';
-          } else {
-            // Clicking a piece that's already part of a group keeps the group
-            // and moves/rotates all of it together.
-            if (!this.selectedPieceIds.has(hit.pieceId)) {
-              this.setPieceSelected(hit.pieceId);
-            }
-            this.beginClothDrag(e.clientX, e.clientY);
-          }
-        } else {
+        if (this.isSewEnabled()) {
+          // The sew tool takes the click; the move/rotate tools stand down, but
+          // dragging still orbits so the far side of the garment is reachable.
           this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
+        } else {
+          // LMB on fabric → select that pattern piece (shift toggles the group).
+          const hit = this.pickCloth(e.clientX, e.clientY);
+          if (hit && this.cloth) {
+            if (e.shiftKey) {
+              // Shift-click toggles membership; never starts a drag so pieces
+              // aren't nudged while building a multi-selection.
+              this.togglePieceSelected(hit.pieceId);
+              this.nav = 'none';
+            } else {
+              // Clicking a piece that's already part of a group keeps the group
+              // and moves/rotates all of it together.
+              if (!this.selectedPieceIds.has(hit.pieceId)) {
+                this.setPieceSelected(hit.pieceId);
+              }
+              this.beginClothDrag(e.clientX, e.clientY);
+            }
+          } else {
+            this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
+          }
         }
       } else {
         return;
       }
-this.nav === 'none'
-                ? this.selectedPieceIds.size > 0
-                  ? 'default'
-                  : 'grab'
-                : 
+
       this.pointerMoved = false;
       this.lastX = e.clientX;
       this.lastY = e.clientY;
@@ -833,13 +868,22 @@ this.nav === 'none'
             ? 'ns-resize'
             : this.nav === 'cloth'
               ? 'move'
-              : 'grabbing';
+              : this.nav === 'none'
+                ? this.isSewEnabled()
+                  ? 'crosshair'
+                  : this.selectedPieceIds.size > 0
+                    ? 'default'
+                    : 'grab'
+                : 'grabbing';
       this.canvas.setPointerCapture(e.pointerId);
       e.preventDefault();
       e.stopPropagation();
     });
 
     this.canvas.addEventListener('pointermove', (e) => {
+      if (this.isSewEnabled() && this.nav === 'none') {
+        this.sewTool?.refreshHover(e.clientX, e.clientY);
+      }
       if (this.nav === 'none' || this.nav === 'gizmo') return;
       const dx = e.clientX - this.lastX;
       const dy = e.clientY - this.lastY;
@@ -912,6 +956,10 @@ this.nav === 'none'
       const wasOrbitClick = this.nav === 'orbit' && (e.button === 0 || e.button === -1) && !this.pointerMoved;
       const wasCloth = this.nav === 'cloth';
       const movedCamera = this.nav === 'orbit' || this.nav === 'orbitHeight' || this.nav === 'pan';
+      // The sew tool reads its own gesture off pointerup, so a drag never sews.
+      const sewConsumed = this.isSewEnabled()
+        ? this.sewTool?.endPress(this.pointerMoved, e.button) ?? false
+        : false;
       if (wasCloth) {
         this.cloth?.setDragging(false);
         this.gizmoAxis = null;
@@ -927,11 +975,19 @@ this.nav === 'none'
         /* ignore */
       }
 
-      if (wasOrbitClick) {
+      if (wasOrbitClick && !sewConsumed && !this.isSewEnabled()) {
         // Empty click — clear the whole selection.
         this.setPieceSelected(null);
       }
-      this.canvas.style.cursor = this.selectedPieceIds.size > 0 ? 'default' : 'grab';
+      // A drag that moved the camera moves the cloth under the pointer too.
+      if (this.isSewEnabled() && this.pointerMoved) {
+        this.sewTool?.refreshHover(e.clientX, e.clientY);
+      }
+      this.canvas.style.cursor = this.isSewEnabled()
+        ? 'crosshair'
+        : this.selectedPieceIds.size > 0
+          ? 'default'
+          : 'grab';
     };
     this.canvas.addEventListener('pointerup', endDrag);
     this.canvas.addEventListener('pointercancel', endDrag);
@@ -989,7 +1045,16 @@ this.nav === 'none'
     return hit;
   }
 
-  frame(active: boolean): void {
+  /**
+   * One frame. `visible` false means the viewport is covered: the drape keeps
+   * stepping so it is not frozen by a glance at another stage, but nothing is
+   * resized or drawn.
+   */
+  frame(active: boolean, visible = true): void {
+    if (!visible) {
+      if (active) this.cloth?.update(true);
+      return;
+    }
     if (active) this.stepAndRender();
     else this.renderPaused();
   }
@@ -1002,6 +1067,8 @@ this.nav === 'none'
     this.renderer.render(this.cloth, this.camera);
     this.syncMoveGizmo();
     this.refreshPointMarkers();
+    // The fabric is moving under the highlight, so re-project it every frame.
+    if (this.isSewEnabled()) this.sewTool?.sync();
   }
 
   renderPaused(): void {
@@ -1012,6 +1079,58 @@ this.nav === 'none'
     this.renderer.render(this.cloth, this.camera);
     this.syncMoveGizmo();
     this.refreshPointMarkers();
+    if (this.isSewEnabled()) this.sewTool?.sync();
+  }
+
+  /**
+   * Sew tool: highlight a cloth edge and click two of them to join them.
+   *
+   * Same tool as the transform viewport, next to "Draw pattern points" because
+   * both are gestures on the fabric itself. While it is on it takes the clicks,
+   * so selecting and dragging pieces stands down — dragging still orbits.
+   */
+  private mountSewToggle(): void {
+    this.sewToggle?.remove();
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'sim-sew-toggle';
+    button.textContent = 'Sew edges';
+    button.setAttribute('aria-pressed', 'false');
+    button.addEventListener('pointerdown', (e) => e.stopPropagation());
+    button.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.setSewEnabled(!this.isSewEnabled());
+    });
+    this.host.appendChild(button);
+    this.sewToggle = button;
+    this.syncSewToggle();
+  }
+
+  setSewEnabled(enabled: boolean): void {
+    this.sewTool?.setEnabled(enabled);
+    this.syncSewToggle();
+    this.canvas.style.cursor = enabled
+      ? 'crosshair'
+      : this.selectedPieceIds.size > 0
+        ? 'default'
+        : 'grab';
+  }
+
+  isSewEnabled(): boolean {
+    return this.sewTool?.isEnabled() ?? false;
+  }
+
+  private syncSewToggle(): void {
+    if (!this.sewToggle) return;
+    const usable = this.sewTool?.isAvailable() ?? false;
+    const active = this.isSewEnabled();
+    this.sewToggle.disabled = !usable;
+    this.sewToggle.classList.toggle('is-active', active);
+    this.sewToggle.setAttribute('aria-pressed', String(active));
+    this.sewToggle.title = usable
+      ? 'Sew edges — highlight and click two cloth edges to sew them together · right-click a sewn edge to reverse it'
+      : 'Sew edges — needs a mesh built from a pattern, so its outlines are known';
   }
 
   async snapshotDataUrl(): Promise<string> {

@@ -55,6 +55,7 @@ import {
   sampleEdgeSpanByPointIds,
   segmentLengths,
 } from './geometry';
+import { findSeamNearPoint, seamCoversEdge } from './seamHit';
 import {
   findBoundaryHits,
   sampleCutterPath,
@@ -69,6 +70,7 @@ import { drivenPointIds } from './blocks/driven';
 import {
   createBlockInstance,
   generateBlockPieces,
+  generateBlockSeams,
   nextBlockOrigin,
   normalizeBlocks,
   spliceBlockPieces,
@@ -246,6 +248,16 @@ export class PatternEditor {
   private resizeObserver: ResizeObserver | null = null;
   /** Last svg layout size used for chrome scaling (skip redundant redraws). */
   private lastChromeLayout = { w: 0, h: 0 };
+  /**
+   * Layout px per pattern unit, captured once per redraw.
+   *
+   * Every stroke width, dash pattern, handle radius and label size goes through
+   * `px()`, and each of those used to read the element's `clientWidth`. Reading
+   * layout after the DOM has been mutated forces a synchronous style flush, so a
+   * redraw that wrote an element and then measured one was doing it hundreds of
+   * times: dragging a piece spent most of its time in layout, not drawing.
+   */
+  private viewScaleCache: number | null = null;
   private pattern: PatternDocument;
   private unit: UnitDisplay;
   private tool: PatternTool = 'move';
@@ -719,6 +731,8 @@ export class PatternEditor {
           <span>Person</span>
           <select data-block-person aria-label="Measurement person"></select>
         </label>
+        <button type="button" class="pattern-block-sew" data-block-sew
+          title="Sew the side seams, and the waistband onto the waist">Sew</button>
         <button type="button" class="pattern-block-detach" data-block-detach
           title="Keep the pieces but stop tracking them as a block">Detach</button>
         <button type="button" class="pattern-block-delete" data-block-delete
@@ -739,6 +753,10 @@ export class PatternEditor {
     );
     this.blockBar.addEventListener('click', (e) => {
       const target = e.target as HTMLElement;
+      if (target.closest('button[data-block-sew]')) {
+        this.sewSelectedBlock();
+        return;
+      }
       if (target.closest('button[data-block-detach]')) {
         this.detachSelectedBlock();
         return;
@@ -1667,25 +1685,28 @@ export class PatternEditor {
    * Minor/major reference grid — see `buildGridGroup` for the letterbox overscan
    * and the zoom-out ladder.
    */
-  private drawGrid(): SVGGElement {
+  private drawGrid(layoutW: number, layoutH: number): SVGGElement {
     return buildGridGroup(this.viewBox, this.unit, {
-      width: this.svg.clientWidth,
-      height: this.svg.clientHeight,
+      width: layoutW,
+      height: layoutH,
     });
   }
 
   private redraw(): void {
     const { x, y, w, h } = this.viewBox;
+    // The single layout read for this redraw — see `viewScaleCache`. Taken before
+    // anything is written so it cannot force a flush of its own.
+    const layoutW = this.svg.clientWidth;
+    const layoutH = this.svg.clientHeight;
+    const sized = layoutW >= 2 && layoutH >= 2;
+    this.viewScaleCache = sized ? Math.min(layoutW / w, layoutH / h) : null;
+    if (sized) this.lastChromeLayout = { w: layoutW, h: layoutH };
+
     this.svg.setAttribute('viewBox', `${x} ${y} ${w} ${h}`);
     this.avatarSvg.setAttribute('viewBox', `${x} ${y} ${w} ${h}`);
     this.svg.innerHTML = '';
-    const layoutW = this.svg.clientWidth;
-    const layoutH = this.svg.clientHeight;
-    if (layoutW >= 2 && layoutH >= 2) {
-      this.lastChromeLayout = { w: layoutW, h: layoutH };
-    }
 
-    const grid = this.drawGrid();
+    const grid = this.drawGrid(layoutW, layoutH);
     this.svg.appendChild(grid);
 
     // Ownership has to be known before anything is drawn, and the group boxes go
@@ -2671,10 +2692,13 @@ export class PatternEditor {
 
   /** Layout CSS px per pattern unit (xMidYMid meet). */
   private viewScale(): number {
+    if (this.viewScaleCache != null) return this.viewScaleCache;
     const w = this.svg.clientWidth;
     const h = this.svg.clientHeight;
     // Before flex layout settles, client size is 0 — assume a typical pattern
-    // viewport so we don't bake 1px≈1cm chrome (huge labels/handles).
+    // viewport so we don't bake 1px≈1cm chrome (huge labels/handles). Deliberately
+    // not cached: it is a placeholder, and storing it would size the whole drawing
+    // for a viewport that never existed.
     if (w < 2 || h < 2) {
       const assumed = 360;
       return Math.min(assumed / this.viewBox.w, assumed / this.viewBox.h);
@@ -3669,12 +3693,96 @@ export class PatternEditor {
     this.pattern.pieces = pieces;
     instance.pieces = ownership;
     this.selectedBlockId = instance.id;
+    // Inside the same edit as the pieces, so one undo takes the block and its
+    // seams away together.
+    this.sewBlock(instance);
     this.cbs.onChange();
     this.endHistoryGesture();
     this.syncBlockBar();
     this.fitView();
     this.redraw();
     return true;
+  }
+
+  /**
+   * Add the seams a block wants, and drop the ones it claims but can no longer
+   * make. Returns whether anything changed.
+   *
+   * Run when the block is placed, and from the ribbon for blocks that were
+   * placed before it existed. Only seams with both pieces in the document can be
+   * made, which is how a bodice front and back each declare the seam between
+   * them: the one placed first has nothing to sew to yet and quietly does
+   * nothing, and the one placed second makes the lot.
+   */
+  private sewBlock(instance: BlockInstance): boolean {
+    const definition = this.blockDefinition(instance);
+    if (!definition?.seams) return false;
+    let changed = false;
+
+    // Drop the block's own dead seams first. A reference that no longer resolves
+    // on its own piece cannot be sewn and is drawn as a warning, so letting one
+    // sit there only makes the next pass add a second copy of the same seam.
+    const owned = new Set(instance.pieces.map((entry) => entry.pieceId));
+    const kept = this.pattern.seams.filter((seam) => {
+      const dead =
+        !isSeamEdgeValid(this.pattern.pieces, seam.a) ||
+        !isSeamEdgeValid(this.pattern.pieces, seam.b);
+      if (dead && (owned.has(seam.a.pieceId) || owned.has(seam.b.pieceId))) {
+        changed = true;
+        return false;
+      }
+      return true;
+    });
+    if (changed) this.pattern.seams = kept;
+
+    const wanted = generateBlockSeams(
+      definition,
+      instance,
+      this.measurementSet(instance.personId),
+      // First block of that definition wins; two bodices on one canvas are not
+      // told apart.
+      (definitionId) => {
+        const partner = this.blocks().find((b) => b.definitionId === definitionId);
+        const partnerDefinition = partner ? this.blockDefinition(partner) : null;
+        return partner && partnerDefinition
+          ? { instance: partner, definition: partnerDefinition }
+          : null;
+      }
+    );
+    const present = new Set(this.pattern.pieces.map((piece) => piece.id));
+    const additions = wanted.filter(
+      ({ a, b }) =>
+        present.has(a.pieceId) &&
+        present.has(b.pieceId) &&
+        !this.pattern.seams.some((seam) => sameSeamBindingPair(seam.a, seam.b, a, b))
+    );
+    if (additions.length > 0) {
+      this.pattern.seams.push(
+        ...additions.map(({ a, b }) => ({
+          id: uid('seam'),
+          a,
+          b,
+          restGapCm: DEFAULT_SEAM_GAP_CM,
+        }))
+      );
+      changed = true;
+    }
+    return changed;
+  }
+
+  /** The ribbon's Sew button: sew up a block placed before this existed. */
+  private sewSelectedBlock(): void {
+    const instance = this.selectedBlock();
+    if (!instance) return;
+    this.markBeforeChange();
+    const changed = this.sewBlock(instance);
+    if (!changed) {
+      this.endHistoryGesture();
+      return;
+    }
+    this.cbs.onChange();
+    this.endHistoryGesture();
+    this.redraw();
   }
 
   /**
@@ -4593,6 +4701,16 @@ export class PatternEditor {
       }
     }
 
+    // The sew tool works on the *edges* of a piece, not on the shape inside it,
+    // so it has to be offered the click before the block intercept below. A
+    // block's outline is exactly what you sew its pieces together by; letting
+    // the intercept take the click would make generated pieces unsewable.
+    if (this.tool === 'sew') {
+      this.setRulerSelection(null);
+      this.onSewDown(p);
+      return;
+    }
+
     // A generated block piece is edited through its variables, not its points:
     // clicking selects the block, dragging moves the whole draft. Regeneration
     // would otherwise discard whatever you did to an individual point.
@@ -4654,11 +4772,6 @@ export class PatternEditor {
 
     if (this.tool === 'dart') {
       this.onDartDown(p);
-      return;
-    }
-
-    if (this.tool === 'sew') {
-      this.onSewDown(p);
       return;
     }
 
@@ -4830,15 +4943,22 @@ export class PatternEditor {
   }
 
   /** Nearest edge across all pieces within a screen-space threshold. */
-  private findNearestEdgeAcrossPieces(
-    p: Vec2
-  ): { piece: PatternPiece; edgeIndex: number; fromPointId: string; toPointId: string; dist: number } | null {
+  private findNearestEdgeAcrossPieces(p: Vec2): {
+    piece: PatternPiece;
+    edgeIndex: number;
+    fromPointId: string;
+    toPointId: string;
+    /** Where along that edge the point is, in the edge's own winding. */
+    t: number;
+    dist: number;
+  } | null {
     const threshold = Math.max(0.5, 12 / this.screenToPatternScale());
     let best: {
       piece: PatternPiece;
       edgeIndex: number;
       fromPointId: string;
       toPointId: string;
+      t: number;
       dist: number;
     } | null = null;
     for (const piece of this.pattern.pieces) {
@@ -4854,6 +4974,7 @@ export class PatternEditor {
           edgeIndex: hit.edgeIndex,
           fromPointId: a.id,
           toPointId: b.id,
+          t: hit.t,
           dist: hit.dist,
         };
       }
@@ -4863,6 +4984,24 @@ export class PatternEditor {
 
   private sameEdge(a: HoverEdge | SeamEdgeRef, b: HoverEdge | SeamEdgeRef): boolean {
     return sameSeamEdgeTopology(a, b);
+  }
+
+  /**
+   * Is the place that was clicked already sewn?
+   *
+   * Not the same question as "does this edge carry a seam": a many-to-many sew
+   * leaves several seams along one edge, and the free part of a half-sewn edge is
+   * still there to be sewn. Asking by edge alone refuses work that is perfectly
+   * possible, and says nothing about why.
+   */
+  private edgeSewnAt(edge: SeamEdgeRef, t: number): boolean {
+    const hit = {
+      pieceId: edge.pieceId,
+      fromPointId: edge.fromPointId,
+      toPointId: edge.toPointId,
+      t,
+    };
+    return this.pattern.seams.some((seam) => seamCoversEdge(seam, hit));
   }
 
   private edgeUsedInExistingSeam(edge: SeamEdgeRef): boolean {
@@ -4990,7 +5129,7 @@ export class PatternEditor {
     }
 
     if (!this.pendingSeam) {
-      if (this.edgeUsedInExistingSeam(edge)) return;
+      if (this.edgeSewnAt(edge, hit.t)) return;
       this.pendingSeam = edge;
       this.selectedPieceId = hit.piece.id;
       this.redraw();
@@ -5004,11 +5143,9 @@ export class PatternEditor {
       return;
     }
 
-    // Reject duplicate of the same undirected edge pair.
-    const dup = this.pattern.seams.some(
-      (s) =>
-        (this.sameEdge(s.a, this.pendingSeam!) && this.sameEdge(s.b, edge)) ||
-        (this.sameEdge(s.b, this.pendingSeam!) && this.sameEdge(s.a, edge))
+    // Reject duplicate of the same undirected edge pair with the same spans.
+    const dup = this.pattern.seams.some((s) =>
+      sameSeamBindingPair(s.a, s.b, this.pendingSeam!, edge)
     );
     if (dup) {
       this.pendingSeam = null;
@@ -5032,22 +5169,16 @@ export class PatternEditor {
     this.redraw();
   }
 
+  /**
+   * The seam under a pattern-space point.
+   *
+   * Distance to the edge is not enough: a many-to-many sew leaves several seams
+   * on one edge, side by side, so the position along the edge decides which one
+   * is meant. Reverse and Remove both act on what this returns.
+   */
   private findSeamNearClick(p: Vec2): SeamBinding | null {
     const threshold = Math.max(0.5, 12 / this.screenToPatternScale());
-    let best: { seam: SeamBinding; dist: number } | null = null;
-    for (const seam of this.pattern.seams) {
-      for (const ref of [seam.a, seam.b]) {
-        const piece = this.pattern.pieces.find((x) => x.id === ref.pieceId);
-        if (!piece) continue;
-        const idx = edgeIndexForPointIds(piece, ref.fromPointId, ref.toPointId);
-        if (idx === null) continue;
-        const hit = findNearestEdge(piece.points, piece.closed, p);
-        // Only count if the nearest edge on this piece is exactly this seam edge
-        if (!hit || hit.edgeIndex !== idx || hit.dist > threshold) continue;
-        if (!best || hit.dist < best.dist) best = { seam, dist: hit.dist };
-      }
-    }
-    return best?.seam ?? null;
+    return findSeamNearPoint(this.pattern.seams, this.pattern.pieces, p, threshold);
   }
 
   private reverseContextSeam(): void {

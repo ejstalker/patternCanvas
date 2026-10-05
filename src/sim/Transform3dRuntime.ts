@@ -25,6 +25,7 @@ import { DEFAULT_MESH_SETTINGS, triangulatePattern } from '../mesh/triangulate';
 import { migrateLegacySimCamera } from './cameraDefaults';
 import { createViewportRenderer } from './SimViewportRuntime';
 import { SelectionOverlay } from './SelectionOverlay';
+import { ClothSewTool } from './ClothSewTool';
 import { keepPieceTransforms } from './pieceTransforms';
 import {
   buildQuadrantLayout,
@@ -39,6 +40,7 @@ import type {
   MeshGeometry,
   PatternDocument,
   PieceTransform3d,
+  SeamEdgeRef,
   SimCameraState,
   SimParams,
   SimPose,
@@ -101,6 +103,13 @@ export type Transform3dRuntimeOptions = {
   /** Fired once before a placement gesture so the host can snapshot undo history. */
   onBeforePoseChange?: () => void;
   onSelectionChange?: (pieceId: string | null) => void;
+  /**
+   * Two cloth edges were clicked together with the sew tool. The host owns the
+   * pattern, the undo snapshot and the rebuild.
+   */
+  onSewEdges?: (a: SeamEdgeRef, b: SeamEdgeRef) => void;
+  /** Right-clicked an edge that a seam runs along: flop that seam end for end. */
+  onReverseSeam?: (seamId: string) => void;
 };
 
 export class Transform3dRuntime {
@@ -117,6 +126,11 @@ export class Transform3dRuntime {
   private selectionOverlay: SelectionOverlay | null = null;
   private transformToggle: HTMLButtonElement | null = null;
   private snapToggle: HTMLButtonElement | null = null;
+  private sewToggle: HTMLButtonElement | null = null;
+  /** Edge highlighting, clicking and reversing, shared with the drape viewport. */
+  private sewTool: ClothSewTool | null = null;
+  /** Seams live in the pattern; the tool reads them to know what to reverse. */
+  private pattern: PatternDocument | null = null;
   /** Quadrant snap tool: shows the grids and centres pieces on click. */
   private snapToQuadrantEnabled = false;
   private quadrantLayout: QuadrantLayout = buildQuadrantLayout();
@@ -147,6 +161,8 @@ export class Transform3dRuntime {
   private onPoseChange?: (transform: Transform3dInstance) => void;
   private onBeforePoseChange?: () => void;
   private onSelectionChange?: (pieceId: string | null) => void;
+  private onSewEdges?: (a: SeamEdgeRef, b: SeamEdgeRef) => void;
+  private onReverseSeam?: (seamId: string) => void;
   private poseHistoryArmed = false;
 
   constructor(
@@ -164,6 +180,8 @@ export class Transform3dRuntime {
     this.onPoseChange = options.onPoseChange;
     this.onBeforePoseChange = options.onBeforePoseChange;
     this.onSelectionChange = options.onSelectionChange;
+    this.onSewEdges = options.onSewEdges;
+    this.onReverseSeam = options.onReverseSeam;
     this.canvas = canvas;
     this.host = host;
     this.device = device;
@@ -190,10 +208,14 @@ export class Transform3dRuntime {
     this.moveGizmo = null;
     this.selectionOverlay?.destroy();
     this.selectionOverlay = null;
+    this.sewTool?.destroy();
+    this.sewTool = null;
     this.transformToggle?.remove();
     this.transformToggle = null;
     this.snapToggle?.remove();
     this.snapToggle = null;
+    this.sewToggle?.remove();
+    this.sewToggle = null;
   }
 
   getSelectedPieceId(): string | null {
@@ -409,11 +431,80 @@ export class Transform3dRuntime {
     this.applyCamera(this.transform);
     this.mountViewGnomon();
     this.selectionOverlay = new SelectionOverlay(this.host);
+    this.sewTool = new ClothSewTool({
+      host: this.host,
+      canvas: this.canvas,
+      getCloth: () => this.cloth,
+      getCamera: () => this.camera,
+      getPattern: () => this.pattern,
+      onSewEdges: (a, b) => this.onSewEdges?.(a, b),
+      onReverseSeam: (seamId) => this.onReverseSeam?.(seamId),
+    });
     this.mountMoveGizmo();
     this.mountTransformToggle();
     this.mountSnapToggle();
+    this.mountSewToggle();
     this.bindPointer();
     this.bindKeyboard();
+  }
+
+  /**
+   * Sew tool: hover a cloth edge to light it up, click two of them to join them.
+   *
+   * Edges are the piece outlines, so this is the same operation the pattern
+   * editor's sew tool performs, done against the cloth in three dimensions. The
+   * tool takes clicks while it is on, so the move/rotate/snap tools stand down —
+   * dragging still orbits, which is how you get to the other side of a garment.
+   * The behaviour itself lives in `ClothSewTool`, shared with the drape viewport.
+   */
+  private mountSewToggle(): void {
+    this.sewToggle?.remove();
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'sim-sew-toggle';
+    button.textContent = 'Sew edges';
+    button.setAttribute('aria-pressed', 'false');
+    button.addEventListener('pointerdown', (e) => e.stopPropagation());
+    button.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.setSewEnabled(!this.isSewEnabled());
+    });
+    this.host.appendChild(button);
+    this.sewToggle = button;
+    this.syncSewToggle();
+  }
+
+  setSewEnabled(enabled: boolean): void {
+    if (enabled && this.snapToQuadrantEnabled) this.setSnapToQuadrant(false);
+    this.sewTool?.setEnabled(enabled);
+    this.syncSewToggle();
+    this.syncCursor();
+  }
+
+  isSewEnabled(): boolean {
+    return this.sewTool?.isEnabled() ?? false;
+  }
+
+  private syncSewToggle(): void {
+    if (!this.sewToggle) return;
+    const usable = this.sewTool?.isAvailable() ?? false;
+    const active = this.isSewEnabled();
+    this.sewToggle.disabled = !usable;
+    this.sewToggle.classList.toggle('is-active', active);
+    this.sewToggle.setAttribute('aria-pressed', String(active));
+    this.sewToggle.title = usable
+      ? 'Sew edges — highlight and click two cloth edges to sew them together · right-click a sewn edge to reverse it'
+      : 'Sew edges — needs a mesh built from a pattern, so its outlines are known';
+  }
+
+  private syncCursor(): void {
+    this.canvas.style.cursor =
+      this.isSewEnabled() || this.snapToQuadrantEnabled
+        ? 'crosshair'
+        : this.selectedPieceIds.size > 0
+          ? 'default'
+          : 'grab';
   }
 
   /** Tool button that reveals the quadrant grids (sits under the Move/Rotate toggle). */
@@ -441,13 +532,10 @@ export class Transform3dRuntime {
     this.snapToQuadrantEnabled = enabled;
     this.hoveredQuadrant = null;
     this.pendingQuadrantSnap = null;
+    if (enabled) this.setSewEnabled(false);
     this.syncSnapToggle();
     this.pushQuadrantOverlay();
-    this.canvas.style.cursor = enabled
-      ? 'crosshair'
-      : this.selectedPieceIds.size > 0
-        ? 'default'
-        : 'grab';
+    this.syncCursor();
   }
 
   isSnapToQuadrantEnabled(): boolean {
@@ -714,11 +802,7 @@ export class Transform3dRuntime {
     this.selectedPieceIds = new Set(ids);
     this.selectedPieceId = primary;
     this.syncMoveGizmo();
-    this.canvas.style.cursor = this.snapToQuadrantEnabled
-      ? 'crosshair'
-      : this.selectedPieceIds.size > 0
-        ? 'default'
-        : 'grab';
+    this.syncCursor();
     this.onSelectionChange?.(primary);
   }
 
@@ -849,6 +933,13 @@ export class Transform3dRuntime {
       pattern ?? undefined
     );
 
+    // Index the new cloth's outline for the sew tool. The tags come from the
+    // mesh, so a cloth without them (no pattern behind it) simply has nothing to
+    // pick, and the tool says so rather than picking edges that are not there.
+    this.pattern = pattern ?? null;
+    this.sewTool?.rebuild(geom);
+    this.syncSewToggle();
+
     const liveIds = this.getPieceIds();
     // Retain placements by durable piece id across remesh / add / delete. Pieces
     // replaced by new ids (a knife cut) inherit via `pattern.pieceSuccessors`,
@@ -887,36 +978,54 @@ export class Transform3dRuntime {
     this.canvas.style.cursor = 'grab';
 
     this.canvas.addEventListener('pointerdown', (e) => {
+      // Edges under the pointer are resolved now and acted on at pointerup, so a
+      // drag that started on an edge still orbits and a click still picks.
+      if (this.isSewEnabled()) this.sewTool?.beginPress(e.clientX, e.clientY, e.button);
+
       if (e.button === 1) {
         this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
       } else if (e.button === 2) {
         this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
       } else if (e.button === 0) {
-        this.camera.update();
-        const ray = unprojectRay(e.clientX, e.clientY, this.canvas, this.camera.getViewProjectMtx());
-        const hit = ray && this.cloth ? this.cloth.raycast(ray.origin, ray.dir) : null;
-        if (hit && this.cloth) {
-          if (e.shiftKey) {
-            // Shift-click toggles membership; never starts a drag so pieces
-            // aren't nudged while building a multi-selection.
-            this.togglePieceSelected(hit.pieceId);
-            this.nav = 'none';
-          } else {
-            // Clicking a piece that's already part of a group keeps the group
-            // and moves/rotates all of it together.
-            if (!this.selectedPieceIds.has(hit.pieceId)) {
-              this.setPieceSelected(hit.pieceId);
-            }
-            this.beginClothDrag(e.clientX, e.clientY);
-          }
-        } else if (this.snapToQuadrantEnabled && this.selectedPieceIds.size > 0 && ray) {
-          // Quadrant tool with a selection: a click centres it on the hovered
-          // cell; a drag still orbits (resolved on pointerup via pointerMoved).
-          const target = pickQuadrant(this.quadrantLayout, ray.origin, ray.dir);
-          this.pendingQuadrantSnap = target ? target.index : null;
+        if (this.isSewEnabled()) {
+          // The sew tool takes the click; the move/rotate tools stand down, but
+          // dragging still orbits so the far side of the garment is reachable.
           this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
+          this.hoverClientX = e.clientX;
+          this.hoverClientY = e.clientY;
+          this.hoverValid = true;
         } else {
-          this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
+          this.camera.update();
+          const ray = unprojectRay(
+            e.clientX,
+            e.clientY,
+            this.canvas,
+            this.camera.getViewProjectMtx()
+          );
+          const hit = ray && this.cloth ? this.cloth.raycast(ray.origin, ray.dir) : null;
+          if (hit && this.cloth) {
+            if (e.shiftKey) {
+              // Shift-click toggles membership; never starts a drag so pieces
+              // aren't nudged while building a multi-selection.
+              this.togglePieceSelected(hit.pieceId);
+              this.nav = 'none';
+            } else {
+              // Clicking a piece that's already part of a group keeps the group
+              // and moves/rotates all of it together.
+              if (!this.selectedPieceIds.has(hit.pieceId)) {
+                this.setPieceSelected(hit.pieceId);
+              }
+              this.beginClothDrag(e.clientX, e.clientY);
+            }
+          } else if (this.snapToQuadrantEnabled && this.selectedPieceIds.size > 0 && ray) {
+            // Quadrant tool with a selection: a click centres it on the hovered
+            // cell; a drag still orbits (resolved on pointerup via pointerMoved).
+            const target = pickQuadrant(this.quadrantLayout, ray.origin, ray.dir);
+            this.pendingQuadrantSnap = target ? target.index : null;
+            this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
+          } else {
+            this.nav = e.shiftKey ? 'orbitHeight' : 'orbit';
+          }
         }
       } else {
         return;
@@ -934,7 +1043,7 @@ export class Transform3dRuntime {
             : this.nav === 'cloth'
               ? 'move'
               : this.nav === 'none'
-                ? this.snapToQuadrantEnabled
+                ? this.isSewEnabled() || this.snapToQuadrantEnabled
                   ? 'crosshair'
                   : this.selectedPieceIds.size > 0
                     ? 'default'
@@ -951,14 +1060,18 @@ export class Transform3dRuntime {
         this.hoveredQuadrant = null;
         this.pushQuadrantOverlay();
       }
+      if (this.isSewEnabled()) this.sewTool?.clear();
     });
 
     this.canvas.addEventListener('pointermove', (e) => {
-      if (this.snapToQuadrantEnabled) {
+      if (this.snapToQuadrantEnabled || this.isSewEnabled()) {
         this.hoverClientX = e.clientX;
         this.hoverClientY = e.clientY;
         this.hoverValid = true;
         if (this.nav === 'none') this.refreshQuadrantHover();
+      }
+      if (this.isSewEnabled() && this.nav === 'none') {
+        this.sewTool?.refreshHover(e.clientX, e.clientY);
       }
       if (this.nav === 'none' || this.nav === 'gizmo') return;
       const dx = e.clientX - this.lastX;
@@ -1037,6 +1150,10 @@ export class Transform3dRuntime {
       const pendingSnap = this.pendingQuadrantSnap;
       this.pendingQuadrantSnap = null;
       const movedCamera = this.nav === 'orbit' || this.nav === 'orbitHeight' || this.nav === 'pan';
+      // The tool reads its own gesture off pointerup, so a drag never sews.
+      const sewConsumed = this.isSewEnabled()
+        ? this.sewTool?.endPress(this.pointerMoved, e.button) ?? false
+        : false;
       if (wasCloth) {
         this.cloth?.setDragging(false);
         this.gizmoAxis = null;
@@ -1053,17 +1170,19 @@ export class Transform3dRuntime {
         /* ignore */
       }
 
-      if (pendingSnap != null && !this.pointerMoved) {
+      if (sewConsumed) {
+        // The sew tool acted on this click — it does not also mean "deselect".
+      } else if (pendingSnap != null && !this.pointerMoved) {
         // Quadrant click (not a drag) — centre the selection on that cell.
         this.snapSelectionToQuadrant(pendingSnap);
-      } else if (wasOrbitClick) {
+      } else if (wasOrbitClick && !this.isSewEnabled()) {
         this.setPieceSelected(null);
       }
-      this.canvas.style.cursor = this.snapToQuadrantEnabled
-        ? 'crosshair'
-        : this.selectedPieceIds.size > 0
-          ? 'default'
-          : 'grab';
+      // A drag that moved the camera moves the cloth under the pointer too.
+      if (this.isSewEnabled() && this.pointerMoved) {
+        this.sewTool?.refreshHover(e.clientX, e.clientY);
+      }
+      this.syncCursor();
     };
     this.canvas.addEventListener('pointerup', endDrag);
     this.canvas.addEventListener('pointercancel', endDrag);
@@ -1121,13 +1240,21 @@ export class Transform3dRuntime {
     return hit;
   }
 
-  frame(): void {
+  /**
+   * One frame. Nothing here changes with time — the arrangement is static — so a
+   * covered viewport simply does not draw until it is uncovered.
+   */
+  frame(visible = true): void {
+    if (!visible) return;
     if (!this.renderer || !this.cloth) return;
     this.resize();
     this.cloth.update(false);
     this.camera.update();
     // Keep the quadrant highlight in sync as the camera orbits/zooms.
     if (this.snapToQuadrantEnabled) this.refreshQuadrantHover();
+    // Same for the sew highlight: it is projected once per frame, so it follows
+    // the camera and the cloth rather than drifting off the edge it marks.
+    if (this.isSewEnabled()) this.sewTool?.sync();
     this.renderer.render(this.cloth, this.camera);
     this.syncMoveGizmo();
   }

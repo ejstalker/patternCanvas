@@ -60,6 +60,22 @@ const BODICES = [
   { name: 'back', definition: BODICE_BACK_BLOCK, role: 'bodiceBack' },
 ] as const;
 
+/**
+ * Point keys a variable moves, deduped — optionally for one role only.
+ *
+ * Each half is drafted with its mirror, and both answer to the same point keys,
+ * so the raw id list names every point twice. The role filter is for the
+ * questions that are about one half: the mirror also *slides* when the block
+ * changes width, because that is what keeping clear of the original costs.
+ */
+function drivenKeys(definition: BlockDefinition, varId: string, role?: string): string[] {
+  const ids = [...(drivenPointIds(definition, instance(definition), null, varId) ?? [])];
+  const keys = ids
+    .filter((id) => (role ? id.split(':')[1] === role : true))
+    .map((id) => id.split(':').pop()!);
+  return [...new Set(keys)].sort();
+}
+
 /** The ease a variable adds on top of its measurement when suggested. */
 function defaultEase(definition: BlockDefinition, id: string): number {
   return definition.variables.find((v) => v.id === id)!.suggested!.offsetCm;
@@ -84,14 +100,15 @@ describe('bodice blocks', () => {
     }
   });
 
-  it('draft one closed piece each', () => {
+  it('draft a closed outline and its mirrored half', () => {
     for (const { definition, role } of BODICES) {
       const generated = generateBlockPieces(definition, instance(definition), null);
-      expect(generated.map((g) => g.role)).toEqual([role]);
-      const drawn = generated[0]!.piece;
-      expect(drawn.closed).toBe(true);
-      expect(drawn.points.length).toBe(10);
-      expect(drawn.grainline).toBeDefined();
+      expect(generated.map((g) => g.role)).toEqual([role, `${role}Mirror`]);
+      for (const { piece: drawn } of generated) {
+        expect(drawn.closed).toBe(true);
+        expect(drawn.points.length).toBe(10);
+        expect(drawn.grainline).toBeDefined();
+      }
     }
   });
 
@@ -568,7 +585,7 @@ describe('bodice body', () => {
       const bindings = defaultBindings(definition, set);
       const values = resolveBlockValues(definition, instance(definition), set);
       const drawn = generateBlockPieces(definition, { ...instance(definition), bindings }, set);
-      expect(drawn).toHaveLength(1);
+      expect(drawn).toHaveLength(2);
       for (const variable of definition.variables) {
         expect(Number.isFinite(values[variable.id]!)).toBe(true);
       }
@@ -582,28 +599,21 @@ describe('bodice inspector integration', () => {
       for (const varId of ['neckWidth', 'neckDepth', 'neckCurve']) {
         const driven = drivenPointIds(definition, instance(definition), null, varId);
         expect(driven, varId).not.toBeNull();
-        const keys = [...driven!].map((id) => id.split(':').pop());
-        expect(keys, varId).toContain('neckShoulder');
+        expect(drivenKeys(definition, varId), varId).toContain('neckShoulder');
       }
       // The curve factor moves no anchor at all — it only bends the cubic — so
       // this one only works because handles count as movement.
-      const curve = [...drivenPointIds(definition, instance(definition), null, 'neckCurve')!].map(
-        (id) => id.split(':').pop()
-      );
-      expect(curve.sort()).toEqual(['neckCentre', 'neckShoulder']);
+      expect(drivenKeys(definition, 'neckCurve')).toEqual(['neckCentre', 'neckShoulder']);
     }
   });
 
   it('lights up the neckline when the depth changes', () => {
     for (const definition of [BODICE_FRONT_BLOCK, BODICE_BACK_BLOCK]) {
-      const keys = [...drivenPointIds(definition, instance(definition), null, 'neckDepth')!].map(
-        (id) => id.split(':').pop()
-      );
       // The depth cuts the hollow further down the centre line, so that anchor
       // moves and the handle hanging off the neck point stretches with it.
       // Nothing else does — the top line, and through it the shoulder tip and
       // the whole armhole, is pinned by the block's height.
-      expect(keys.sort()).toEqual(['neckCentre', 'neckShoulder']);
+      expect(drivenKeys(definition, 'neckDepth')).toEqual(['neckCentre', 'neckShoulder']);
       const shallow = piece(definition, { neckDepth: 2 });
       const deep = piece(definition, { neckDepth: 9 });
       expect(point(deep, 'neckShoulder').anchor).toEqual(point(shallow, 'neckShoulder').anchor);
@@ -615,9 +625,7 @@ describe('bodice inspector integration', () => {
 
   it('leaves the neckline alone when a body control is hovered', () => {
     for (const definition of [BODICE_FRONT_BLOCK, BODICE_BACK_BLOCK]) {
-      const keys = [...drivenPointIds(definition, instance(definition), null, 'dartIntake')!].map(
-        (id) => id.split(':').pop()
-      );
+      const keys = drivenKeys(definition, 'dartIntake');
       expect(keys).not.toContain('neckCentre');
       expect(keys).not.toContain('neckShoulder');
       expect(keys).toContain('dartApex');
@@ -625,10 +633,8 @@ describe('bodice inspector integration', () => {
   });
 
   it('drives the scye from the block width', () => {
-    for (const definition of [BODICE_FRONT_BLOCK, BODICE_BACK_BLOCK]) {
-      const keys = [...drivenPointIds(definition, instance(definition), null, 'width')!].map(
-        (id) => id.split(':').pop()
-      );
+    for (const { definition, role } of BODICES) {
+      const keys = drivenKeys(definition, 'width', role);
       expect(keys).toContain('underarm');
       expect(keys).toContain('across');
       expect(keys).not.toContain('centreWaist');
