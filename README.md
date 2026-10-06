@@ -57,6 +57,7 @@ If you see “WebGPU is not supported,” update the browser and confirm WebGPU 
 - Engines: **CPU mass-spring** or **GPU XPBD**
 - Avatar body collision (load OBJ · optional SDF bake/cache under `refPpl/`)
 - **Strain** map toggle (blue compress · green rest · red stretch)
+- **Freeze a piece** — right-click it and choose *Freeze piece*; it holds its current pose while the rest drapes and across rebuilds, with its seams still pulling. Right-click again to *Unfreeze piece*
 - One active sim at a time; paused sims keep their pose
 
 ---
@@ -71,6 +72,10 @@ If you see “WebGPU is not supported,” update the browser and confirm WebGPU 
 | Duplicate node | ⌘/Ctrl+D · or ⌥/Alt-drag |
 | Orbit 3D (sim / transform) | Drag empty space in the viewport |
 | Move fabric | Drag the cloth (Play or paused) |
+| Aim a seam's direction | Sew tool: hover/click the half of the edge to read from (2D + 3D) |
+| Preview the stitches | With one edge picked, hover a partner (2D + 3D) — dashed lines show the pairing |
+| Reverse / delete a seam | Right-click a sewn edge (Sew edges on) → popover |
+| Freeze / unfreeze a piece | Right-click the piece in the Sim viewport |
 | Exit fullscreen | Esc or ✕ |
 
 Pattern viewport: ⌘/Ctrl-wheel zooms the pattern; Alt-drag pans inside the editor.

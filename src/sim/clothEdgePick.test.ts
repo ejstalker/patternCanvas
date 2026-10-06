@@ -4,6 +4,7 @@ import type { MeshGeometry } from '../project/types';
 import {
   boundaryEdgeKey,
   buildClothBoundaryEdges,
+  buildStitchPreviewPairs,
   distanceToSegment,
   pickClothEdge,
   projectToViewport,
@@ -194,6 +195,38 @@ describe('picking a cloth edge', () => {
   });
 });
 
+describe('stitch preview pairs', () => {
+  const edges = buildClothBoundaryEdges(mesh);
+  const ab = edges.find((e) => e.fromPointId === 'a')!; // vertices [1, 0]
+  const cd = edges.find((e) => e.fromPointId === 'c')!; // vertices [3, 2]
+  const forward = { t0: 0, t1: 1 };
+  const reversed = { t0: 1, t1: 0 };
+
+  it('zips edges end to end when both read forwards', () => {
+    expect(buildStitchPreviewPairs(ab, forward, cd, forward)).toEqual([
+      [1, 3],
+      [0, 2],
+    ]);
+  });
+
+  it('reverses a side when its direction is reversed, revealing the cross', () => {
+    // Reversing one side pairs its near end to the other's far end.
+    expect(buildStitchPreviewPairs(ab, forward, cd, reversed)).toEqual([
+      [1, 2],
+      [0, 3],
+    ]);
+    expect(buildStitchPreviewPairs(ab, reversed, cd, forward)).toEqual([
+      [0, 3],
+      [1, 2],
+    ]);
+  });
+
+  it('produces nothing when an edge has no samples', () => {
+    const empty = { ...ab, vertices: [], tags: [] };
+    expect(buildStitchPreviewPairs(empty, forward, cd, forward)).toEqual([]);
+  });
+});
+
 describe('cloth edge overlay', () => {
   const points = [
     { x: 1, y: 2 },
@@ -227,5 +260,25 @@ describe('cloth edge overlay', () => {
 
     overlay.destroy();
     expect(host.querySelector('.cloth-edge-overlay')).toBeNull();
+  });
+
+  it('draws and clears the stitch preview lines', () => {
+    const host = document.createElement('div');
+    const overlay = new ClothEdgeOverlay(host);
+    expect(host.querySelectorAll('.cloth-edge-stitch-line')).toHaveLength(0);
+
+    overlay.setStitch([
+      [{ x: 1, y: 2 }, { x: 3, y: 4 }],
+      [{ x: 5, y: 6 }, { x: 7, y: 8 }],
+    ]);
+    const lines = host.querySelectorAll('.cloth-edge-stitch-line');
+    expect(lines).toHaveLength(2);
+    expect(lines[0].getAttribute('x1')).toBe('1.00');
+    expect(lines[0].getAttribute('y2')).toBe('4.00');
+    expect(lines[1].getAttribute('x2')).toBe('7.00');
+
+    overlay.setStitch(null);
+    expect(host.querySelectorAll('.cloth-edge-stitch-line')).toHaveLength(0);
+    overlay.destroy();
   });
 });

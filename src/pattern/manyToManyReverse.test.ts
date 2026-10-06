@@ -6,6 +6,7 @@ import {
   triangulatePattern,
 } from '../mesh/triangulate';
 import { buildManyToManySeams } from './multiSew';
+import { reverseSeamsAcrossEdge } from './seamHit';
 
 /**
  * What a many-to-many sew really leaves behind, and what reversing one of its
@@ -179,5 +180,106 @@ describe('reversing a seam that many-to-many sewing made', () => {
     expect(samplesIn('long', 'long-0', 'long-1', 0, 0.5)).not.toBe(agreed);
     // The seam that won the plan is exact.
     expect(samplesIn('long', 'long-0', 'long-1', 0.5, 1)).toBe(agreed);
+  });
+});
+
+/**
+ * The other half of the fix: the order the two groups of edges were handed over
+ * in.
+ *
+ * Reversing a seam's direction cannot help when the whole side was clicked
+ * backwards, because the spans are right and the *partners* are wrong. What has
+ * to change is which partner each span of the shared edge was paired with.
+ */
+describe('reversing the order of the seams sharing an edge', () => {
+  const pieces = [long, short];
+  /** The short panel's top edge (0→1) and right edge (1→2), in space. */
+  const top = edge('short', 0, 1);
+  const right = edge('short', 1, 2);
+
+  /** The pairs a many-to-many sew makes, with the groups in the given order. */
+  const sewInOrder = (targets: SeamEdgeRef[]): SeamBinding[] =>
+    buildManyToManySeams([edge('long', 0, 1)], targets, pieces).map((pair, i) => ({
+      id: `seam-${i}`,
+      ...pair,
+      restGapCm: 0.15,
+    }));
+
+  /** Each resolved stitch: how far along the long edge, and where on the short one. */
+  function stitches(seams: SeamBinding[]): Array<{ longT: number; x: number; y: number }> {
+    const pattern = { id: 'p', pieces, seams } as unknown as PatternDocument;
+    const mesh = triangulatePattern(pattern, DEFAULT_MESH_SETTINGS);
+    const rows: Array<{ longT: number; x: number; y: number }> = [];
+    for (const { a, b } of resolveSeamParticlePairs(pattern, mesh)) {
+      const pa = mesh.vertices[a];
+      const pb = mesh.vertices[b];
+      const [onLong, onShort] = pa.x <= 20 ? [pa, pb] : [pb, pa];
+      if (onLong.x > 20 || onShort.x < 30) continue;
+      const longT = onLong.x / 20;
+      // The corner where the short panel's two edges meet is claimed by both
+      // seams, so it cannot say which seam a stitch belongs to.
+      if (Math.abs(longT - 0.5) < 1e-6) continue;
+      rows.push({ longT, x: onShort.x, y: onShort.y });
+    }
+    return rows;
+  }
+
+  /** Does the run along the long edge reach the short panel's top edge first? */
+  const readsTopFirst = (rows: Array<{ longT: number; x: number; y: number }>) => {
+    const mean = (xs: number[]) => xs.reduce((s, v) => s + v, 0) / xs.length;
+    const firstHalf = rows.filter((r) => r.longT < 0.5);
+    const secondHalf = rows.filter((r) => r.longT > 0.5);
+    // The top edge is at y = 0 and x ∈ [30, 40]; the right edge is at x = 40.
+    return mean(firstHalf.map((r) => r.y)) < mean(secondHalf.map((r) => r.y));
+  };
+
+  it('pairs the halves in the order the edges were clicked', () => {
+    // Clicked top-then-right: the run reads along the seam.
+    expect(readsTopFirst(stitches(sewInOrder([top, right])))).toBe(true);
+    // Clicked right-then-top: the same seams, crossed.
+    expect(readsTopFirst(stitches(sewInOrder([right, top])))).toBe(false);
+  });
+
+  it('un-crosses them, without rebuilding the seams', () => {
+    const crossed = sewInOrder([right, top]);
+    const reversed = reverseSeamsAcrossEdge(crossed, {
+      pieceId: 'long',
+      fromPointId: 'long-0',
+      toPointId: 'long-1',
+      t: 0.25,
+    })!;
+
+    // Same seams, same spans on the shared edge — new partners.
+    expect(reversed.map((s) => s.id)).toEqual(crossed.map((s) => s.id));
+    expect(reversed.map((s) => s.a)).toEqual(crossed.map((s) => s.a));
+    expect(reversed.map((s) => s.b)).toEqual([crossed[1].b, crossed[0].b]);
+
+    const after = stitches(reversed);
+    // Both halves really carry stitches, so "reads top first" is not vacuous.
+    expect(after.some((r) => r.longT < 0.5)).toBe(true);
+    expect(after.some((r) => r.longT > 0.5)).toBe(true);
+    expect(readsTopFirst(after)).toBe(true);
+    // Repairing the pairing moves no stitches: it only re-chooses which of them
+    // go together.
+    expect(after.length).toBe(stitches(crossed).length);
+  });
+
+  it('needs no remesh, and survives one', () => {
+    const crossed = sewInOrder([right, top]);
+    const reversed = reverseSeamsAcrossEdge(crossed, {
+      pieceId: 'long',
+      fromPointId: 'long-0',
+      toPointId: 'long-1',
+      t: 0.25,
+    })!;
+    const meshOf = (seams: SeamBinding[]) =>
+      triangulatePattern(
+        { id: 'p', pieces, seams } as unknown as PatternDocument,
+        DEFAULT_MESH_SETTINGS
+      );
+    expect(meshOf(reversed).vertices.length).toBe(meshOf(crossed).vertices.length);
+    expect(meshOf(reversed).triangles.length).toBe(meshOf(crossed).triangles.length);
+    // And the crossing is still gone after the mesher has had another go at it.
+    expect(readsTopFirst(stitches(reversed))).toBe(true);
   });
 });

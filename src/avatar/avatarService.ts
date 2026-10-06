@@ -6,13 +6,16 @@
 import { AvatarBody } from '../mesh/AvatarBody';
 import { bakeSdfVolume } from '../mesh/sdfBake';
 import { SdfVolume } from '../mesh/sdfVolume';
-import { loadAvatarSdf, saveAvatarSdf } from '../persistence/avatarAssets';
+import { avatarSdfAssetId, loadAvatarSdf, saveAvatarSdf } from '../persistence/avatarAssets';
+import { getAsset } from '../persistence/idb';
 import type { Avatar } from '../project/avatars';
 import { autoCapableFields } from './makehuman/generate';
 import {
+  analyzeCollisionMesh,
   avatarMeshCacheKey,
   generateAvatarMesh,
   MAKEHUMAN_UNIT_TO_WORLD,
+  type CollisionMeshAnalysis,
   type GeneratedAvatarMesh,
 } from './generateMesh';
 
@@ -44,13 +47,7 @@ export async function buildAvatarMeshes(
   avatar: Avatar,
   onProgress?: (done: number, total: number) => void
 ): Promise<GeneratedAvatarMesh> {
-  const measurements = measurementsToCm(avatar);
-  // Model-driven fields are outputs, not goals — don't feed them back in.
-  const manual = new Set(avatar.manual ?? []);
-  for (const field of autoCapableFields()) {
-    if (!manual.has(field)) delete measurements[field];
-  }
-  const input = { gender: avatar.gender, heightCm: measurements.height, measurements };
+  const input = avatarMeshInput(avatar);
   const cacheKey = avatarMeshCacheKey(input);
 
   const cached = meshCache.get(cacheKey);
@@ -65,6 +62,187 @@ export async function buildAvatarMeshes(
   });
   inflight.set(cacheKey, promise);
   return promise;
+}
+
+/**
+ * The inputs a generated mesh is built from: measurements in cm, with the fields
+ * the model itself derives left out (they are outputs, not goals).
+ *
+ * The cache key is derived from this in one place so the status the editor shows
+ * can never disagree with what the cache would actually do.
+ */
+export function avatarMeshInput(avatar: Avatar): {
+  gender: number;
+  heightCm?: number;
+  measurements: Record<string, number>;
+} {
+  const measurements = measurementsToCm(avatar);
+  const manual = new Set(avatar.manual ?? []);
+  for (const field of autoCapableFields()) {
+    if (!manual.has(field)) delete measurements[field];
+  }
+  return { gender: avatar.gender, heightCm: measurements.height, measurements };
+}
+
+/** Cache key the avatar's *current* measurements and settings would generate. */
+export function avatarCacheKeyFor(avatar: Avatar): string {
+  return avatarMeshCacheKey(avatarMeshInput(avatar));
+}
+
+/** Collision representation an avatar is configured for. */
+export function avatarCollisionMode(avatar: Avatar): 'triangle' | 'sdf' {
+  return avatar.sdfResolution ? 'sdf' : 'triangle';
+}
+
+/**
+ * The mesh the collider is built from: the SDF path bakes from the headless
+ * collision mesh, the triangle path collides against the render mesh as-is.
+ */
+function colliderMesh(
+  mesh: GeneratedAvatarMesh,
+  mode: 'triangle' | 'sdf'
+): { positions: Float32Array; indices: Uint32Array } {
+  return mode === 'sdf'
+    ? { positions: mesh.collision.positions, indices: mesh.collision.indices }
+    : { positions: mesh.render.positions, indices: mesh.render.indices };
+}
+
+function analyzeCollider(mesh: GeneratedAvatarMesh, mode: 'triangle' | 'sdf'): CollisionMeshAnalysis {
+  return cachedAnalysis(mesh, mode === 'sdf' ? 'collision' : 'render');
+}
+
+/**
+ * Edge topology of one of a mesh's two surfaces.
+ *
+ * Memoised per generated mesh: the editor asks for these on every status refresh,
+ * and building the edge map for 20k triangles is not something to repeat.
+ */
+const analysisCache = new WeakMap<
+  GeneratedAvatarMesh,
+  Partial<Record<'render' | 'collision', CollisionMeshAnalysis>>
+>();
+
+function cachedAnalysis(
+  mesh: GeneratedAvatarMesh,
+  which: 'render' | 'collision'
+): CollisionMeshAnalysis {
+  let entry = analysisCache.get(mesh);
+  if (!entry) {
+    entry = {};
+    analysisCache.set(mesh, entry);
+  }
+  const hit = entry[which];
+  if (hit) return hit;
+  const value =
+    which === 'render'
+      ? analyzeCollisionMesh(mesh.render.positions, mesh.render.indices)
+      : analyzeCollisionMesh(mesh.collision.positions, mesh.collision.indices);
+  entry[which] = value;
+  return value;
+}
+
+/** What the cloth will collide against, and what that took to produce. */
+export type AvatarCollisionReport = {
+  cacheKey: string;
+  /** Nothing had to be solved: the mesh was already in memory. */
+  meshFromCache: boolean;
+  mode: 'triangle' | 'sdf';
+  resolution?: number;
+  /** Geometry of the mesh collisions are resolved against. */
+  collider: CollisionMeshAnalysis;
+  /** Geometry of the headless mesh an SDF is baked from (SDF mode only). */
+  collisionMesh?: CollisionMeshAnalysis;
+  /** Mesh-space → body-space lift applied to the collision mesh. */
+  floorLift: number;
+  sdfSource?: 'device-cache' | 'baked';
+  bakeMs?: number;
+  sdfBytes?: number;
+  totalMs: number;
+};
+
+/** One line for status bars: what the drape will collide against. */
+export function collisionSummaryText(report: AvatarCollisionReport): string {
+  const tris = `${report.collider.triangles.toLocaleString()} tris`;
+  if (report.mode === 'triangle') return `triangle mesh · ${tris}`;
+  const from =
+    report.sdfSource === 'device-cache'
+      ? 'from device cache'
+      : `baked in ${formatSeconds(report.bakeMs ?? 0)}`;
+  return `SDF ${report.resolution}³ · ${tris} · ${from}`;
+}
+
+function formatSeconds(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms)} ms`;
+}
+
+/**
+ * A baked SDF sitting in the device's IndexedDB for one cache key.
+ *
+ * The record is fetched without reading the blob, so this is cheap enough to run
+ * whenever the avatar editor opens.
+ */
+export type AvatarSdfAsset = { resolution: number; byteLength: number; createdAt: number };
+
+async function readSdfAsset(cacheKey: string, resolution: number): Promise<AvatarSdfAsset | null> {
+  try {
+    const record = await getAsset(avatarSdfAssetId(cacheKey, resolution));
+    if (!record) return null;
+    return { resolution, byteLength: record.byteLength, createdAt: record.createdAt };
+  } catch {
+    return null;
+  }
+}
+
+/** Everything the UI can say about what exists for an avatar, and how current it is. */
+export type AvatarAssetStatus = {
+  /** Key these measurements and settings would generate. */
+  cacheKey: string;
+  /** Key the stored model was generated from, when there is one. */
+  generatedKey: string | null;
+  /** A model was generated for exactly these measurements. */
+  current: boolean;
+  /** A model exists, but these measurements have changed since. */
+  stale: boolean;
+  /** The generated mesh is still in memory, so nothing has to be re-solved. */
+  meshInMemory: boolean;
+  mode: 'triangle' | 'sdf';
+  resolution?: number;
+  /** Geometry of the render mesh (what is drawn), when the mesh is in memory. */
+  render: CollisionMeshAnalysis | null;
+  /** Geometry of the collider, when the mesh is in memory. */
+  collider: CollisionMeshAnalysis | null;
+  /** Geometry of the headless mesh an SDF bakes from, when in memory. */
+  collisionMesh: CollisionMeshAnalysis | null;
+  /** Baked SDF on this device for the current measurements. */
+  sdf: AvatarSdfAsset | null;
+};
+
+/**
+ * What exists for an avatar right now: whether a mesh has been generated for
+ * these measurements, whether it is still in memory, what shape the collider has
+ * and whether an SDF is already baked on this device.
+ */
+export async function describeAvatarAssets(avatar: Avatar): Promise<AvatarAssetStatus> {
+  const cacheKey = avatarCacheKeyFor(avatar);
+  const generatedKey = avatar.model?.cacheKey ?? null;
+  const mode = avatarCollisionMode(avatar);
+  const resolution = avatar.sdfResolution || undefined;
+  const mesh = meshCache.get(cacheKey) ?? null;
+  const sdf = resolution ? await readSdfAsset(cacheKey, resolution) : null;
+
+  return {
+    cacheKey,
+    generatedKey,
+    current: generatedKey === cacheKey,
+    stale: generatedKey !== null && generatedKey !== cacheKey,
+    meshInMemory: mesh !== null,
+    mode,
+    resolution,
+    render: mesh ? cachedAnalysis(mesh, 'render') : null,
+    collider: mesh ? analyzeCollider(mesh, mode) : null,
+    collisionMesh: mesh ? cachedAnalysis(mesh, 'collision') : null,
+    sdf,
+  };
 }
 
 export type AvatarBodyOptions = {
@@ -94,16 +272,26 @@ export async function buildAvatarSdfForMesh(
   mesh: GeneratedAvatarMesh,
   resolution: number,
   onProgress?: (value: number) => void
-): Promise<SdfVolume> {
+): Promise<{ volume: SdfVolume; source: 'device-cache' | 'baked'; ms: number; bytes: number }> {
+  const started = performance.now();
   const cached = await loadAvatarSdf(mesh.cacheKey, resolution);
-  if (cached) return cached;
+  if (cached) {
+    return { volume: cached, source: 'device-cache', ms: performance.now() - started, bytes: 0 };
+  }
+  // `mesh.collision` is already in body space — the same frame the cloth and the
+  // render body live in — so the volume can be sampled with particle positions.
   const { positions, indices } = mesh.collision;
   const bounds = computeBounds(positions);
   const data = await bakeSdfVolume(positions, indices, bounds.min, bounds.max, resolution, {
     onProgress,
   });
   await saveAvatarSdf(mesh.cacheKey, resolution, data);
-  return new SdfVolume(data);
+  return {
+    volume: new SdfVolume(data),
+    source: 'baked',
+    ms: performance.now() - started,
+    bytes: data.distances.byteLength,
+  };
 }
 
 /** Build a renderable {@link AvatarBody} from the generated meshes. */
@@ -111,8 +299,22 @@ export async function createAvatarBodyFromAvatar(
   device: GPUDevice,
   avatar: Avatar,
   options: AvatarBodyOptions = {}
-): Promise<{ body: AvatarBody; mesh: GeneratedAvatarMesh }> {
+): Promise<{ body: AvatarBody; mesh: GeneratedAvatarMesh; collision: AvatarCollisionReport }> {
+  const started = performance.now();
+  const mode = avatarCollisionMode(avatar);
+  const meshFromCache = meshCache.has(avatarCacheKeyFor(avatar));
   const mesh = await buildAvatarMeshes(avatar);
+  const floorLift = mesh.floorLift;
+  const report: AvatarCollisionReport = {
+    cacheKey: mesh.cacheKey,
+    meshFromCache,
+    mode,
+    resolution: avatar.sdfResolution || undefined,
+    collider: analyzeCollider(mesh, mode),
+    floorLift,
+    totalMs: 0,
+  };
+
   if (options.sdfResolution) {
     const sdf = await buildAvatarSdfForMesh(mesh, options.sdfResolution, options.onProgress);
     const body = AvatarBody.fromRawMesh(
@@ -122,14 +324,21 @@ export async function createAvatarBodyFromAvatar(
       device,
       { skipSpatialGrid: true }
     );
-    body.setSdfVolume(sdf);
-    return { body, mesh };
+    body.setSdfVolume(sdf.volume);
+    report.collisionMesh = cachedAnalysis(mesh, 'collision');
+    report.sdfSource = sdf.source;
+    report.bakeMs = sdf.ms;
+    report.sdfBytes = sdf.bytes;
+    report.totalMs = performance.now() - started;
+    return { body, mesh, collision: report };
   }
+
   const body = AvatarBody.fromRawMesh(
     mesh.render.positions,
     mesh.render.indices,
     MAKEHUMAN_UNIT_TO_WORLD,
     device
   );
-  return { body, mesh };
+  report.totalMs = performance.now() - started;
+  return { body, mesh, collision: report };
 }

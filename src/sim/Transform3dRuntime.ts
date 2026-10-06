@@ -110,6 +110,8 @@ export type Transform3dRuntimeOptions = {
   onSewEdges?: (a: SeamEdgeRef, b: SeamEdgeRef) => void;
   /** Right-clicked an edge that a seam runs along: flop that seam end for end. */
   onReverseSeam?: (seamId: string) => void;
+  /** Right-clicked a sewn edge and chose "Delete seam": drop it and rebuild. */
+  onDeleteSeam?: (seamId: string) => void;
 };
 
 export class Transform3dRuntime {
@@ -163,6 +165,7 @@ export class Transform3dRuntime {
   private onSelectionChange?: (pieceId: string | null) => void;
   private onSewEdges?: (a: SeamEdgeRef, b: SeamEdgeRef) => void;
   private onReverseSeam?: (seamId: string) => void;
+  private onDeleteSeam?: (seamId: string) => void;
   private poseHistoryArmed = false;
 
   constructor(
@@ -182,6 +185,7 @@ export class Transform3dRuntime {
     this.onSelectionChange = options.onSelectionChange;
     this.onSewEdges = options.onSewEdges;
     this.onReverseSeam = options.onReverseSeam;
+    this.onDeleteSeam = options.onDeleteSeam;
     this.canvas = canvas;
     this.host = host;
     this.device = device;
@@ -439,6 +443,7 @@ export class Transform3dRuntime {
       getPattern: () => this.pattern,
       onSewEdges: (a, b) => this.onSewEdges?.(a, b),
       onReverseSeam: (seamId) => this.onReverseSeam?.(seamId),
+      onDeleteSeam: (seamId) => this.onDeleteSeam?.(seamId),
     });
     this.mountMoveGizmo();
     this.mountTransformToggle();
@@ -494,7 +499,7 @@ export class Transform3dRuntime {
     this.sewToggle.classList.toggle('is-active', active);
     this.sewToggle.setAttribute('aria-pressed', String(active));
     this.sewToggle.title = usable
-      ? 'Sew edges — highlight and click two cloth edges to sew them together · right-click a sewn edge to reverse it'
+      ? 'Sew edges — click two cloth edges to sew them together · the half you hover sets the direction · right-click a sewn edge for reverse / delete'
       : 'Sew edges — needs a mesh built from a pattern, so its outlines are known';
   }
 

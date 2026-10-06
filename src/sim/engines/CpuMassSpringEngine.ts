@@ -104,6 +104,26 @@ export class CpuMassSpringEngine implements ClothSimulator {
     this.cloth.rotateBy(axis, radians, pieceId);
   }
 
+  setPieceFrozen(pieceId: string, frozen: boolean): void {
+    this.cloth.setPieceFrozen(pieceId, frozen);
+  }
+
+  isPieceFrozen(pieceId: string): boolean {
+    return this.cloth.isPieceFrozen(pieceId);
+  }
+
+  getFrozenPieceIds(): string[] {
+    return this.cloth.getFrozenPieceIds();
+  }
+
+  captureFrozenState(): Record<string, number[]> {
+    return this.cloth.captureFrozenState();
+  }
+
+  applyFrozenState(state: Record<string, number[]> | null | undefined): void {
+    this.cloth.applyFrozenState(state);
+  }
+
   setDragging(dragging: boolean): void {
     this.cloth.setDragging(dragging);
   }

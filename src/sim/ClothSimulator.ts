@@ -55,6 +55,21 @@ export interface ClothSimulator extends ClothRenderExtras {
   applyPieceQuat(pieceId: string, quatXyZw: [number, number, number, number]): void;
   translateBy(delta: vec3, pieceId?: string): void;
   rotateBy(axis: vec3, radians: number, pieceId: string): void;
+  /**
+   * Pin a piece's particles at their current positions (freeze) or release
+   * them. Seam constraints stay live either way: a fixed end simply does not
+   * move while the other end is still pulled.
+   */
+  setPieceFrozen(pieceId: string, frozen: boolean): void;
+  isPieceFrozen(pieceId: string): boolean;
+  getFrozenPieceIds(): string[];
+  /** Live positions of every frozen piece, keyed by piece id (flat xyz). */
+  captureFrozenState(): Record<string, number[]>;
+  /**
+   * Re-pin frozen pieces on a freshly built cloth, placing each at its saved
+   * positions when the particle count still matches (otherwise at rest).
+   */
+  applyFrozenState(state: Record<string, number[]> | null | undefined): void;
   setDragging(dragging: boolean): void;
   /** Latest particle positions (xyz interleaved, world units) for overlays, or null. */
   getPositionsSnapshot?(): Float32Array | null;

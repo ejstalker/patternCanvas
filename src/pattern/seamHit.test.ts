@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { PatternPiece, SeamBinding, SeamEdgeRef } from '../project/types';
-import { findSeamNearPoint, findSeamThroughEdge, seamCoversEdge } from './seamHit';
+import { findSeamNearPoint, findSeamThroughEdge, reverseSeamsAcrossEdge, seamCoversEdge } from './seamHit';
 
 /**
  * A long panel and a short one, with the long one's edge sewn to both of the
@@ -128,5 +128,84 @@ describe('finding the seam a pointer is on', () => {
 
   it('does not pick a seam up from a piece that has none there', () => {
     expect(findSeamNearPoint(seams, pieces, { x: 35, y: 10 }, 2)).toBeNull();
+  });
+});
+
+describe('reversing the order of the seams sharing an edge', () => {
+  /** The shared edge split in half, each half sewn to a *different* short edge. */
+  const fan: SeamBinding[] = [
+    { id: 'first', a: ref('long', 0, 1, 0, 0.5), b: ref('short', 0, 1), restGapCm: 0.15 },
+    { id: 'second', a: ref('long', 0, 1, 0.5, 1), b: ref('short', 1, 2), restGapCm: 0.15 },
+  ];
+
+  it('hands the partners round in reverse and leaves every span where it was', () => {
+    const reversed = reverseSeamsAcrossEdge(fan, onLongEdge(0.25))!;
+    expect(reversed).toHaveLength(2);
+    // The spans still say which part of the shared edge each seam covers...
+    expect(reversed.map((s) => s.a)).toEqual(fan.map((s) => s.a));
+    // ...and the partners have swapped: the first span now takes the last one.
+    expect(reversed[0].b).toEqual(fan[1].b);
+    expect(reversed[1].b).toEqual(fan[0].b);
+    // Identity and fit survive, so the seams stay the same seams.
+    expect(reversed.map((s) => s.id)).toEqual(['first', 'second']);
+    expect(reversed.map((s) => s.restGapCm)).toEqual([0.15, 0.15]);
+  });
+
+  it('leaves the originals alone', () => {
+    reverseSeamsAcrossEdge(fan, onLongEdge(0.25));
+    expect(fan[0].b.fromPointId).toBe('short-0');
+    expect(fan[1].b.fromPointId).toBe('short-1');
+  });
+
+  it('reverses to exactly what it started from when applied twice', () => {
+    const once = reverseSeamsAcrossEdge(fan, onLongEdge(0.25))!;
+    const twice = reverseSeamsAcrossEdge(once, onLongEdge(0.25))!;
+    expect(twice).toEqual(fan);
+  });
+
+  it('orders by where the seams sit on the edge, not by their order in the list', () => {
+    const reversed = reverseSeamsAcrossEdge([...fan].reverse(), onLongEdge(0.25))!;
+    expect(reversed.map((s) => s.id)).toEqual(['first', 'second']);
+    expect(reversed[0].b).toEqual(fan[1].b);
+  });
+
+  it('rewrites whichever side of the seam sits on the edge', () => {
+    // The same fan, handed over with the shared edge on side B.
+    const mirrored: SeamBinding[] = fan.map((seam, i) => ({
+      ...seam,
+      id: `mirror-${i}`,
+      a: seam.b,
+      b: seam.a,
+    }));
+    const reversed = reverseSeamsAcrossEdge(mirrored, onLongEdge(0.25))!;
+    expect(reversed[0].a).toEqual(mirrored[1].a);
+    expect(reversed[1].a).toEqual(mirrored[0].a);
+    expect(reversed.map((s) => s.b)).toEqual(mirrored.map((s) => s.b));
+  });
+
+  it('has nothing to reorder for a single seam on the edge', () => {
+    expect(reverseSeamsAcrossEdge([fan[0]], onLongEdge(0.25))).toBeNull();
+    // Nor for a seam on some other edge, or between two spans of this one.
+    const elsewhere = { ...fan[0], id: 'other', a: ref('short', 0, 1) };
+    expect(reverseSeamsAcrossEdge([fan[1], elsewhere], onLongEdge(0.25))).toBeNull();
+    const selfSeam: SeamBinding = {
+      id: 'self',
+      a: ref('long', 0, 1, 0, 0.5),
+      b: ref('long', 0, 1, 0.5, 1),
+      restGapCm: 0.15,
+    };
+    expect(reverseSeamsAcrossEdge([selfSeam, fan[0]], onLongEdge(0.25))).toBeNull();
+  });
+
+  it('ignores a seam that only touches the edge in the other direction', () => {
+    // long-1 → long-0 is the same segment walked backwards; ids decide, so it
+    // is not part of this run.
+    const backwards: SeamBinding = {
+      id: 'backwards',
+      a: ref('long', 1, 0, 0, 0.5),
+      b: ref('short', 0, 1),
+      restGapCm: 0.15,
+    };
+    expect(reverseSeamsAcrossEdge([fan[0], backwards], onLongEdge(0.25))).toBeNull();
   });
 });

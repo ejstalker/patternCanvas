@@ -96,7 +96,7 @@ import {
 } from '../sim/avatarAsset';
 import { resetAvatarOverlayCache } from '../pattern/avatarPatternOverlay';
 import { DEFAULT_SDF_RESOLUTION } from '../mesh/sdfBake';
-import { buildAvatarMeshes, createAvatarBodyFromAvatar } from '../avatar/avatarService';
+import { buildAvatarMeshes, collisionSummaryText, createAvatarBodyFromAvatar } from '../avatar/avatarService';
 import { updateAvatar } from '../persistence/avatarLibrary';
 import type { Avatar } from '../project/avatars';
 
@@ -147,13 +147,6 @@ function ensureVisibleConnections(project: ProjectDocument): ProjectDocument {
     }
   }
   return p;
-}
-
-/** True when `el` sits entirely inside the horizontal scroll box of `container`. */
-function isFullyVisible(el: HTMLElement, container: HTMLElement): boolean {
-  const a = el.getBoundingClientRect();
-  const b = container.getBoundingClientRect();
-  return a.left >= b.left - 1 && a.right <= b.right + 1;
 }
 
 export class StudioApp {
@@ -207,18 +200,6 @@ export class StudioApp {
   private expandedNodeId: string | null = null;
   private expandPlaceholder: HTMLElement | null = null;
   private expandOverlay: HTMLElement | null = null;
-  /**
-   * What the fullscreen tab strip currently shows, so it is only rebuilt when it
-   * would actually look different.
-   *
-   * `refreshFullscreenTabs` runs on every pattern change, and a drag is a pattern
-   * change per pointer move: rebuilding the strip meant re-parsing its markup,
-   * re-binding its handlers and calling `scrollIntoView` — which forces a layout
-   * of the whole board — dozens of times a second, for a strip that looks exactly
-   * the same. The only thing that changes mid-drag is the stale chip, and only
-   * once.
-   */
-  private fullscreenTabsKey = '';
   private expandEscHandler: ((e: KeyboardEvent) => void) | null = null;
   private imageFileInput: HTMLInputElement;
   private resizeShiftKey = false;
@@ -955,7 +936,7 @@ export class StudioApp {
       }
 
       setStatus('Generating body…');
-      const { body, mesh } = await createAvatarBodyFromAvatar(this.device, avatar, {
+      const { body, mesh, collision } = await createAvatarBodyFromAvatar(this.device, avatar, {
         sdfResolution: options.sdfResolution,
         onProgress: (value) => setStatus(`Baking collision SDF… ${Math.round(value * 100)}%`),
       });
@@ -967,17 +948,27 @@ export class StudioApp {
 
       await updateAvatar(avatar.id, {
         kind: '3d',
-        model: { cacheKey: mesh.cacheKey },
+        model: {
+          cacheKey: mesh.cacheKey,
+          ...(options.sdfResolution ? { sdfResolution: options.sdfResolution } : {}),
+        },
         ...(options.sdfResolution ? { sdfResolution: options.sdfResolution } : {}),
       });
 
-      this.setStatus(`Generated avatar “${avatar.name}” — ${mesh.heightCm.toFixed(0)} cm`);
+      // Say what the drape is now colliding against, and whether it had to be
+      // built from scratch (which is where the seconds go).
+      const collisionText = collisionSummaryText(collision);
+      const reused = collision.meshFromCache ? ' · mesh reused' : ` · ${(collision.totalMs / 1000).toFixed(1)} s`;
+      this.setStatus(
+        `Generated avatar “${avatar.name}” — ${mesh.heightCm.toFixed(0)} cm · ${collisionText}${reused}`
+      );
       return {
         heightCm: mesh.heightCm,
         measured: mesh.measured,
         saturated: mesh.saturated,
         driven: mesh.driven,
         applied: true,
+        collision,
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -2338,25 +2329,11 @@ export class StudioApp {
 
     const pipeline = this.pipelineNodesFor(activeId);
     if (pipeline.length < 2) {
-      this.fullscreenTabsKey = `${activeId}|single`;
       tabs.hidden = true;
       tabs.innerHTML = '';
       if (title) title.hidden = false;
       return;
     }
-
-    const stale = new Map<string, boolean>();
-    for (const n of pipeline) {
-      stale.set(
-        n.id,
-        n.type === 'meshFrame' && !this.project.meshes.find((m) => m.id === n.meshId)?.geometry
-      );
-    }
-    const key = `${activeId}|${pipeline
-      .map((n) => `${n.id}:${stale.get(n.id) ? 'stale' : 'ok'}:${this.pipelineTabLabel(n)}`)
-      .join(',')}|${tabs.hidden}`;
-    if (key === this.fullscreenTabsKey) return;
-    this.fullscreenTabsKey = key;
 
     if (title) title.hidden = true;
     tabs.hidden = false;
@@ -2365,12 +2342,14 @@ export class StudioApp {
     // moved on since the last build is flagged red.
     tabs.innerHTML = pipeline
       .map((n, i) => {
-        const isStale = stale.get(n.id) === true;
+        const stale =
+          n.type === 'meshFrame' &&
+          !this.project.meshes.find((m) => m.id === n.meshId)?.geometry;
         const chip = `<button type="button" role="tab" class="node-fullscreen-tab${
           n.id === activeId ? ' is-active' : ''
-        }${isStale ? ' is-stale' : ''}" data-fs-node="${n.id}" aria-selected="${
+        }${stale ? ' is-stale' : ''}" data-fs-node="${n.id}" aria-selected="${
           n.id === activeId
-        }"${isStale ? ' title="Pattern changed since this mesh was built — it rebuilds when you open a later stage"' : ''}>${this.escapeHtml(
+        }"${stale ? ' title="Pattern changed since this mesh was built — it rebuilds when you open a later stage"' : ''}>${this.escapeHtml(
           this.pipelineTabLabel(n)
         )}</button>`;
         if (i >= pipeline.length - 1) return chip;
@@ -2389,17 +2368,14 @@ export class StudioApp {
     });
 
     // The strip scrolls horizontally; make sure the stage you are looking at is
-    // the one in view (and that a stage is never clipped out of reach). Only when
-    // it is actually out of view: scrolling an already-visible chip still costs a
-    // layout of everything above it.
-    const active = tabs.querySelector<HTMLElement>('.node-fullscreen-tab.is-active');
-    if (active && !isFullyVisible(active, tabs)) {
-      active.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-    }
+    // the one in view (and that a stage is never clipped out of reach).
+    tabs.querySelector('.node-fullscreen-tab.is-active')?.scrollIntoView({
+      block: 'nearest',
+      inline: 'nearest',
+    });
   }
 
   private clearFullscreenTabs(el: HTMLElement): void {
-    this.fullscreenTabsKey = '';
     const title = el.querySelector('.node-title') as HTMLElement | null;
     const tabs = el.querySelector('.node-fullscreen-tabs') as HTMLElement | null;
     if (title) title.hidden = false;
@@ -2747,6 +2723,20 @@ export class StudioApp {
             this.applyPatternPointEdit(patternId, edited),
           onSewEdges: (a, b) => this.sewEdgesFromView(this.patternForSim(sim.id), a, b),
           onReverseSeam: (seamId) => this.reverseSeamFromView(this.patternForSim(sim.id), seamId),
+          onDeleteSeam: (seamId) => this.deleteSeamFromView(this.patternForSim(sim.id), seamId),
+          onBeforeFreezeChange: () => this.pushUndo(),
+          onFreezeChange: (pieceId, frozen) => {
+            this.markDirty(true);
+            const name = this.patternForSim(sim.id)?.pieces.find(
+              (p) => p.id === pieceId
+            )?.name;
+            const label = name?.trim() || 'piece';
+            this.setStatus(
+              frozen
+                ? `Froze ${label} — it holds its shape while the rest drapes`
+                : `Unfroze ${label}`
+            );
+          },
         }
       );
       await runtime.initRenderer();
@@ -2805,6 +2795,8 @@ export class StudioApp {
           onSewEdges: (a, b) => this.sewEdgesFromView(this.patternForTransform(transform.id), a, b),
           onReverseSeam: (seamId) =>
             this.reverseSeamFromView(this.patternForTransform(transform.id), seamId),
+          onDeleteSeam: (seamId) =>
+            this.deleteSeamFromView(this.patternForTransform(transform.id), seamId),
         }
       );
       await runtime.initRenderer();
@@ -3073,6 +3065,19 @@ export class StudioApp {
     this.commitSeamEdit(pattern, 'Reversed the seam direction');
   }
 
+  /** Drop a seam chosen from a 3D viewport's edge popover, then remesh. */
+  private deleteSeamFromView(
+    pattern: PatternDocument | null | undefined,
+    seamId: string
+  ): void {
+    if (!pattern) return;
+    const index = pattern.seams.findIndex((seam) => seam.id === seamId);
+    if (index < 0) return;
+    this.pushUndo();
+    pattern.seams.splice(index, 1);
+    this.commitSeamEdit(pattern, 'Deleted the seam');
+  }
+
   private commitSeamEdit(pattern: PatternDocument, status: string): void {
     for (const node of this.project.canvas.nodes) {
       if (node.type !== 'patternFrame' || node.patternId !== pattern.id) continue;
@@ -3106,36 +3111,12 @@ export class StudioApp {
 
   private tick(): void {
     const active = this.project.activeSimId;
-    const expanded = this.expandedNodeId;
     for (const [simId, rt] of this.simRuntimes) {
-      rt.frame(simId === active, !this.viewportIsHidden('simViewport', simId, expanded));
+      rt.frame(simId === active);
     }
-    for (const [transformId, rt] of this.transformRuntimes) {
-      rt.frame(!this.viewportIsHidden('transform3d', transformId, expanded));
+    for (const rt of this.transformRuntimes.values()) {
+      rt.frame();
     }
-  }
-
-  /**
-   * True when this viewport's node is not the one on screen.
-   *
-   * A fullscreen stage covers the board, but the stages behind it keep their size
-   * and keep drawing: a second WebGPU frame plus a full set of cloth buffer
-   * uploads, sixty times a second, for something nobody can see. On a slower GPU
-   * that is what makes every other interaction feel sluggish.
-   */
-  private viewportIsHidden(
-    type: 'simViewport' | 'transform3d',
-    id: string,
-    expanded: string | null
-  ): boolean {
-    if (!expanded) return false;
-    const node = this.project.canvas.nodes.find((n) =>
-      type === 'simViewport'
-        ? n.type === 'simViewport' && n.simId === id
-        : n.type === 'transform3d' && n.transformId === id
-    );
-    // A runtime with no node of its own cannot be judged — keep drawing it.
-    return node ? node.id !== expanded : false;
   }
 
   private persistTransformStates(): void {
@@ -3258,6 +3239,8 @@ export class StudioApp {
       case 'reset':
         rt.cloth?.resetToInitialState();
         sim.pose = null;
+        // Reset returns every piece to its rest layout, so nothing stays frozen.
+        delete sim.frozenPieces;
         this.setStatus(`Reset: ${sim.name}`);
         break;
       case 'rebuild':

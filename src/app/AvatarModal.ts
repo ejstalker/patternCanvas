@@ -15,6 +15,12 @@ import {
   updateAvatar,
 } from '../persistence/avatarLibrary';
 import { FIELD_DRIVERS, autoCapableFields } from '../avatar/makehuman/generate';
+import {
+  collisionSummaryText,
+  describeAvatarAssets,
+  type AvatarAssetStatus,
+  type AvatarCollisionReport,
+} from '../avatar/avatarService';
 
 export type AvatarReport = {
   heightCm: number;
@@ -22,6 +28,8 @@ export type AvatarReport = {
   saturated: string[];
   driven?: string[];
   applied?: boolean;
+  /** What the cloth will collide against, when the report comes from a generate. */
+  collision?: AvatarCollisionReport;
 };
 
 export type AvatarGenerationOptions = { sdfResolution?: number };
@@ -87,6 +95,8 @@ export class AvatarModal {
   private previewCanvas: HTMLCanvasElement | null = null;
   private overlayEl: HTMLElement | null = null;
   private previewToken = 0;
+  /** Guards the async asset status against a re-render or avatar switch. */
+  private assetToken = 0;
   private showRulers = true;
   /** Keys of collapsed accordions, preserved across re-renders. */
   private readonly accordionKeys = new Set<string>();
@@ -227,6 +237,16 @@ export class AvatarModal {
                       <button type="button" class="primary" id="avatarGenerate">Generate model</button>
                       <span class="muted" id="avatar3dStatus">${active.model ? 'Model cached' : 'Not generated yet'}</span>
                     </div>
+                    <div class="avatar-3d-assets" id="avatar3dAssets">
+                      <div class="avatar-3d-asset">
+                        <span class="avatar-3d-asset-label">Model</span>
+                        <span class="avatar-3d-asset-value" data-asset="model">…</span>
+                      </div>
+                      <div class="avatar-3d-asset">
+                        <span class="avatar-3d-asset-label">Collision</span>
+                        <span class="avatar-3d-asset-value" data-asset="collision">…</span>
+                      </div>
+                    </div>
                   </div>
                 </div>
                 <div class="measure-scroll" id="measureScroll">
@@ -247,6 +267,8 @@ export class AvatarModal {
     this.previewCanvas = this.root.querySelector('.avatar-canvas');
     this.overlayEl = this.root.querySelector('.avatar-view-overlay');
     if (is3d) void this.refreshPreview(active);
+    // 2D avatars have no mesh, so this also decides whether the block shows.
+    void this.refreshAssets();
   }
 
   /** Required (driver) measurements first, then everything the model can derive. */
@@ -357,6 +379,9 @@ export class AvatarModal {
       if (token !== this.previewToken) return;
       this.setPreviewStatus('');
       if (report) this.applyReport(report, false);
+      // The preview is what puts a generated mesh in memory, so the asset rows
+      // have something to read only once it has finished.
+      void this.refreshAssets();
     } catch {
       if (token === this.previewToken) this.setPreviewStatus('Could not render preview');
     }
@@ -470,6 +495,7 @@ export class AvatarModal {
       void updateAvatar(active.id, { decoupled: decoupled.checked }).then((library) => {
         this.library = library;
         this.notify();
+        void this.refreshAssets();
       });
     });
 
@@ -479,6 +505,7 @@ export class AvatarModal {
       void updateAvatar(active.id, { sdfResolution }).then((library) => {
         this.library = library;
         this.notify();
+        void this.refreshAssets();
       });
     });
 
@@ -550,6 +577,7 @@ export class AvatarModal {
       });
       if (info) {
         this.applyReport(info, true);
+        void this.refreshAssets();
         void this.refreshPreview(active);
       }
     } finally {
@@ -571,8 +599,8 @@ export class AvatarModal {
         ? ` · outside range: ${report.saturated.map((f) => FIELD_LABELS.get(f) ?? f).join(', ')}`
         : '';
       status.textContent = `Height ${report.heightCm.toFixed(1)} cm${
-        applied ? ' · applied to sims' : ''
-      }${warn}`;
+        report.collision ? ` · collision ${collisionSummaryText(report.collision)}` : ''
+      }${applied ? ' · applied to sims' : ''}${warn}`;
     }
 
     const convert = active.unit === 'in';
@@ -595,6 +623,146 @@ export class AvatarModal {
       this.queuePatch({ values: next });
       this.updateCount();
     }
+  }
+
+  /**
+   * Report what exists for the active avatar and whether it matches the
+   * measurements on screen.
+   *
+   * The question this answers is the one you cannot answer by looking at the
+   * avatar list: *has a body — and therefore a collision mesh — been generated
+   * for the numbers I am looking at right now?* A stored cache key that no longer
+   * matches means the drape is still colliding with the body the old numbers
+   * made, and nothing else in the UI would say so.
+   */
+  private async refreshAssets(): Promise<void> {
+    const active = this.active;
+    const host = this.root.querySelector<HTMLElement>('#avatar3dAssets');
+    if (!active || !host) return;
+    if (active.kind !== '3d') {
+      host.hidden = true;
+      return;
+    }
+    const token = ++this.assetToken;
+    let status: AvatarAssetStatus;
+    try {
+      status = await describeAvatarAssets(active);
+    } catch {
+      return;
+    }
+    // The modal may have re-rendered or switched avatar while we looked.
+    if (token !== this.assetToken || this.active?.id !== active.id) return;
+
+    const appliedSdf = active.model?.sdfResolution;
+    const applied: 'triangle' | 'sdf' = appliedSdf ? 'sdf' : 'triangle';
+    const mismatch = status.current && applied !== status.mode;
+
+    const modelValue = this.root.querySelector('[data-asset="model"]');
+    const collisionValue = this.root.querySelector('[data-asset="collision"]');
+    const count = (n: number) => n.toLocaleString();
+
+    if (modelValue) {
+      const render = status.render;
+      const detail = render ? `${count(render.triangles)} tris` : 'solved on demand';
+      modelValue.textContent = !status.generatedKey
+        ? status.meshInMemory
+          ? 'solved in this session · not applied to sims'
+          : 'not generated yet'
+        : status.stale
+          ? 'measurements changed — generate again'
+          : `up to date · ${detail}`;
+      modelValue.classList.toggle('is-warn', status.stale);
+      modelValue.setAttribute(
+        'title',
+        [
+          `Cache key ${status.cacheKey}`,
+          status.generatedKey ? `Generated from ${status.generatedKey}` : 'Nothing generated yet',
+          status.stale ? 'These measurements differ from the generated ones.' : '',
+          render
+            ? `Render mesh in memory: ${count(render.vertices)} v / ${count(render.triangles)} t`
+            : 'Mesh is not in memory — generating re-solves it.',
+        ]
+          .filter(Boolean)
+          .join('\n')
+      );
+    }
+
+    if (collisionValue) {
+      collisionValue.textContent = this.collisionRowText(status, mismatch);
+      collisionValue.classList.toggle('is-warn', status.stale || mismatch);
+      collisionValue.setAttribute('title', this.collisionTip(status, applied, mismatch));
+    }
+    host.hidden = false;
+  }
+
+  private collisionRowText(status: AvatarAssetStatus, mismatch: boolean): string {
+    const count = (n: number) => n.toLocaleString();
+    if (!status.generatedKey) {
+      return status.meshInMemory ? 'in this session · not applied' : 'nothing generated yet';
+    }
+    if (status.stale) return 'rebuilds for the new measurements';
+    const shape = status.collider
+      ? `${count(status.collider.triangles)} tris`
+      : 'mesh not in memory';
+    if (status.mode === 'sdf') {
+      const res = `${status.resolution ?? 48}³`;
+      const baked = status.sdf ? 'baked on this device' : 'bakes on Generate';
+      return `SDF ${res} · ${shape} · ${baked}${mismatch ? ' · regenerate to apply' : ''}`;
+    }
+    return `triangle mesh · ${shape}${
+      status.collider?.watertight === false && status.collider.openEdges > 0
+        ? ` · ${count(status.collider.openEdges)} open edges`
+        : ''
+    }${mismatch ? ' · regenerate to drop the SDF' : ''}`;
+  }
+
+  private collisionTip(
+    status: AvatarAssetStatus,
+    applied: 'triangle' | 'sdf',
+    mismatch: boolean
+  ): string {
+    const count = (n: number) => n.toLocaleString();
+    const cm = (dm: number) => `${(dm * 10).toFixed(1)} cm`;
+    const lines: string[] = [];
+    lines.push(
+      status.mode === 'sdf'
+        ? 'Collides against a signed distance field baked from the headless collision mesh.'
+        : 'Collides against the render mesh, head included.'
+    );
+    const collider = status.collider;
+    if (collider) {
+      lines.push(
+        `Collider: ${count(collider.vertices)} v / ${count(collider.triangles)} t, ` +
+          (collider.watertight
+            ? 'watertight'
+            : `${count(collider.openEdges)} open edges, ${count(collider.nonManifoldEdges)} non-manifold`)
+      );
+    } else {
+      lines.push('Collider not in memory — the numbers come back after generating.');
+    }
+    const clipped = status.collisionMesh;
+    if (clipped) {
+      lines.push(
+        `Headless mesh: ${count(clipped.triangles)} t, cut ${cm(clipped.maxY)} from the floor, ` +
+          `reaching ${cm(clipped.cutReach)} from the axis`
+      );
+    }
+    if (status.mode === 'sdf') {
+      lines.push(
+        status.sdf
+          ? `SDF on this device: ${status.resolution}³, ${(status.sdf.byteLength / 1048576).toFixed(1)} MB`
+          : `No SDF on this device yet — generating bakes one at ${status.resolution ?? 48}³.`
+      );
+    }
+    if (status.current && applied !== status.mode) {
+      lines.push(
+        `The drape is still colliding with what was generated last: ${
+          applied === 'sdf' ? `SDF ${status.resolution}³` : 'triangle mesh'
+        }.`
+      );
+    }
+    if (mismatch) lines.push('Generate again to switch collision.');
+    return lines.join('\n');
   }
 
   /** Coalesce keystrokes into one write; also used to flush before generating. */
@@ -630,6 +798,8 @@ export class AvatarModal {
     });
     this.library = library;
     this.notify();
+    // Measurements just changed: the asset rows have to say so.
+    void this.refreshAssets();
   }
 
   private notify(): void {

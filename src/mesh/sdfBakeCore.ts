@@ -484,7 +484,16 @@ function rayHitCount(bvh: Bvh, positions: Float32Array, indices: Uint32Array, ox
   return hits;
 }
 
-/** Bake a signed distance field. Negative inside, positive outside. */
+/**
+ * Bake a signed distance field. Negative inside, positive outside.
+ *
+ * Cell `(ix, iy, iz)` holds the distance at `origin + i * voxelSize` — the
+ * **index-to-world** convention, matching `SdfVolume.sampleAt`, the GPU sampler
+ * in `collide_sdf.wgsl` and `densifyOpenVdbToSdf`. Sampling at cell *centres*
+ * instead put every surface half a voxel inside its geometry, in all three axes
+ * (1.8 cm at 48³ on a body), which reads as a collision mesh floating off the
+ * body it was baked from.
+ */
 export function bakeDistances(req: SdfBakeRequest, onProgress?: BakeProgress): Float32Array {
   const { positions, indices, origin, voxelSize, dim } = req;
   const [nx, ny, nz] = dim;
@@ -495,9 +504,9 @@ export function bakeDistances(req: SdfBakeRequest, onProgress?: BakeProgress): F
   for (let iz = 0; iz < nz; iz++) {
     for (let iy = 0; iy < ny; iy++) {
       for (let ix = 0; ix < nx; ix++) {
-        const px = origin[0] + (ix + 0.5) * voxelSize;
-        const py = origin[1] + (iy + 0.5) * voxelSize;
-        const pz = origin[2] + (iz + 0.5) * voxelSize;
+        const px = origin[0] + ix * voxelSize;
+        const py = origin[1] + iy * voxelSize;
+        const pz = origin[2] + iz * voxelSize;
 
         const distance = closestDistance(bvh, positions, indices, px, py, pz);
         const inside = rayHitCount(bvh, positions, indices, px, py, pz) % 2 === 1;

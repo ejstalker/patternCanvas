@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mat4, vec3 } from 'gl-matrix';
 import type { MeshGeometry, PatternDocument, SeamEdgeRef } from '../project/types';
 import { ClothSewTool, type SewableCamera, type SewableCloth, type ViewportElement } from './ClothSewTool';
@@ -30,8 +30,10 @@ const mesh: MeshGeometry = {
 
 const positions = new Float32Array([0, 0, 0, 0.2, 0, 0, 0, 0.05, 0, 0.2, 0.05, 0, 0.1, 0.1, 0]);
 
-const ON_AB = [55, 50] as const;
-const ON_CD = [55, 47.5] as const;
+// Anchored a little before the midpoint so they sit unambiguously in the first
+// half: direction now depends on which half is picked (see FIRST_HALF below).
+const ON_AB = [56, 50] as const;
+const ON_CD = [56, 47.5] as const;
 
 const seamRef = (fromPointId: string, toPointId: string): SeamEdgeRef => ({
   pieceId: 'p1',
@@ -47,9 +49,33 @@ type Harness = {
   pattern: PatternDocument;
   onSewEdges: ReturnType<typeof vi.fn>;
   onReverseSeam: ReturnType<typeof vi.fn>;
+  onDeleteSeam: ReturnType<typeof vi.fn>;
   hovered: () => string | null;
   source: () => string | null;
   sourceStart: () => string | null;
+};
+
+/** Every tool built by a test, torn down between tests so nothing leaks. */
+const liveTools: ClothSewTool[] = [];
+afterEach(() => {
+  while (liveTools.length) liveTools.pop()!.destroy();
+  document.querySelectorAll('.seam-context-menu').forEach((el) => el.remove());
+});
+
+/** Labels of the open seam popover's buttons, or null when it is closed. */
+const seamMenuItems = (): string[] | null => {
+  const menu = document.querySelector('.seam-context-menu');
+  if (!menu) return null;
+  return Array.from(menu.querySelectorAll('button')).map((b) => b.textContent ?? '');
+};
+
+/** Click the seam popover button with this label. */
+const chooseSeamMenu = (label: string): void => {
+  const button = Array.from(
+    document.querySelectorAll<HTMLButtonElement>('.seam-context-menu button')
+  ).find((b) => b.textContent === label);
+  if (!button) throw new Error(`no seam menu item “${label}”`);
+  button.click();
 };
 
 /** Points of a highlight line, as "x,y" pairs, or null when it is hidden. */
@@ -86,6 +112,7 @@ const makeTool = (seams: PatternDocument['seams'] = []): Harness => {
   const pattern = { id: 'pat1', seams } as unknown as PatternDocument;
   const onSewEdges = vi.fn();
   const onReverseSeam = vi.fn();
+  const onDeleteSeam = vi.fn();
   const tool = new ClothSewTool({
     host,
     canvas,
@@ -94,7 +121,9 @@ const makeTool = (seams: PatternDocument['seams'] = []): Harness => {
     getPattern: () => pattern,
     onSewEdges,
     onReverseSeam,
+    onDeleteSeam,
   });
+  liveTools.push(tool);
   tool.rebuild(mesh);
   tool.setEnabled(true);
   return {
@@ -103,6 +132,7 @@ const makeTool = (seams: PatternDocument['seams'] = []): Harness => {
     pattern,
     onSewEdges,
     onReverseSeam,
+    onDeleteSeam,
     hovered: () => (pointsOf(host, 'hover') ? 'edge' : null),
     source: () => pointsOf(host, 'source')?.join(' ') ?? null,
     sourceStart: () => startOf(host, 'source'),
@@ -165,6 +195,80 @@ describe('cloth sew tool', () => {
     expect(h.onSewEdges).not.toHaveBeenCalled();
   });
 
+  // a→b runs on screen from x = 60 (read-from end) to x = 50, so 57.5 is its
+  // first half and 52.5 its second — the Marvelous Designer direction gesture.
+  const FIRST_HALF = [57.5, 50] as const;
+  const SECOND_HALF = [52.5, 50] as const;
+
+  it('hovering a half previews the direction a click there would sew', () => {
+    const h = makeTool();
+    h.tool.refreshHover(FIRST_HALF[0], FIRST_HALF[1]);
+    expect(startOf(h.host, 'hover')).toBe('60.00,50.00');
+
+    h.tool.refreshHover(SECOND_HALF[0], SECOND_HALF[1]);
+    expect(startOf(h.host, 'hover')).toBe('50.00,50.00');
+  });
+
+  it('the clicked half sets the sewing direction of each edge', () => {
+    const h = makeTool();
+    // First edge picked on its second half → read from b back to a (reversed).
+    expect(click(h.tool, SECOND_HALF)).toBe(true);
+    expect(h.sourceStart()).toBe('50.00,50.00');
+    // Second edge picked on its first half → forward.
+    click(h.tool, ON_CD);
+    expect(h.onSewEdges).toHaveBeenCalledWith(
+      { ...seamRef('a', 'b'), t0: 1, t1: 0 },
+      seamRef('c', 'd')
+    );
+  });
+
+  it('clicking the other half of the pending edge flips it instead of cancelling', () => {
+    const h = makeTool();
+    click(h.tool, FIRST_HALF);
+    expect(h.sourceStart()).toBe('60.00,50.00');
+
+    // Other half of the same edge: same topology, opposite direction → flip.
+    click(h.tool, SECOND_HALF);
+    expect(h.tool.hasPendingEdge()).toBe(true);
+    expect(h.sourceStart()).toBe('50.00,50.00');
+
+    // Same half again now means "take it back".
+    click(h.tool, SECOND_HALF);
+    expect(h.tool.hasPendingEdge()).toBe(false);
+  });
+
+  it('previews the stitches a second click would make', () => {
+    const h = makeTool();
+    click(h.tool, ON_AB);
+    // Picked, but the pointer still sits on the picked edge: nothing to pair.
+    expect(h.host.querySelectorAll('.cloth-edge-stitch-line')).toHaveLength(0);
+
+    h.tool.refreshHover(ON_CD[0], ON_CD[1]);
+    const lines = h.host.querySelectorAll('.cloth-edge-stitch-line');
+    expect(lines).toHaveLength(2);
+    // Forward on both edges: straight across, both ends at x 60 and 50.
+    expect(lines[0].getAttribute('x1')).toBe('60.00');
+    expect(lines[0].getAttribute('x2')).toBe('60.00');
+    expect(lines[1].getAttribute('x1')).toBe('50.00');
+    expect(lines[1].getAttribute('x2')).toBe('50.00');
+
+    // Back onto the source edge: no pairing to show.
+    h.tool.refreshHover(ON_AB[0], ON_AB[1]);
+    expect(h.host.querySelectorAll('.cloth-edge-stitch-line')).toHaveLength(0);
+  });
+
+  it('the hovered half turns the preview into a crossing', () => {
+    const h = makeTool();
+    click(h.tool, ON_AB);
+    // c→d reads from t 0 at screen x 60 to t 1 at x 50, so x 52.5 is its second
+    // (t 0.75) half — picking there reverses that side and the lines cross.
+    h.tool.refreshHover(52.5, 47.5);
+    const lines = h.host.querySelectorAll('.cloth-edge-stitch-line');
+    expect(lines).toHaveLength(2);
+    expect(lines[0].getAttribute('x1')).toBe('60.00');
+    expect(lines[0].getAttribute('x2')).toBe('50.00');
+  });
+
   it('never sews on a drag — a press that moves is the camera', () => {
     const h = makeTool();
     click(h.tool, ON_AB, true);
@@ -198,14 +302,50 @@ describe('cloth sew tool', () => {
     expect(h.onSewEdges).toHaveBeenCalledTimes(1);
   });
 
-  it('right-click reverses the seam through the edge', () => {
+  it('right-click a sewn edge opens a reverse / delete popover', () => {
     const h = makeTool([
       { id: 'seam1', a: seamRef('a', 'b'), b: seamRef('c', 'd'), restGapCm: 0.15 },
     ]);
     h.tool.refreshHover(ON_CD[0], ON_CD[1]);
     h.tool.beginPress(ON_CD[0], ON_CD[1], 2);
     expect(h.tool.endPress(false, 2)).toBe(true);
+    // Nothing happens until a menu item is chosen.
+    expect(h.onReverseSeam).not.toHaveBeenCalled();
+    expect(h.onDeleteSeam).not.toHaveBeenCalled();
+    expect(seamMenuItems()).toEqual(['Reverse seam', 'Delete seam']);
+  });
+
+  it('the popover reverses the seam it was opened on', () => {
+    const h = makeTool([
+      { id: 'seam1', a: seamRef('a', 'b'), b: seamRef('c', 'd'), restGapCm: 0.15 },
+    ]);
+    h.tool.refreshHover(ON_CD[0], ON_CD[1]);
+    h.tool.beginPress(ON_CD[0], ON_CD[1], 2);
+    h.tool.endPress(false, 2);
+    chooseSeamMenu('Reverse seam');
     expect(h.onReverseSeam).toHaveBeenCalledWith('seam1');
+    expect(seamMenuItems()).toBeNull();
+  });
+
+  it('the popover deletes the seam it was opened on', () => {
+    const h = makeTool([
+      { id: 'seam1', a: seamRef('a', 'b'), b: seamRef('c', 'd'), restGapCm: 0.15 },
+    ]);
+    h.tool.refreshHover(ON_CD[0], ON_CD[1]);
+    h.tool.beginPress(ON_CD[0], ON_CD[1], 2);
+    h.tool.endPress(false, 2);
+    chooseSeamMenu('Delete seam');
+    expect(h.onDeleteSeam).toHaveBeenCalledWith('seam1');
+    expect(seamMenuItems()).toBeNull();
+  });
+
+  it('right-click on an unsewn edge is left for the view to handle', () => {
+    const h = makeTool();
+    h.tool.refreshHover(ON_CD[0], ON_CD[1]);
+    h.tool.beginPress(ON_CD[0], ON_CD[1], 2);
+    // Not consumed, so the viewport can show its own (piece) popover instead.
+    expect(h.tool.endPress(false, 2)).toBe(false);
+    expect(seamMenuItems()).toBeNull();
   });
 
   it('right-click flips the pending pick when nothing is sewn there yet', () => {
@@ -263,7 +403,7 @@ describe('cloth sew tool on an edge with several seams', () => {
     return h;
   };
 
-  it('reverses the seam the pointer is actually on', () => {
+  it('targets the seam the pointer is actually on', () => {
     // t 0.25 and t 0.75 of a→b: 57.5 is inside the [0, 0.5] seam, 52.5 inside
     // the [0.5, 1] one. By edge alone these are the same click.
     const inFirst = 57.5;
@@ -273,12 +413,14 @@ describe('cloth sew tool on an edge with several seams', () => {
     first.tool.refreshHover(inFirst, 50);
     first.tool.beginPress(inFirst, 50, 2);
     first.tool.endPress(false, 2);
-    expect(first.onReverseSeam).toHaveBeenCalledWith('first');
+    chooseSeamMenu('Delete seam');
+    expect(first.onDeleteSeam).toHaveBeenCalledWith('first');
 
     const second = makeSplit();
     second.tool.refreshHover(inSecond, 50);
     second.tool.beginPress(inSecond, 50, 2);
     second.tool.endPress(false, 2);
+    chooseSeamMenu('Reverse seam');
     expect(second.onReverseSeam).toHaveBeenCalledWith('second');
   });
 

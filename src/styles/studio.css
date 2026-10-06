@@ -1523,6 +1523,19 @@ body {
   cursor: ew-resize;
 }
 
+/* The rotate zone beside each corner grip: dashed and faint until it is the one
+   under the pointer. Never hit-tested — the editor measures distance, because a
+   ring that wide would otherwise swallow clicks meant for the grips and points
+   inside it. */
+.pattern-rotate-ring {
+  stroke: #6ea8fe;
+  opacity: 0.22;
+}
+
+.pattern-rotate-ring.is-hot {
+  opacity: 0.85;
+}
+
 .pattern-length {
   fill: var(--muted);
   text-anchor: middle;
@@ -2258,6 +2271,23 @@ body {
 .cloth-edge-start.is-hover {
   fill: #ffc65c;
   opacity: 0.8;
+}
+
+/* Stitch preview: the lines a click would create, so a crossed run is obvious. */
+.cloth-edge-stitch-line {
+  stroke: rgba(126, 214, 255, 0.85);
+  stroke-width: 1.4;
+  stroke-dasharray: 5 3;
+  pointer-events: none;
+  filter: drop-shadow(0 0 3px rgba(0, 0, 0, 0.7));
+}
+
+/* Same idea in the pattern editor — dashed blue, over the pending/hover strokes. */
+.pattern-seam-preview-connector {
+  stroke: #7ed6ff;
+  stroke-dasharray: 3 2.5;
+  fill: none;
+  pointer-events: none;
 }
 
 /* "Draw pattern points" — sits to the right of the Move/Rotate toggle. */
@@ -3207,6 +3237,49 @@ body {
   font-size: 11px;
 }
 
+/* What has been generated for these measurements, and whether it still matches. */
+.avatar-3d-assets {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px 7px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--panel) 60%, transparent);
+  font-size: 11px;
+}
+
+.avatar-3d-assets[hidden] {
+  display: none;
+}
+
+.avatar-3d-asset {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.avatar-3d-asset-label {
+  flex: 0 0 58px;
+  color: var(--muted);
+}
+
+.avatar-3d-asset-value {
+  flex: 1;
+  min-width: 0;
+  color: var(--ink);
+  font-family: var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: help;
+}
+
+.avatar-3d-asset-value.is-warn {
+  color: var(--seam);
+}
+
 .avatar-ruler-label {
   position: absolute;
   transform: translate(-50%, -50%);
@@ -3693,7 +3766,9 @@ body {
  * Right-click popover on board nodes (duplicate / delete). Fixed-positioned so
  * it escapes the board's pan/zoom transform.
  */
-.node-context-menu {
+.node-context-menu,
+.piece-context-menu,
+.seam-context-menu {
   position: fixed;
   z-index: 5000;
   min-width: 168px;
@@ -3706,7 +3781,9 @@ body {
   user-select: none;
 }
 
-.node-context-title {
+.node-context-title,
+.piece-context-menu .node-context-title,
+.seam-context-menu .node-context-title {
   margin: 2px 4px 5px;
   padding: 0 4px 6px;
   border-bottom: 1px solid var(--border);
@@ -3717,7 +3794,9 @@ body {
   white-space: nowrap;
 }
 
-.node-context-menu button {
+.node-context-menu button,
+.piece-context-menu button,
+.seam-context-menu button {
   display: block;
   width: 100%;
   padding: 6px 8px;
@@ -3730,11 +3809,14 @@ body {
   text-align: left;
 }
 
-.node-context-menu button:hover {
+.node-context-menu button:hover,
+.piece-context-menu button:hover,
+.seam-context-menu button:hover {
   background: #3a342c;
 }
 
-.node-context-menu button.is-danger:hover {
+.node-context-menu button.is-danger:hover,
+.seam-context-menu button.is-danger:hover {
   background: rgba(196, 92, 74, 0.22);
   color: #f0a091;
 }

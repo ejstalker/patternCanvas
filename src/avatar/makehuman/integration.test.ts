@@ -1,12 +1,19 @@
 import { readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { bakeDistances } from '../../mesh/sdfBakeCore';
+import { floorLift } from '../../mesh/floorLift';
 import { parseBaseMesh } from './baseMesh';
 import { parseTarget, type TargetDelta } from './targetFile';
 import { macroTargetRequests, allMeasureTargetNames } from './macroTargets';
 import { generateAvatar, FIELD_READERS } from './generate';
 import { heightCm, measureCm } from './ruler';
-import { clipAbovePlane, NECK_TOP_VERTEX } from '../generateMesh';
+import {
+  analyzeCollisionMesh,
+  clipAbovePlane,
+  composeAvatarMesh,
+  NECK_TOP_VERTEX,
+} from '../generateMesh';
 
 const ASSET_DIR = resolvePath(process.cwd(), 'refPpl/mh');
 
@@ -139,5 +146,86 @@ describe('MakeHuman integration (real vendored assets)', () => {
     }
     expect(collisionMaxY).toBeCloseTo(planeY, 4);
     expect(collision.indices.length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * The collision mesh's *frame*, which is the part that is easy to get wrong: the
+ * cloth is simulated with the avatar's feet on the floor, so anything baked from
+ * the collision mesh has to be in that same frame.
+ */
+describe('generated avatar collision mesh (real assets)', () => {
+  const base = parseBaseMesh(readFileSync(`${ASSET_DIR}/base.obj`, 'utf8'));
+  const targets = loadTargets();
+  const mesh = composeAvatarMesh(base, (name: string) => targets.get(name) ?? null, {
+    gender: 0.5,
+    heightCm: 170,
+  });
+
+  const yBounds = (positions: Float32Array) => {
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (let i = 1; i < positions.length; i += 3) {
+      minY = Math.min(minY, positions[i]!);
+      maxY = Math.max(maxY, positions[i]!);
+    }
+    return { minY, maxY };
+  };
+
+  it('is emitted in body space, resting on the floor', () => {
+    const render = yBounds(mesh.render.positions);
+    const collision = yBounds(mesh.collision.positions);
+
+    // The render mesh stays in the morph's own frame: hips at 0, feet below.
+    expect(render.minY).toBeLessThan(-5);
+    expect(mesh.floorLift).toBeCloseTo(-render.minY, 6);
+    expect(mesh.floorLift).toBeCloseTo(floorLift(mesh.render.positions), 6);
+
+    // The collision mesh is moved into the frame AvatarBody and the cloth use,
+    // which is also the frame the pattern view's avatar overlay is aligned to.
+    expect(collision.minY).toBeCloseTo(0, 6);
+    const neckTop = mesh.positions[NECK_TOP_VERTEX * 3 + 1]!;
+    expect(collision.maxY).toBeCloseTo(neckTop + mesh.floorLift, 4);
+    // Head removed, body kept.
+    expect(collision.maxY).toBeLessThan(yBounds(mesh.positions).maxY + mesh.floorLift - 1);
+    expect(mesh.collision.indices.length / 3).toBeGreaterThan(5000);
+  });
+
+  it('bakes a field that classifies points in that frame correctly', () => {
+    // A 5 cm voxel box around the pelvis and lower torso, placed using the body
+    // frame only: 10 cm below the hip origin to 40 cm above it.
+    const voxelSize = 0.5;
+    const origin: [number, number, number] = [-1.5, mesh.floorLift - 1, -1.5];
+    const dim: [number, number, number] = [6, 10, 6];
+    const distances = bakeDistances({
+      positions: mesh.collision.positions,
+      indices: mesh.collision.indices,
+      origin,
+      voxelSize,
+      dim,
+    });
+
+    const inside = [...distances].filter((d) => d < 0).length;
+    const fraction = inside / distances.length;
+    // Not empty (the field would be nowhere near the body), and not solid.
+    expect(fraction).toBeGreaterThan(0.15);
+    expect(fraction).toBeLessThan(0.85);
+  });
+
+  it('documents the neck cut: open edges, and a cap wider than the neck (known gap)', () => {
+    const a = analyzeCollisionMesh(mesh.collision.positions, mesh.collision.indices);
+    expect(a.vertices).toBeGreaterThan(1000);
+    expect(a.triangles).toBeGreaterThan(5000);
+    expect(a.nonManifoldEdges).toBe(0);
+    // Snapping the straddling triangles flat leaves one-sided edges behind, so
+    // the mesh is not watertight. Measured: ~300 open edges on a neutral body.
+    expect(a.openEdges).toBeGreaterThan(0);
+    expect(a.openEdges).toBeLessThan(a.triangles * 0.05);
+    expect(a.watertight).toBe(false);
+    // The snapped cap is the head's projection as much as the neck's section:
+    // a real neck ring is ~5-6 cm across, and this reaches ~17 cm from the axis.
+    expect(a.cutReach).toBeGreaterThan(0.6);
+    // The cut is the top of the mesh, and it sits at the neck.
+    expect(a.maxY).toBeGreaterThan(0);
   });
 });

@@ -52,6 +52,15 @@ export type SimViewportRuntimeOptions = {
   onSewEdges?: (a: SeamEdgeRef, b: SeamEdgeRef) => void;
   /** Right-clicked an edge that a seam runs along: flop that seam end for end. */
   onReverseSeam?: (seamId: string) => void;
+  /** Right-clicked a sewn edge and chose "Delete seam": drop it and rebuild. */
+  onDeleteSeam?: (seamId: string) => void;
+  /**
+   * Freeze state on a piece is about to change. The host snapshots undo here,
+   * before the runtime captures the piece's positions.
+   */
+  onBeforeFreezeChange?: () => void;
+  /** A piece was frozen or released: let the host persist / report it. */
+  onFreezeChange?: (pieceId: string, frozen: boolean) => void;
 };
 
 export type SharedGpu = {
@@ -142,6 +151,14 @@ export class SimViewportRuntime {
   private sim: SimInstance;
   private defaultCamera: SimCameraState;
   private options: SimViewportRuntimeOptions;
+  /** Right-click popover on a piece (freeze / unfreeze). */
+  private pieceMenu: HTMLElement | null = null;
+  // Stable handlers so dispose() can remove the global dismiss listeners.
+  private readonly onDocumentPointerDown = () => this.closePieceMenu();
+  private readonly onWindowKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'Escape') this.closePieceMenu();
+  };
+  private readonly onWindowResize = () => this.closePieceMenu();
 
   constructor(
     simId: string,
@@ -197,6 +214,10 @@ export class SimViewportRuntime {
     this.pointMarkerEls = [];
     this.pointMarkers = [];
     this.incidentTriangles = null;
+    this.closePieceMenu();
+    document.removeEventListener('pointerdown', this.onDocumentPointerDown);
+    window.removeEventListener('keydown', this.onWindowKeyDown);
+    window.removeEventListener('resize', this.onWindowResize);
   }
 
   syncFromDocument(sim: SimInstance): void {
@@ -261,6 +282,7 @@ export class SimViewportRuntime {
       getPattern: () => this.pattern,
       onSewEdges: (a, b) => this.options.onSewEdges?.(a, b),
       onReverseSeam: (seamId) => this.options.onReverseSeam?.(seamId),
+      onDeleteSeam: (seamId) => this.options.onDeleteSeam?.(seamId),
     });
     this.mountSewToggle();
     this.bindPointer();
@@ -558,6 +580,7 @@ export class SimViewportRuntime {
         this.nav = 'none';
         this.gizmoAxis = null;
         this.lastPlaneHit = null;
+        this.syncFrozenSnapshot();
       },
     });
   }
@@ -747,6 +770,9 @@ export class SimViewportRuntime {
     if (pose && pose.positions.length >= 12) {
       this.cloth.applyPose(pose);
     }
+    // Frozen pieces keep their captured pose even when a rebuild handed us a
+    // different one (transform layout / cleared pose).
+    this.cloth.applyFrozenState(this.sim.frozenPieces);
     this.cloth.setStrainMapEnabled?.(this.strainMapEnabled);
     // The outline the sew tool picks against comes from the new mesh's boundary
     // tags, so it has to be re-indexed whenever the cloth is.
@@ -964,11 +990,20 @@ export class SimViewportRuntime {
         this.cloth?.setDragging(false);
         this.gizmoAxis = null;
         this.lastPlaneHit = null;
+        // A frozen piece may have been dragged; keep its saved pose current.
+        this.syncFrozenSnapshot();
       }
       if (movedCamera && this.pointerMoved) {
         this.captureCamera(this.sim);
       }
       this.nav = 'none';
+
+      // Right-click on a piece (a click, not a camera drag, and not a seam
+      // reverse) opens its freeze popover.
+      if (e.button === 2 && !this.pointerMoved && !sewConsumed) {
+        const hit = this.pickCloth(e.clientX, e.clientY);
+        if (hit) this.openPieceMenu(hit.pieceId, e.clientX, e.clientY);
+      }
       try {
         this.canvas.releasePointerCapture(e.pointerId);
       } catch {
@@ -1003,7 +1038,17 @@ export class SimViewportRuntime {
       },
       { passive: false }
     );
-    this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    // The viewport owns right-click: keep the event from bubbling to the board's
+    // node menu, which would otherwise stack a second popover over the piece one.
+    this.canvas.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    });
+
+    // Any press elsewhere, plus Esc / resize, dismisses the piece popover.
+    document.addEventListener('pointerdown', this.onDocumentPointerDown);
+    window.addEventListener('keydown', this.onWindowKeyDown);
+    window.addEventListener('resize', this.onWindowResize);
   }
 
   /** Start free-dragging the cloth on a camera-facing plane (same as gizmo free axis). */
@@ -1129,8 +1174,83 @@ export class SimViewportRuntime {
     this.sewToggle.classList.toggle('is-active', active);
     this.sewToggle.setAttribute('aria-pressed', String(active));
     this.sewToggle.title = usable
-      ? 'Sew edges — highlight and click two cloth edges to sew them together · right-click a sewn edge to reverse it'
+      ? 'Sew edges — click two cloth edges to sew them together · the half you hover sets the direction · right-click a sewn edge for reverse / delete'
       : 'Sew edges — needs a mesh built from a pattern, so its outlines are known';
+  }
+
+  /**
+   * Right-click a piece for its freeze popover. A frozen piece holds its current
+   * vertex positions while the rest of the cloth keeps draping; because only
+   * integration is disabled, its seam springs stay live and keep pulling.
+   */
+  private openPieceMenu(pieceId: string, clientX: number, clientY: number): void {
+    this.closePieceMenu();
+    const frozen = this.cloth?.isPieceFrozen(pieceId) ?? false;
+    const menu = document.createElement('div');
+    menu.className = 'piece-context-menu';
+    menu.setAttribute('role', 'menu');
+
+    const title = document.createElement('p');
+    title.className = 'node-context-title';
+    title.textContent = this.pieceLabel(pieceId);
+    menu.appendChild(title);
+
+    const freezeBtn = document.createElement('button');
+    freezeBtn.type = 'button';
+    freezeBtn.setAttribute('role', 'menuitem');
+    freezeBtn.textContent = frozen ? 'Unfreeze piece' : 'Freeze piece';
+    freezeBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.closePieceMenu();
+      this.togglePieceFrozen(pieceId);
+    });
+    menu.appendChild(freezeBtn);
+
+    // Keep presses inside the popover from reaching the dismiss listener.
+    menu.addEventListener('pointerdown', (e) => e.stopPropagation());
+    menu.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    menu.style.left = `${clientX}px`;
+    menu.style.top = `${clientY}px`;
+    document.body.appendChild(menu);
+    this.pieceMenu = menu;
+
+    const rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth - 8) {
+      menu.style.left = `${Math.max(8, window.innerWidth - rect.width - 8)}px`;
+    }
+    if (rect.bottom > window.innerHeight - 8) {
+      menu.style.top = `${Math.max(8, window.innerHeight - rect.height - 8)}px`;
+    }
+  }
+
+  private closePieceMenu(): void {
+    this.pieceMenu?.remove();
+    this.pieceMenu = null;
+  }
+
+  private pieceLabel(pieceId: string): string {
+    const piece = this.pattern?.pieces.find((p) => p.id === pieceId);
+    const name = piece?.name?.trim();
+    return name ? name : 'Piece';
+  }
+
+  private togglePieceFrozen(pieceId: string): void {
+    if (!this.cloth) return;
+    const frozen = !this.cloth.isPieceFrozen(pieceId);
+    this.options.onBeforeFreezeChange?.();
+    this.cloth.setPieceFrozen(pieceId, frozen);
+    this.syncFrozenSnapshot();
+    this.options.onFreezeChange?.(pieceId, frozen);
+  }
+
+  /** Mirror the live frozen pieces (and their positions) onto the sim document. */
+  private syncFrozenSnapshot(): void {
+    if (!this.cloth) return;
+    const state = this.cloth.captureFrozenState();
+    if (Object.keys(state).length === 0) delete this.sim.frozenPieces;
+    else this.sim.frozenPieces = state;
   }
 
   async snapshotDataUrl(): Promise<string> {

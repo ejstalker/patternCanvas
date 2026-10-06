@@ -1,6 +1,7 @@
 import { vec3, mat4 } from 'gl-matrix';
 import { identity } from '../utils/math';
 import { closestPointOnTriangle, triangleNormal } from './triangleCollision';
+import { floorLift } from './floorLift';
 import type { ObjMesh } from './loadObj';
 import type { Particle } from '../physics/Particle';
 import type { SdfVolume } from './sdfVolume';
@@ -153,12 +154,13 @@ export class AvatarBody {
     }
 
     // Rest the mesh on world y=0 (OBJ feet are usually near but not exactly at zero).
-    const floorLift = -this.boundsMin[1];
-    if (Math.abs(floorLift) > 1e-6) {
+    // The same lift defines the collision mesh's frame — see `floorLift`.
+    const lift = floorLift(positions);
+    if (Math.abs(lift) > 1e-6) {
       for (let i = 0; i < vertCount; i++) {
-        positions[i * 3 + 1] += floorLift;
+        positions[i * 3 + 1] += lift;
       }
-      this.boundsMax[1] += floorLift;
+      this.boundsMax[1] += lift;
       this.boundsMin[1] = 0;
     }
 

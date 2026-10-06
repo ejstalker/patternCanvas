@@ -33,15 +33,67 @@ function spanDistance(ref: SeamEdgeRef, t: number): number {
   return 0;
 }
 
-/** Does either side of the seam cover this position? */
-export function seamCoversEdge(seam: SeamBinding, hit: EdgeParamHit): boolean {
-  return [seam.a, seam.b].some(
-    (ref) =>
-      ref.pieceId === hit.pieceId &&
-      ref.fromPointId === hit.fromPointId &&
-      ref.toPointId === hit.toPointId &&
-      spanDistance(ref, hit.t) === 0
+/** Does this side of a seam sit on the edge the pointer is on? */
+function refOnEdge(ref: SeamEdgeRef, hit: EdgeParamHit): boolean {
+  return (
+    ref.pieceId === hit.pieceId &&
+    ref.fromPointId === hit.fromPointId &&
+    ref.toPointId === hit.toPointId
   );
+}
+
+/**
+ * Re-pair the seams that share an edge, in the opposite order.
+ *
+ * A many-to-many sew walks two groups of edges and splits spans to match their
+ * arc lengths, so a single edge can end up carrying several seams side by side.
+ * Hand the two groups over in the wrong order — the left edge clicked before the
+ * right — and every one of those seams pairs the wrong way round: the stitches
+ * cross and a run that should read along the seam reads against it. Reversing a
+ * seam's *direction* cannot fix that, because the spans are fine; what is wrong
+ * is which partner each span is paired with.
+ *
+ * So every span stays exactly where it is and the partners are handed round in
+ * reverse: the first span takes the last partner. Returns the rewritten seams,
+ * or null when the edge has fewer than two seams to reorder.
+ */
+export function reverseSeamsAcrossEdge(
+  seams: readonly SeamBinding[],
+  hit: EdgeParamHit
+): SeamBinding[] | null {
+  const onEdge: Array<{ seam: SeamBinding; local: SeamEdgeRef; partner: SeamEdgeRef; start: number }> =
+    [];
+
+  for (const seam of seams) {
+    const aOnEdge = refOnEdge(seam.a, hit);
+    const bOnEdge = refOnEdge(seam.b, hit);
+    // A seam with both sides on this edge has no partner to hand round, and one
+    // with neither is not part of this run.
+    if (aOnEdge === bOnEdge) continue;
+    const local = aOnEdge ? seam.a : seam.b;
+    onEdge.push({
+      seam,
+      local,
+      partner: aOnEdge ? seam.b : seam.a,
+      start: Math.min(local.t0, local.t1),
+    });
+  }
+  if (onEdge.length < 2) return null;
+
+  const ordered = [...onEdge].sort((x, y) => x.start - y.start);
+  const partners = ordered.map((entry) => entry.partner).reverse();
+
+  return ordered.map((entry, i) => {
+    const partner = partners[i];
+    return refOnEdge(entry.seam.a, hit)
+      ? { ...entry.seam, b: partner }
+      : { ...entry.seam, a: partner };
+  });
+}
+
+/** Does either side of the seam cover this position on this edge? */
+export function seamCoversEdge(seam: SeamBinding, hit: EdgeParamHit): boolean {
+  return [seam.a, seam.b].some((ref) => refOnEdge(ref, hit) && spanDistance(ref, hit.t) === 0);
 }
 
 /**

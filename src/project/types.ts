@@ -302,6 +302,12 @@ export type SimInstance = {
   pose: SimPose | null;
   camera: SimCameraState;
   dropped: boolean;
+  /**
+   * Pattern pieces pinned in place. A frozen piece holds its captured vertex
+   * positions as the sim plays forward and across rebuilds, while the rest of
+   * the cloth keeps draping and its seams stay live. Maps piece id → flat xyz.
+   */
+  frozenPieces?: Record<string, number[]>;
 };
 
 export type CanvasNodeBase = {

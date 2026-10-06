@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { SeamEdgeRef } from '../project/types';
-import { sameSeamBindingPair, sameSeamSpan, sampleEdgeSpanByPointIds } from './geometry';
+import {
+  sameSeamBindingPair,
+  sameSeamSpan,
+  sampleEdgeSpanByPointIds,
+  seamReadsFromSecondHalf,
+  seamRefFromHalf,
+} from './geometry';
 
 function edge(
   pieceId: string,
@@ -26,6 +32,17 @@ describe('seam span helpers', () => {
     const b2 = edge('p2', 'c', 'd', 0.5, 1);
     expect(sameSeamBindingPair(a1, b1, a2, b2)).toBe(true);
     expect(sameSeamBindingPair(a1, b1, b2, a2)).toBe(true);
+  });
+
+  it('reads direction from the picked half', () => {
+    // Near half → forward; far half → reversed.
+    expect(seamRefFromHalf('p', 'a', 'b', 0.2)).toEqual(edge('p', 'a', 'b', 0, 1));
+    expect(seamRefFromHalf('p', 'a', 'b', 0.8)).toEqual(edge('p', 'a', 'b', 1, 0));
+    // Exactly the midpoint counts as the first half.
+    expect(seamRefFromHalf('p', 'a', 'b', 0.5)).toEqual(edge('p', 'a', 'b', 0, 1));
+
+    expect(seamReadsFromSecondHalf(seamRefFromHalf('p', 'a', 'b', 0.2))).toBe(false);
+    expect(seamReadsFromSecondHalf(seamRefFromHalf('p', 'a', 'b', 0.8))).toBe(true);
   });
 
   it('samples only the requested parametric span', () => {

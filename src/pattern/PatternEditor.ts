@@ -32,7 +32,11 @@ import {
   setRulerDrawnLength,
   type RulerHit,
 } from './rulers';
-import { drawMeshSeamConnectors } from '../mesh/meshSeamDraw';
+import {
+  buildSeamConnectorPointPairs,
+  drawMeshSeamConnectors,
+  drawSeamConnectorPairs,
+} from '../mesh/meshSeamDraw';
 import { recordPieceSuccessors } from '../sim/pieceTransforms';
 import { circlePiece, rectPiece, uid } from '../project/createDefault';
 import {
@@ -51,11 +55,18 @@ import {
   pointOnEdgeAtT,
   sameSeamBindingPair,
   sameSeamEdgeTopology,
+  seamReadsFromSecondHalf,
+  seamRefFromHalf,
   sampleEdgeByPointIds,
   sampleEdgeSpanByPointIds,
   segmentLengths,
 } from './geometry';
-import { findSeamNearPoint, seamCoversEdge } from './seamHit';
+import {
+  findSeamNearPoint,
+  reverseSeamsAcrossEdge,
+  seamCoversEdge,
+  type EdgeParamHit,
+} from './seamHit';
 import {
   findBoundaryHits,
   sampleCutterPath,
@@ -85,6 +96,15 @@ import {
   ensureAvatarOverlaySource,
   type AvatarOverlayView,
 } from './avatarPatternOverlay';
+import {
+  CORNER_HANDLES,
+  angleAbout,
+  handleCentre,
+  rotatePoint,
+  rotateZoneAt,
+  snapAngle,
+  type ScaleHandle,
+} from './selectionHandles';
 
 export type PatternEditorCallbacks = {
   onChange: () => void;
@@ -114,11 +134,14 @@ export type PatternTool =
 export type KnifeMode = 'linear' | 'circle' | 'curve';
 export type SewMode = 'segment' | 'many';
 
-type HoverEdge = { pieceId: string; fromPointId: string; toPointId: string };
+/**
+ * The edge under the pointer. Carries the direction a click here would sew
+ * (read from the half the pointer is on), the same gesture the 3D sew tool uses,
+ * so the hover stroke can preview it.
+ */
+type HoverEdge = { pieceId: string; fromPointId: string; toPointId: string; t0: number; t1: number };
 
 /** Corner = free/proportional 2-axis; edge = single-axis (n/s → Y, e/w → X). */
-type ScaleHandle = 'nw' | 'ne' | 'sw' | 'se' | 'n' | 'e' | 's' | 'w';
-
 type PointSnapshot = {
   pieceId: string;
   pointId: string;
@@ -148,6 +171,14 @@ type DragKind =
   | { type: 'knifeCircle'; center: Vec2; radius: number; shift: boolean }
   | { type: 'knifeCurveHandles'; a: Vec2; b: Vec2; c0: Vec2; c1: Vec2 }
   | { type: 'moveSelection'; start: Vec2; snapshots: PointSnapshot[] }
+  | {
+      type: 'rotateSelection';
+      /** Pivot: the centre of the selection box. */
+      center: Vec2;
+      /** Pointer angle about `center` when the drag began, radians. */
+      startAngle: number;
+      snapshots: PointSnapshot[];
+    }
   | {
       type: 'scaleSelection';
       handle: ScaleHandle;
@@ -189,6 +220,14 @@ type SnapGuide =
 type SnapMidTarget = { at: Vec2; a: Vec2; b: Vec2 };
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
+
+/**
+ * Turn arrow for the rotate zone, inline because CSS has no rotate cursor and
+ * the gesture — "grab beside the corner" — is exactly what the pointer has to
+ * say. Hotspot at the centre of the arc, where the pivot sits.
+ */
+const ROTATE_CURSOR =
+  "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23f2ebe3' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M12 6.5a6 6 0 1 1-5.2 3'/%3E%3Cpath d='M12 2.6v5.2l-4.4-2.6z' fill='%23f2ebe3' stroke='none'/%3E%3C/svg%3E\") 12 12, grabbing";
 
 function svgEl<K extends keyof SVGElementTagNameMap>(tag: K): SVGElementTagNameMap[K] {
   return document.createElementNS(SVG_NS, tag);
@@ -323,6 +362,8 @@ export class PatternEditor {
   private contextPieceId: string | null = null;
   /** Seam targeted by the open context menu (when right-clicking a seam). */
   private contextSeamId: string | null = null;
+  /** Where on its edge the seam menu was opened — which seam, and which part of a shared edge. */
+  private contextSeamHit: EdgeParamHit | null = null;
   /** First edge locked while sewing (MD segment sewing). */
   private pendingSeam: SeamEdgeRef | null = null;
   /** Ordered edge groups for many-to-many sewing. */
@@ -331,6 +372,8 @@ export class PatternEditor {
   private multiSewTarget: SeamEdgeRef[] = [];
   /** Edge under the cursor while the sew tool is active. */
   private hoverEdge: HoverEdge | null = null;
+  /** Corner whose rotate zone the pointer is in, while a selection has handles. */
+  private hoverRotate: ScaleHandle | null = null;
   private svgFileInput!: HTMLInputElement;
   private importDialog: HTMLElement | null = null;
   private pendingSvgImport: SvgImportResult | null = null;
@@ -842,6 +885,7 @@ export class PatternEditor {
     this.sewBar.hidden = true;
     this.sewBar.innerHTML = `
       <span data-sew-instruction></span>
+      <button type="button" data-sew-reverse title="Reverse the order of the edges selected for this side">Reverse order</button>
       <button type="button" data-sew-next></button>
       <button type="button" data-sew-cancel aria-label="Cancel many-to-many sewing">Cancel</button>
     `;
@@ -849,6 +893,9 @@ export class PatternEditor {
     this.sealOverlay(this.sewBar);
     this.sewBar.querySelector('[data-sew-next]')?.addEventListener('click', () => {
       this.advanceMultiSew();
+    });
+    this.sewBar.querySelector('[data-sew-reverse]')?.addEventListener('click', () => {
+      this.reverseMultiSewSide();
     });
     this.sewBar.querySelector('[data-sew-cancel]')?.addEventListener('click', () => {
       this.clearMultiSew();
@@ -946,6 +993,7 @@ export class PatternEditor {
       <button type="button" data-act="mirror-y">Mirror duplicate Y</button>
       <button type="button" data-act="delete-piece" class="danger">Delete piece</button>
       <button type="button" data-act="reverse-seam" hidden>Reverse seam</button>
+      <button type="button" data-act="reverse-seam-order" hidden>Reverse seam order here</button>
       <button type="button" data-act="remove-seam" class="danger" hidden>Remove seam</button>
       <button type="button" data-act="ruler-toggle-half" hidden>Toggle full / half width</button>
       <button type="button" data-act="ruler-delete" class="danger" hidden>Delete ruler</button>
@@ -961,6 +1009,7 @@ export class PatternEditor {
       else if (act === 'mirror-y') this.mirrorDuplicateContextPiece('y');
       else if (act === 'delete-piece') this.deleteContextPiece();
       else if (act === 'reverse-seam') this.reverseContextSeam();
+      else if (act === 'reverse-seam-order') this.reverseContextSeamOrder();
       else if (act === 'remove-seam') this.removeContextSeam();
       else if (act === 'ruler-toggle-half') this.setSelectedRulerHalf(!this.selectedRuler()?.half);
       else if (act === 'ruler-delete') this.deleteSelectedRuler();
@@ -1152,7 +1201,14 @@ export class PatternEditor {
     for (const btn of Array.from(this.toolbar.querySelectorAll('button[data-tool]'))) {
       btn.classList.toggle('active', (btn as HTMLElement).dataset.tool === tool);
     }
-    this.svg.style.cursor =
+    this.applyCursor(null);
+    this.redraw();
+  }
+
+  /** Cursor the active tool uses when nothing is under the pointer. */
+  private baseCursor(): string {
+    const tool = this.tool;
+    if (
       tool === 'pen' ||
       tool === 'dart' ||
       tool === 'sew' ||
@@ -1160,11 +1216,21 @@ export class PatternEditor {
       tool === 'circle' ||
       tool === 'knife' ||
       tool === 'ruler'
-        ? 'crosshair'
-        : tool === 'bend'
-          ? 'pointer'
-          : 'default';
-    this.redraw();
+    ) {
+      return 'crosshair';
+    }
+    return tool === 'bend' ? 'pointer' : 'default';
+  }
+
+  /**
+   * The one place the canvas cursor is decided, so hover feedback cannot fight
+   * itself: a ruler in hand outranks the rotate zone, which outranks the tool's
+   * own cursor.
+   */
+  private applyCursor(over: 'ruler' | 'rotate' | null): void {
+    const next =
+      over === 'rotate' ? ROTATE_CURSOR : over === 'ruler' ? 'move' : this.baseCursor();
+    if (this.svg.style.cursor !== next) this.svg.style.cursor = next;
   }
 
   private bindKnifeFlyout(): void {
@@ -2484,6 +2550,27 @@ export class PatternEditor {
       { handle: 'w', cx: x, cy: midY },
       { handle: 'e', cx: x + w, cy: midY },
     ];
+
+    // A dashed ring outside each corner: the rotate zone, drawn where it can be
+    // seen. The grip is a small exact target, so the gesture “just outside it”
+    // needs to be visible or nobody finds it. Pointer-events stay off — the hit
+    // test is distance-based, in `rotateZoneHandle`.
+    for (const c of handles) {
+      if (!CORNER_HANDLES.includes(c.handle)) continue;
+      const ring = svgEl('circle');
+      const inner = this.rotateZoneInner();
+      const outer = this.rotateZoneOuter();
+      ring.setAttribute('cx', String(c.cx));
+      ring.setAttribute('cy', String(c.cy));
+      ring.setAttribute('r', String((inner + outer) / 2 - (outer - inner) / 4));
+      ring.setAttribute('class', `pattern-rotate-ring${this.hoverRotate === c.handle ? ' is-hot' : ''}`);
+      ring.setAttribute('fill', 'none');
+      ring.setAttribute('stroke-width', String(this.px(1.25)));
+      ring.setAttribute('stroke-dasharray', `${this.px(3)} ${this.px(3)}`);
+      ring.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(ring);
+    }
+
     for (const c of handles) {
       const handle = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
       handle.setAttribute('x', String(c.cx - hs / 2));
@@ -2767,6 +2854,19 @@ export class PatternEditor {
       x: fixed.x + (v.x - fixed.x) * safeSx,
       y: fixed.y + (v.y - fixed.y) * safeSy,
     });
+    this.mapSnapshots(snapshots, map);
+  }
+
+  /** Rotate the selection about a pivot. Anchors *and* handles turn together. */
+  private applySnapshotsRotated(
+    snapshots: PointSnapshot[],
+    pivot: Vec2,
+    angle: number
+  ): void {
+    this.mapSnapshots(snapshots, (v) => rotatePoint(v, pivot, angle));
+  }
+
+  private mapSnapshots(snapshots: PointSnapshot[], map: (v: Vec2) => Vec2): void {
     for (const s of snapshots) {
       const piece = this.pattern.pieces.find((x) => x.id === s.pieceId);
       const pt = piece?.points.find((x) => x.id === s.pointId);
@@ -2822,27 +2922,25 @@ export class PatternEditor {
     }
   }
 
-  private scaleHandlePoint(box: BBox, handle: ScaleHandle): Vec2 {
-    const midX = (box.minX + box.maxX) / 2;
-    const midY = (box.minY + box.maxY) / 2;
-    switch (handle) {
-      case 'nw':
-        return { x: box.minX, y: box.minY };
-      case 'ne':
-        return { x: box.maxX, y: box.minY };
-      case 'sw':
-        return { x: box.minX, y: box.maxY };
-      case 'se':
-        return { x: box.maxX, y: box.maxY };
-      case 'n':
-        return { x: midX, y: box.minY };
-      case 's':
-        return { x: midX, y: box.maxY };
-      case 'w':
-        return { x: box.minX, y: midY };
-      case 'e':
-        return { x: box.maxX, y: midY };
-    }
+  /** Inner edge of the rotate zone: just clear of the drawn grip. */
+  private rotateZoneInner(): number {
+    return this.px(7);
+  }
+
+  /** Outer edge of the rotate zone: how far out a drag still reads as rotate. */
+  private rotateZoneOuter(): number {
+    return this.px(20);
+  }
+
+  /**
+   * The corner whose rotate zone the pointer is in, or null.
+   *
+   * Trimmed to *outside* the selection box: a drag that starts inside the box
+   * means “move”, and for a small selection the zone would otherwise cover the
+   * whole thing.
+   */
+  private rotateCornerAt(p: Vec2, box: BBox): ScaleHandle | null {
+    return rotateZoneAt(p, box, this.rotateZoneInner(), this.rotateZoneOuter());
   }
 
   private scaleAxisForHandle(handle: ScaleHandle): 'both' | 'x' | 'y' {
@@ -2919,6 +3017,15 @@ export class PatternEditor {
     if (seamHit) {
       e.stopPropagation();
       this.contextSeamId = seamHit.id;
+      const near = this.findNearestEdgeAcrossPieces(p);
+      this.contextSeamHit = near
+        ? {
+            pieceId: near.piece.id,
+            fromPointId: near.fromPointId,
+            toPointId: near.toPointId,
+            t: near.t,
+          }
+        : null;
       this.contextPieceId = null;
       this.showContextMenu(e.clientX, e.clientY, 'seam');
       this.redraw();
@@ -2946,8 +3053,12 @@ export class PatternEditor {
     mode: 'piece' | 'seam' | 'ruler' = 'piece'
   ): void {
     const pieceActs = ['duplicate', 'mirror-x', 'mirror-y', 'delete-piece'];
-    const seamActs = ['reverse-seam', 'remove-seam'];
+    const seamActs = ['reverse-seam', 'reverse-seam-order', 'remove-seam'];
     const rulerActs = ['ruler-toggle-half', 'ruler-delete'];
+    // Reordering only means something where a run of seams shares one edge.
+    const canReorder =
+      !!this.contextSeamHit &&
+      reverseSeamsAcrossEdge(this.pattern.seams, this.contextSeamHit) !== null;
     for (const btn of Array.from(this.contextMenu.querySelectorAll('button[data-act]'))) {
       const act = (btn as HTMLElement).dataset.act!;
       const show =
@@ -2955,7 +3066,9 @@ export class PatternEditor {
           ? pieceActs.includes(act)
           : mode === 'ruler'
             ? rulerActs.includes(act)
-            : seamActs.includes(act);
+            : act === 'reverse-seam-order'
+              ? canReorder
+              : seamActs.includes(act);
       (btn as HTMLButtonElement).hidden = !show;
     }
 
@@ -2976,6 +3089,7 @@ export class PatternEditor {
     this.contextMenu.hidden = true;
     this.contextPieceId = null;
     this.contextSeamId = null;
+    this.contextSeamHit = null;
   }
 
   /**
@@ -4784,7 +4898,7 @@ export class PatternEditor {
         x: (box.minX + box.maxX) / 2,
         y: (box.minY + box.maxY) / 2,
       };
-      const startHandle = this.scaleHandlePoint(box, handle);
+      const startHandle = handleCentre(box, handle);
       this.markBeforeChange();
       this.drag = {
         type: 'scaleSelection',
@@ -4806,6 +4920,31 @@ export class PatternEditor {
       this.svg.setPointerCapture(e.pointerId);
       e.preventDefault();
       return;
+    }
+
+    // Outside every grip, and outside every element that carries its own
+    // meaning: the rotate zone around a corner. A drag starting near a corner
+    // turns the selection about its centre, and Shift snaps it to 15° steps.
+    if (this.tool === 'move' && !kind && this.selectedIds.size >= 2) {
+      const box = this.selectionScaleBox();
+      const corner = box ? this.rotateCornerAt(p, box) : null;
+      if (corner && box) {
+        const center = {
+          x: (box.minX + box.maxX) / 2,
+          y: (box.minY + box.maxY) / 2,
+        };
+        this.markBeforeChange();
+        this.drag = {
+          type: 'rotateSelection',
+          center,
+          startAngle: angleAbout(p, center),
+          snapshots: this.snapshotSelection(),
+        };
+        this.svg.setPointerCapture(e.pointerId);
+        e.preventDefault();
+        this.redraw();
+        return;
+      }
     }
 
     if (this.tool === 'move' && kind === 'selectionBox') {
@@ -4987,6 +5126,20 @@ export class PatternEditor {
   }
 
   /**
+   * Whole-edge reference read from the half a point landed on (Marvelous
+   * Designer-style): the half you click is the end the edge is read from, so the
+   * sewing direction can be aimed directly. Shared with the 3D sew tool.
+   */
+  private refForHalf(
+    pieceId: string,
+    fromPointId: string,
+    toPointId: string,
+    t: number
+  ): HoverEdge {
+    return seamRefFromHalf(pieceId, fromPointId, toPointId, t);
+  }
+
+  /**
    * Is the place that was clicked already sewn?
    *
    * Not the same question as "does this edge carry a seam": a many-to-many sew
@@ -5025,16 +5178,49 @@ export class PatternEditor {
     this.sewBar.hidden = !active;
     if (!active) return;
     const instruction = this.sewBar.querySelector('[data-sew-instruction]') as HTMLElement;
+    const reverse = this.sewBar.querySelector('[data-sew-reverse]') as HTMLButtonElement;
     const next = this.sewBar.querySelector('[data-sew-next]') as HTMLButtonElement;
     if (this.multiSewPhase === 'source') {
-      instruction.textContent = `Side A: select edges (${this.multiSewSource.length})`;
+      instruction.textContent = `Side A (${this.multiSewSource.length}): ${this.describeSewEdges(this.multiSewSource)}`;
+      instruction.title = instruction.textContent;
+      reverse.disabled = this.multiSewSource.length < 2;
       next.textContent = 'Next side';
       next.disabled = this.multiSewSource.length === 0;
     } else {
-      instruction.textContent = `Side B: select edges (${this.multiSewTarget.length})`;
+      instruction.textContent = `Side B (${this.multiSewTarget.length}): ${this.describeSewEdges(this.multiSewTarget)}`;
+      instruction.title = instruction.textContent;
+      reverse.disabled = this.multiSewTarget.length < 2;
       next.textContent = 'Create seams';
       next.disabled = this.multiSewTarget.length === 0;
     }
+  }
+
+  /**
+   * The selection *in order*, because the order is what the seams are paired in:
+   * hand the two sides over backwards and every seam comes out crossed.
+   */
+  private describeSewEdges(edges: readonly SeamEdgeRef[]): string {
+    if (edges.length === 0) return 'select edges';
+    return edges
+      .map((edge, i) => {
+        const piece = this.pattern.pieces.find((p) => p.id === edge.pieceId);
+        return `${i + 1} ${piece?.name ?? '?'}`;
+      })
+      .join(' \u2192 ');
+  }
+
+  private activeSewEdges(): SeamEdgeRef[] | null {
+    if (this.multiSewPhase === 'source') return this.multiSewSource;
+    return this.multiSewTarget;
+  }
+
+  /** Hand the current side over in the opposite order. */
+  private reverseMultiSewSide(): void {
+    const edges = this.activeSewEdges();
+    if (!edges || edges.length < 2) return;
+    edges.reverse();
+    this.syncSewBar();
+    this.redraw();
   }
 
   private advanceMultiSew(): void {
@@ -5115,13 +5301,19 @@ export class PatternEditor {
     const hit = this.findNearestEdgeAcrossPieces(p);
     if (!hit) return;
 
-    const edge: SeamEdgeRef = {
-      pieceId: hit.piece.id,
-      fromPointId: hit.fromPointId,
-      toPointId: hit.toPointId,
-      t0: 0,
-      t1: 1,
-    };
+    // Many-to-many selects whole edges (its own ordering / reverse controls set
+    // direction), so it stays forward; the segment flow takes direction from the
+    // clicked half.
+    const edge: SeamEdgeRef =
+      this.sewMode === 'many'
+        ? {
+            pieceId: hit.piece.id,
+            fromPointId: hit.fromPointId,
+            toPointId: hit.toPointId,
+            t0: 0,
+            t1: 1,
+          }
+        : this.refForHalf(hit.piece.id, hit.fromPointId, hit.toPointId, hit.t);
 
     if (this.sewMode === 'many') {
       this.onManySewDown(edge, hit.piece.id);
@@ -5137,8 +5329,11 @@ export class PatternEditor {
     }
 
     if (this.sameEdge(this.pendingSeam, edge)) {
-      // Clicking the same edge again cancels the first pick
-      this.pendingSeam = null;
+      // Same edge: clicking the same half takes the pick back, the other half
+      // flips the direction it will be sewn in.
+      const sameDirection =
+        seamReadsFromSecondHalf(this.pendingSeam) === seamReadsFromSecondHalf(edge);
+      this.pendingSeam = sameDirection ? null : edge;
       this.redraw();
       return;
     }
@@ -5194,6 +5389,25 @@ export class PatternEditor {
     this.redraw();
   }
 
+  /**
+   * Hand the partners round among the seams sharing this edge.
+   *
+   * The other half of the fix for a many-to-many run that came out crossed: the
+   * direction of each seam is fine, the order they were paired in is not.
+   */
+  private reverseContextSeamOrder(): void {
+    const hit = this.contextSeamHit;
+    if (!hit) return;
+    const rewritten = reverseSeamsAcrossEdge(this.pattern.seams, hit);
+    if (!rewritten) return;
+    const byId = new Map(rewritten.map((seam) => [seam.id, seam]));
+    this.markBeforeChange();
+    this.pattern.seams = this.pattern.seams.map((seam) => byId.get(seam.id) ?? seam);
+    this.cbs.onChange();
+    this.endHistoryGesture();
+    this.redraw();
+  }
+
   private removeContextSeam(): void {
     if (!this.contextSeamId) return;
     this.markBeforeChange();
@@ -5218,6 +5432,12 @@ export class PatternEditor {
     }
     if (this.pendingSeam) {
       this.drawSeamEdgeStroke(this.pendingSeam, 'pattern-seam-pending', true);
+      // With one edge picked, hovering a partner previews the stitches a click
+      // would make, so a crossing (wrong-direction) run is visible before it is
+      // committed.
+      if (this.hoverEdge && !this.sameEdge(this.pendingSeam, this.hoverEdge)) {
+        this.drawStitchPreview(this.pendingSeam, this.hoverEdge);
+      }
     }
     for (const edge of this.multiSewSource) {
       this.drawSeamEdgeStroke(edge, 'pattern-seam-pending pattern-seam-multi-source', true);
@@ -5255,6 +5475,25 @@ export class PatternEditor {
         }
       }
     }
+  }
+
+  /**
+   * Stitches that sewing `pending` to `hovered` would create, drawn as dashed
+   * lines at matched arc-length samples. Where they cross, the direction is
+   * wrong — the same read as the pattern editor's own seam connectors.
+   */
+  private drawStitchPreview(pending: SeamEdgeRef, hovered: HoverEdge): void {
+    const pieceA = this.pattern.pieces.find((p) => p.id === pending.pieceId);
+    const pieceB = this.pattern.pieces.find((p) => p.id === hovered.pieceId);
+    if (!pieceA || !pieceB) return;
+    // `pending` carries the pick's direction and `hovered` the half's, so the
+    // preview is exactly what committing would sew.
+    const pairs = buildSeamConnectorPointPairs(pieceA, pending, pieceB, hovered);
+    drawSeamConnectorPairs(this.svg, pairs, {
+      className: 'pattern-seam-preview-connector',
+      strokeWidth: this.px(1.4),
+      opacity: 0.9,
+    });
   }
 
   private drawSeamEdgeStroke(
@@ -5519,11 +5758,16 @@ export class PatternEditor {
       const p = this.svgPoint(e);
       const hit = this.findNearestEdgeAcrossPieces(p);
       const next: HoverEdge | null = hit
-        ? { pieceId: hit.piece.id, fromPointId: hit.fromPointId, toPointId: hit.toPointId }
+        ? this.refForHalf(hit.piece.id, hit.fromPointId, hit.toPointId, hit.t)
         : null;
+      // Crossing the midpoint changes the direction the stroke previews, so it
+      // has to redraw even though the edge itself is unchanged.
       const changed =
         (!!next !== !!this.hoverEdge) ||
-        (next && this.hoverEdge && !this.sameEdge(next, this.hoverEdge));
+        (next &&
+          this.hoverEdge &&
+          (!this.sameEdge(next, this.hoverEdge) ||
+            seamReadsFromSecondHalf(next) !== seamReadsFromSecondHalf(this.hoverEdge)));
       if (changed) {
         this.hoverEdge = next;
         this.redraw();
@@ -5531,19 +5775,31 @@ export class PatternEditor {
       return;
     }
 
-    // Hover feedback for rulers (ruler + move tools only).
+    // Hover feedback for rulers, and for the rotate zones beside a selection's
+    // corner grips (ruler + move tools only).
     if (!this.drag && (this.tool === 'ruler' || this.tool === 'move')) {
-      const hit = this.findRulerHit(this.svgPoint(e));
+      const point = this.svgPoint(e);
+      const hit = this.findRulerHit(point);
       const next = hit?.id ?? null;
+      let redraw = false;
       if (next !== this.hoverRulerId) {
         this.hoverRulerId = next;
-        this.redraw();
+        redraw = true;
       }
-      if (this.tool === 'ruler') {
-        this.svg.style.cursor = hit ? 'move' : 'crosshair';
-      } else if (this.svg.style.cursor !== (hit ? 'move' : 'default')) {
-        this.svg.style.cursor = hit ? 'move' : 'default';
+
+      // The rotate zone sits beside the corner rather than on it, so it has no
+      // element of its own to hover: it is measured from the pointer, and only
+      // where nothing else already owns the pixel — a point, a grip, or the box
+      // itself.
+      const free = this.tool === 'move' && !(e.target as SVGElement).dataset?.kind;
+      const box = free && this.selectedIds.size >= 2 ? this.selectionScaleBox() : null;
+      const zone = box ? this.rotateCornerAt(point, box) : null;
+      if (zone !== this.hoverRotate) {
+        this.hoverRotate = zone;
+        redraw = true;
       }
+      if (redraw) this.redraw();
+      this.applyCursor(hit ? 'ruler' : zone ? 'rotate' : null);
     }
 
     if (!this.drag) return;
@@ -5715,6 +5971,18 @@ export class PatternEditor {
         sy = s;
       }
       this.applySnapshotsScaled(d.snapshots, pivot, sx, sy);
+      this.redraw();
+      this.cbs.onChange();
+      return;
+    }
+
+    if (this.drag.type === 'rotateSelection') {
+      const d = this.drag;
+      let delta = angleAbout(p, d.center) - d.startAngle;
+      // Shift snaps the *amount turned*, so a piece can be rotated in exact
+      // steps (15° here, the same step the ruler's own turn gesture uses).
+      if (e.shiftKey) delta = snapAngle(delta, Math.PI / 12);
+      this.applySnapshotsRotated(d.snapshots, d.center, delta);
       this.redraw();
       this.cbs.onChange();
       return;

@@ -22,6 +22,8 @@ export type AvatarKind = '2d' | '3d';
 export type AvatarModelCache = {
   /** Hash of the inputs (measurements + gender + asset version) that produced this model. */
   cacheKey: string;
+  /** Collision resolution the model was generated with; 0/undefined = triangle mesh. */
+  sdfResolution?: number;
   /** IDB asset id for the generated mesh payload. */
   meshAssetId?: string;
   /** IDB asset id for the baked SDF payload. */
@@ -86,6 +88,11 @@ export function normalizeAvatarLibrary(raw: unknown): AvatarLibrary {
       modelRaw && typeof modelRaw === 'object' && typeof (modelRaw as { cacheKey?: unknown }).cacheKey === 'string'
         ? {
             cacheKey: (modelRaw as { cacheKey: string }).cacheKey,
+            sdfResolution:
+              typeof (modelRaw as { sdfResolution?: unknown }).sdfResolution === 'number' &&
+              (modelRaw as { sdfResolution: number }).sdfResolution > 0
+                ? (modelRaw as { sdfResolution: number }).sdfResolution
+                : undefined,
             meshAssetId:
               typeof (modelRaw as { meshAssetId?: unknown }).meshAssetId === 'string'
                 ? (modelRaw as { meshAssetId: string }).meshAssetId

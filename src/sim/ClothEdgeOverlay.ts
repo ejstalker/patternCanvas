@@ -56,6 +56,8 @@ export class ClothEdgeOverlay {
   private root: HTMLDivElement;
   private hoverLine: HighlightLine;
   private sourceLine: HighlightLine;
+  /** Dashed lines previewing the stitches a click would create. */
+  private stitchLayer: SVGGElement;
 
   constructor(host: HTMLElement) {
     this.root = document.createElement('div');
@@ -63,10 +65,14 @@ export class ClothEdgeOverlay {
 
     const svg = document.createElementNS(SVG_NS, 'svg');
     svg.setAttribute('class', 'cloth-edge-layer');
+    this.stitchLayer = document.createElementNS(SVG_NS, 'g');
+    this.stitchLayer.setAttribute('class', 'cloth-edge-stitch');
     this.sourceLine = makeLine('cloth-edge-line is-source');
     this.hoverLine = makeLine('cloth-edge-line is-hover');
-    // Source first: the edge being sewn stays lit under the moving highlight.
+    // Stitch preview under the outlines; source before hover so the edge being
+    // sewn stays lit under the moving highlight.
     svg.append(
+      this.stitchLayer,
       this.sourceLine.polyline,
       this.sourceLine.start,
       this.hoverLine.polyline,
@@ -84,6 +90,21 @@ export class ClothEdgeOverlay {
   /** The first edge of the seam being built, held lit until the seam is made. */
   setSource(points: ReadonlyArray<ClothEdgePoint> | null): void {
     setPoints(this.sourceLine, points);
+  }
+
+  /** Stitch lines a click would make, as screen-space point pairs. */
+  setStitch(pairs: ReadonlyArray<readonly [ClothEdgePoint, ClothEdgePoint]> | null): void {
+    this.stitchLayer.replaceChildren();
+    if (!pairs) return;
+    for (const [a, b] of pairs) {
+      const line = document.createElementNS(SVG_NS, 'line');
+      line.setAttribute('x1', a.x.toFixed(2));
+      line.setAttribute('y1', a.y.toFixed(2));
+      line.setAttribute('x2', b.x.toFixed(2));
+      line.setAttribute('y2', b.y.toFixed(2));
+      line.setAttribute('class', 'cloth-edge-stitch-line');
+      this.stitchLayer.appendChild(line);
+    }
   }
 
   destroy(): void {

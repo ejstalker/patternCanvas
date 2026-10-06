@@ -1,5 +1,22 @@
 import { describe, expect, it } from 'vitest';
+import { vec3 } from 'gl-matrix';
 import { bakeDistances } from './sdfBakeCore';
+import { SdfVolume } from './sdfVolume';
+
+/** A 2×2×2 box centred on the origin: every face is at ±1. */
+function boxMesh() {
+  return {
+    positions: new Float32Array([
+      -1, -1, -1, 1, -1, -1, 1, -1, 1, -1, -1, 1,
+      -1, 1, -1, 1, 1, -1, 1, 1, 1, -1, 1, 1,
+    ]),
+    indices: new Uint32Array([
+      0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7,
+      0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5,
+      2, 3, 7, 2, 7, 6, 3, 0, 4, 3, 4, 7,
+    ]),
+  };
+}
 
 /** UV sphere as a triangle soup. */
 function sphereMesh(radius: number, segments = 24, rings = 16) {
@@ -77,9 +94,10 @@ describe('bakeDistances', () => {
     for (let iz = 1; iz < resolution - 1; iz++) {
       for (let iy = 1; iy < resolution - 1; iy++) {
         for (let ix = 1; ix < resolution - 1; ix++) {
-          const x = origin[0] + (ix + 0.5) * voxelSize;
-          const y = origin[1] + (iy + 0.5) * voxelSize;
-          const z = origin[2] + (iz + 0.5) * voxelSize;
+          // Cell (ix, iy, iz) holds the distance at origin + i * voxelSize.
+          const x = origin[0] + ix * voxelSize;
+          const y = origin[1] + iy * voxelSize;
+          const z = origin[2] + iz * voxelSize;
           const analytic = Math.hypot(x, y, z) - radius;
           const value = sample(ix, iy, iz);
           maxError = Math.max(maxError, Math.abs(Math.abs(value) - Math.abs(analytic)));
@@ -104,5 +122,51 @@ describe('bakeDistances', () => {
     );
     expect(progress.length).toBe(12);
     expect(progress[progress.length - 1]).toBeCloseTo(1);
+  });
+});
+
+/**
+ * The one thing a baked volume has to get right: where its surface is.
+ *
+ * `bakeDistances` writes a value per cell and `SdfVolume.sampleAt` reads them
+ * back; the GPU sampler and the OpenVDB importer write the same layout. All of
+ * them have to agree on which world position a cell holds, or every collision
+ * surface sits half a voxel away from the geometry it was baked from — 1.8 cm at
+ * 48³ on a body.
+ */
+describe('SDF grid convention', () => {
+  const box = boxMesh();
+  const dim: [number, number, number] = [32, 32, 32];
+  const voxelSize = 4 / 32;
+  const origin: [number, number, number] = [-2, -2, -2];
+
+  const volume = () =>
+    new SdfVolume({
+      origin,
+      voxelSize,
+      dim,
+      distances: bakeDistances({ positions: box.positions, indices: box.indices, origin, voxelSize, dim }),
+    });
+
+  /** The surface along a ray, by bisection on the sampled field. */
+  const crossing = (v: SdfVolume, from: number, to: number): number => {
+    let lo = from;
+    let hi = to;
+    for (let i = 0; i < 40; i++) {
+      const mid = (lo + hi) / 2;
+      if (v.sampleAt(vec3.fromValues(0, mid, 0)) < 0) lo = mid;
+      else hi = mid;
+    }
+    return (lo + hi) / 2;
+  };
+
+  it('puts the sampled surface where the geometry is', () => {
+    const v = volume();
+    // The box's top face is at y = 1, its bottom at y = -1.
+    expect(crossing(v, 0.5, 1.5)).toBeCloseTo(1, 3);
+    expect(crossing(v, -0.5, -1.5)).toBeCloseTo(-1, 3);
+    // ...and the same in x, so the shift is not a y-only accident.
+    expect(v.sampleAt(vec3.fromValues(0.5, 0, 0))).toBeLessThan(0);
+    expect(v.sampleAt(vec3.fromValues(1.5, 0, 0))).toBeGreaterThan(0);
   });
 });

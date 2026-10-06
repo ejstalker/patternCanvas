@@ -122,6 +122,10 @@ export class XpbdGpuEngine implements ClothSimulator {
   private edgeLengths: Float32Array;
   private indices: Uint32Array;
   private vertexPieceIds: string[];
+  /** Pieces pinned by zeroing their inverse mass; they never gain velocity. */
+  private frozenPieceIds = new Set<string>();
+  /** Un-frozen per-particle inverse mass, restored when a piece is released. */
+  private restInvMasses: Float32Array;
   private seamPairs: Array<[number, number]>;
 
   private substeps: number;
@@ -254,6 +258,7 @@ export class XpbdGpuEngine implements ClothSimulator {
     this.cpuInitial = new Float32Array(this.topo.initialPositions);
     this.cpuVel = new Float32Array(this.nParticles * 3);
     this.invMasses = new Float32Array(this.topo.inverseMasses);
+    this.restInvMasses = new Float32Array(this.invMasses);
     this.radii = new Float32Array(this.topo.radii);
     this.edgeLengths = new Float32Array(this.topo.edgeLengths);
     this.indices = new Uint32Array(this.topo.indices);
@@ -1202,9 +1207,8 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.totalMass = mass;
       const particleMass = mass / Math.max(1, this.nParticles);
       const inv = particleMass > 0 ? 1 / particleMass : 0;
-      this.invMasses.fill(inv);
-      this.writeBuf(this.invMassBuf, this.invMasses);
-      this.writeMassEdgeBuffer();
+      this.restInvMasses.fill(inv);
+      this.applyFrozenMasses();
     }
   }
 
@@ -1236,6 +1240,8 @@ export class XpbdGpuEngine implements ClothSimulator {
   resetToInitialState(): void {
     this.cpuPos.set(this.cpuInitial);
     this.cpuVel.fill(0);
+    this.frozenPieceIds.clear();
+    this.applyFrozenMasses();
     this.seamRampElapsed = 0;
     this.dragging = false;
     this.prevT = 0;
@@ -1444,6 +1450,95 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.cpuVel[i * 3 + 2] = 0;
     }
     this.syncRenderFromCpu();
+  }
+
+  /**
+   * Freeze a piece by zeroing its particles' inverse mass. The predict and
+   * finalize kernels treat w=0 as immovable, so the piece holds its pose while
+   * XPBD stretch/seam constraints still pull the other (live) end.
+   */
+  setPieceFrozen(pieceId: string, frozen: boolean): void {
+    const changed = frozen
+      ? !this.frozenPieceIds.has(pieceId)
+      : this.frozenPieceIds.has(pieceId);
+    if (!changed) return;
+    if (frozen) this.frozenPieceIds.add(pieceId);
+    else this.frozenPieceIds.delete(pieceId);
+    this.zeroPieceVelocity(pieceId);
+    this.applyFrozenMasses();
+    this.simStateDirty = true;
+  }
+
+  isPieceFrozen(pieceId: string): boolean {
+    return this.frozenPieceIds.has(pieceId);
+  }
+
+  getFrozenPieceIds(): string[] {
+    return [...this.frozenPieceIds];
+  }
+
+  captureFrozenState(): Record<string, number[]> {
+    const state: Record<string, number[]> = {};
+    for (const pieceId of this.frozenPieceIds) {
+      const positions = this.capturePiecePositions(pieceId);
+      if (positions) state[pieceId] = positions;
+    }
+    return state;
+  }
+
+  applyFrozenState(state: Record<string, number[]> | null | undefined): void {
+    this.frozenPieceIds.clear();
+    if (state) {
+      for (const [pieceId, positions] of Object.entries(state)) {
+        let count = 0;
+        for (const id of this.vertexPieceIds) if (id === pieceId) count++;
+        if (count === 0) continue;
+        // A remesh renumbers vertices, so only restore the saved pose when the
+        // per-piece vertex count still lines up; otherwise pin it at rest.
+        if (positions.length === count * 3) {
+          let k = 0;
+          for (let i = 0; i < this.nParticles; i++) {
+            if (this.vertexPieceIds[i] !== pieceId) continue;
+            this.cpuPos[i * 3] = positions[k * 3]!;
+            this.cpuPos[i * 3 + 1] = positions[k * 3 + 1]!;
+            this.cpuPos[i * 3 + 2] = positions[k * 3 + 2]!;
+            k++;
+          }
+        }
+        this.frozenPieceIds.add(pieceId);
+        this.zeroPieceVelocity(pieceId);
+      }
+    }
+    this.applyFrozenMasses();
+    this.simStateDirty = true;
+  }
+
+  private capturePiecePositions(pieceId: string): number[] | null {
+    const out: number[] = [];
+    for (let i = 0; i < this.nParticles; i++) {
+      if (this.vertexPieceIds[i] !== pieceId) continue;
+      out.push(this.cpuPos[i * 3]!, this.cpuPos[i * 3 + 1]!, this.cpuPos[i * 3 + 2]!);
+    }
+    return out.length ? out : null;
+  }
+
+  private zeroPieceVelocity(pieceId: string): void {
+    for (let i = 0; i < this.nParticles; i++) {
+      if (this.vertexPieceIds[i] !== pieceId) continue;
+      this.cpuVel[i * 3] = 0;
+      this.cpuVel[i * 3 + 1] = 0;
+      this.cpuVel[i * 3 + 2] = 0;
+    }
+  }
+
+  /** Rebuild invMasses from the un-frozen rest values, zeroing pinned pieces. */
+  private applyFrozenMasses(): void {
+    for (let i = 0; i < this.nParticles; i++) {
+      const frozen = this.frozenPieceIds.has(this.vertexPieceIds[i]!);
+      this.invMasses[i] = frozen ? 0 : this.restInvMasses[i]!;
+    }
+    this.writeBuf(this.invMassBuf, this.invMasses);
+    this.writeMassEdgeBuffer();
   }
 
   setDragging(dragging: boolean): void {

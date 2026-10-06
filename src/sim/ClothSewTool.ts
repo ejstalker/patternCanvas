@@ -1,11 +1,12 @@
 import { vec3, type mat4 } from 'gl-matrix';
 import type { MeshGeometry, PatternDocument, SeamEdgeRef } from '../project/types';
-import { sameSeamEdgeTopology } from '../pattern/geometry';
+import { sameSeamEdgeTopology, seamReadsFromSecondHalf, seamRefFromHalf } from '../pattern/geometry';
 import { findSeamThroughEdge, seamCoversEdge, type EdgeParamHit } from '../pattern/seamHit';
 import { worldToCanvasPx } from './MoveGizmo';
-import { ClothEdgeOverlay } from './ClothEdgeOverlay';
+import { ClothEdgeOverlay, type ClothEdgePoint } from './ClothEdgeOverlay';
 import {
   buildClothBoundaryEdges,
+  buildStitchPreviewPairs,
   pickClothEdge,
   seamRefForBoundaryEdge,
   type ClothBoundaryEdge,
@@ -14,7 +15,11 @@ import {
 
 /**
  * Sewing on the cloth: hover a piece outline to light it up, click two of them
- * to join them, right-click a sewn one to turn the seam end for end.
+ * to join them, right-click a sewn one for its reverse / delete popover.
+ *
+ * Which *half* of an edge you hover or click sets the seam direction — the end
+ * you pick is the end the edge is read from, so stitch order can be aimed
+ * directly (the Marvelous Designer gesture). The hover marker previews it.
  *
  * Shared by the transform and drape viewports, which differ in everything except
  * this: which camera they look through and where the cloth comes from. It owns
@@ -56,6 +61,8 @@ export type ClothSewToolHost = {
   getPattern: () => PatternDocument | null;
   onSewEdges?: (a: SeamEdgeRef, b: SeamEdgeRef) => void;
   onReverseSeam?: (seamId: string) => void;
+  /** Right-click → "Delete seam": the host drops it and rebuilds. */
+  onDeleteSeam?: (seamId: string) => void;
 };
 
 /** How far from the pointer an edge may be and still be picked. CSS pixels. */
@@ -68,16 +75,32 @@ export class ClothSewTool {
   private edges: ClothBoundaryEdge[] = [];
   private enabled = false;
   private hovered: ClothBoundaryEdge | null = null;
+  /** Where along the hovered edge the pointer is, 0..1 — sets the shown direction. */
+  private hoverT = 0;
   /** First edge of the seam being built, waiting for its partner. */
   private source: SeamEdgeRef | null = null;
   /** Where the pointer was on the edge it pressed, for telling seams apart. */
   private pressed: ClothEdgeHit | null = null;
   private pressWasPick = false;
   private reversePressed: ClothEdgeHit | null = null;
+  /** Where the pointer went down, so the seam popover can open there. */
+  private pressX = 0;
+  private pressY = 0;
+  /** The right-click popover on a sewn edge (reverse / delete). */
+  private seamMenu: HTMLElement | null = null;
+  // Stable handlers so destroy() can remove the global dismiss listeners.
+  private readonly onDocumentPointerDown = () => this.closeSeamMenu();
+  private readonly onWindowKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'Escape') this.closeSeamMenu();
+  };
+  private readonly onWindowResize = () => this.closeSeamMenu();
 
   constructor(options: ClothSewToolHost) {
     this.options = options;
     this.overlay = new ClothEdgeOverlay(options.host);
+    document.addEventListener('pointerdown', this.onDocumentPointerDown);
+    window.addEventListener('keydown', this.onWindowKeyDown);
+    window.addEventListener('resize', this.onWindowResize);
   }
 
   /**
@@ -104,15 +127,18 @@ export class ClothSewTool {
     else this.sync();
   }
 
-  /** Drop the highlight and any half-made seam. */
+  /** Drop the highlight, any half-made seam, and the seam popover. */
   clear(): void {
     this.hovered = null;
+    this.hoverT = 0;
     this.source = null;
     this.pressed = null;
     this.pressWasPick = false;
     this.reversePressed = null;
+    this.closeSeamMenu();
     this.overlay.setHover(null);
     this.overlay.setSource(null);
+    this.overlay.setStitch(null);
   }
 
   /** True while a first edge is picked and waiting for its partner. */
@@ -123,12 +149,17 @@ export class ClothSewTool {
   /** Re-pick the edge under the pointer. Cheap when it has not changed. */
   refreshHover(clientX: number, clientY: number): void {
     const next = this.pickAt(clientX, clientY);
+    // Which half the pointer is on matters as much as the edge: it is the seam
+    // direction preview, so crossing the midpoint has to re-project.
+    const half = (next?.t ?? 0) > 0.5;
     const same =
       (next?.edge.pieceId ?? null) === (this.hovered?.pieceId ?? null) &&
       (next?.edge.fromPointId ?? null) === (this.hovered?.fromPointId ?? null) &&
-      (next?.edge.toPointId ?? null) === (this.hovered?.toPointId ?? null);
+      (next?.edge.toPointId ?? null) === (this.hovered?.toPointId ?? null) &&
+      half === this.hoverT > 0.5; // both are "is the pointer past the midpoint"
     if (same) return;
     this.hovered = next?.edge ?? null;
+    this.hoverT = next?.t ?? 0;
     this.sync();
   }
 
@@ -140,6 +171,8 @@ export class ClothSewTool {
     this.pressed = null;
     this.pressWasPick = false;
     this.reversePressed = null;
+    this.pressX = clientX;
+    this.pressY = clientY;
     if (button === 0) {
       this.pressWasPick = true;
       this.pressed = this.pickAt(clientX, clientY);
@@ -162,8 +195,7 @@ export class ClothSewTool {
     if (moved) return false;
 
     if (button === 2 && reversing) {
-      this.reverseAt(this.paramHit(reversing));
-      return true;
+      return this.reverseAt(this.paramHit(reversing), this.pressX, this.pressY);
     }
     if (!wasPick || button !== 0) return false;
     if (pressed) {
@@ -182,15 +214,83 @@ export class ClothSewTool {
     if (!this.enabled) {
       this.overlay.setHover(null);
       this.overlay.setSource(null);
+      this.overlay.setStitch(null);
       return;
     }
-    this.overlay.setHover(this.projectEdge(this.hovered?.vertices ?? null));
+    // The hover highlight carries the direction a click here would sew: read
+    // from the near half, so the marker sits at the end the pointer is on.
+    const hoverVerts = this.hovered
+      ? this.hoverT > 0.5
+        ? [...this.hovered.vertices].reverse()
+        : this.hovered.vertices
+      : null;
+    this.overlay.setHover(this.projectEdge(hoverVerts));
     this.overlay.setSource(
       this.source ? this.projectEdge(this.verticesForSeamEdge(this.source)) : null
     );
+    this.overlay.setStitch(this.buildStitchPreview());
+  }
+
+  /**
+   * The stitches a click would make, projected to screen. With one edge picked,
+   * hovering a partner shows the pairing (rank-order zipped, exactly as the
+   * mesher sews) — so a crossing, reversed run is visible before it is created.
+   */
+  private buildStitchPreview(): Array<[ClothEdgePoint, ClothEdgePoint]> | null {
+    const source = this.source;
+    const hovered = this.hovered;
+    if (!source || !hovered) return null;
+    const sourceEdge = this.edges.find(
+      (edge) =>
+        edge.pieceId === source.pieceId &&
+        edge.fromPointId === source.fromPointId &&
+        edge.toPointId === source.toPointId
+    );
+    if (!sourceEdge || sourceEdge === hovered) return null;
+    const hoverRef = this.refForHit({
+      pieceId: hovered.pieceId,
+      fromPointId: hovered.fromPointId,
+      toPointId: hovered.toPointId,
+      t: this.hoverT,
+    });
+    if (this.pairAlreadySewn(source, hoverRef)) return null;
+
+    const positions = this.options.getCloth()?.getPositionsSnapshot?.() ?? null;
+    if (!positions || positions.length < 3) return null;
+    const camera = this.options.getCamera();
+    camera.update();
+
+    const pairs = buildStitchPreviewPairs(sourceEdge, source, hovered, hoverRef);
+    const out: Array<[ClothEdgePoint, ClothEdgePoint]> = [];
+    for (const [ia, ib] of pairs) {
+      const a = this.projectVertex(ia, positions, camera);
+      const b = this.projectVertex(ib, positions, camera);
+      if (a && b) out.push([a, b]);
+    }
+    return out.length ? out : null;
+  }
+
+  /** One mesh vertex projected to layout space, or null when off-screen. */
+  private projectVertex(
+    index: number,
+    positions: ArrayLike<number>,
+    camera: SewableCamera
+  ): ClothEdgePoint | null {
+    if (index < 0 || index * 3 + 2 >= positions.length) return null;
+    const px = worldToCanvasPx(
+      vec3.fromValues(positions[index * 3], positions[index * 3 + 1], positions[index * 3 + 2]),
+      camera,
+      this.options.canvas
+    );
+    if (!px || px.behind) return null;
+    return { x: px.x, y: px.y };
   }
 
   destroy(): void {
+    this.closeSeamMenu();
+    document.removeEventListener('pointerdown', this.onDocumentPointerDown);
+    window.removeEventListener('keydown', this.onWindowKeyDown);
+    window.removeEventListener('resize', this.onWindowResize);
     this.overlay.destroy();
     this.edges = [];
   }
@@ -249,24 +349,31 @@ export class ClothSewTool {
     };
   }
 
+  /**
+   * The seam reference a pick means. Which *half* of the edge the pointer was on
+   * decides the sewing direction (Marvelous Designer-style): the half you pick
+   * is where the edge is read from, so the stitch order can be aimed without a
+   * separate reverse step.
+   */
+  private refForHit(hit: EdgeParamHit): SeamEdgeRef {
+    return seamRefFromHalf(hit.pieceId, hit.fromPointId, hit.toPointId, hit.t);
+  }
+
   /** A click: pick, pair, or take the first pick back. */
   private commitPick(hit: EdgeParamHit): void {
-    const ref: SeamEdgeRef = {
-      pieceId: hit.pieceId,
-      fromPointId: hit.fromPointId,
-      toPointId: hit.toPointId,
-      t0: 0,
-      t1: 1,
-    };
+    const ref = this.refForHit(hit);
     if (!this.source) {
       if (this.edgeHasSeam(hit)) return;
       this.source = ref;
       this.sync();
       return;
     }
-    // Clicking the same edge again takes the first pick back.
     if (sameSeamEdgeTopology(this.source, ref)) {
-      this.source = null;
+      // Same edge: clicking the same half takes the pick back, the other half
+      // flips the direction the seam will be sewn in.
+      const sameDirection =
+        seamReadsFromSecondHalf(this.source) === seamReadsFromSecondHalf(ref);
+      this.source = sameDirection ? null : ref;
       this.sync();
       return;
     }
@@ -280,20 +387,22 @@ export class ClothSewTool {
   }
 
   /**
-   * Right-click: turn a seam end for end, so the two sides are read the same way.
+   * Right-click: on a sewn edge, open the seam popover (reverse / delete); on
+   * the half-made first pick, flip it end for end.
    *
    * Which end of an edge meets which is decided by direction, and on a mirrored
-   * piece "the same way" is not the way it looks. This is the escape hatch, the
-   * one the pattern editor's seam menu also offers.
+   * piece "the same way" is not the way it looks — reversing is the correction,
+   * the same escape hatch the pattern editor's seam menu offers. Returns true
+   * when it acted, so the view does not also treat the click as something else.
    */
-  private reverseAt(hit: EdgeParamHit): void {
+  private reverseAt(hit: EdgeParamHit, clientX: number, clientY: number): boolean {
     // Only a seam the pointer is actually on: a click in the free half of a
-    // half-sewn edge must not flip the neighbour it happens to share the edge
-    // with. There is no highlight to warn you here, the click acts at once.
+    // half-sewn edge must not touch the neighbour it happens to share the edge
+    // with, and one many-to-many run leaves several seams along a single edge.
     const seam = this.seamThroughEdge(hit);
     if (seam && this.seamCovers(hit)) {
-      this.options.onReverseSeam?.(seam);
-      return;
+      this.openSeamMenu(seam, clientX, clientY);
+      return true;
     }
     // Nothing sewn here yet — flip the half-made seam instead, so the first pick
     // can be turned round before the second one is chosen.
@@ -307,7 +416,87 @@ export class ClothSewTool {
       this.source.t0 = this.source.t1;
       this.source.t1 = t0;
       this.sync();
+      return true;
     }
+    return false;
+  }
+
+  /** Popover for a sewn edge: reverse the seam, or delete it outright. */
+  private openSeamMenu(seamId: string, clientX: number, clientY: number): void {
+    this.closeSeamMenu();
+    const menu = document.createElement('div');
+    menu.className = 'seam-context-menu';
+    menu.setAttribute('role', 'menu');
+
+    const title = document.createElement('p');
+    title.className = 'node-context-title';
+    title.textContent = this.seamLabel(seamId);
+    menu.appendChild(title);
+
+    menu.appendChild(
+      this.menuButton('Reverse seam', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.closeSeamMenu();
+        this.options.onReverseSeam?.(seamId);
+      })
+    );
+    menu.appendChild(
+      this.menuButton(
+        'Delete seam',
+        (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this.closeSeamMenu();
+          this.options.onDeleteSeam?.(seamId);
+        },
+        'is-danger'
+      )
+    );
+
+    // Keep presses inside the popover from reaching the dismiss listener.
+    menu.addEventListener('pointerdown', (e) => e.stopPropagation());
+    menu.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    menu.style.left = `${clientX}px`;
+    menu.style.top = `${clientY}px`;
+    document.body.appendChild(menu);
+    this.seamMenu = menu;
+
+    const rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth - 8) {
+      menu.style.left = `${Math.max(8, window.innerWidth - rect.width - 8)}px`;
+    }
+    if (rect.bottom > window.innerHeight - 8) {
+      menu.style.top = `${Math.max(8, window.innerHeight - rect.height - 8)}px`;
+    }
+  }
+
+  private menuButton(
+    label: string,
+    onClick: (e: MouseEvent) => void,
+    extraClass = ''
+  ): HTMLButtonElement {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.setAttribute('role', 'menuitem');
+    button.textContent = label;
+    if (extraClass) button.classList.add(extraClass);
+    button.addEventListener('click', onClick);
+    return button;
+  }
+
+  private closeSeamMenu(): void {
+    this.seamMenu?.remove();
+    this.seamMenu = null;
+  }
+
+  private seamLabel(seamId: string): string {
+    const pattern = this.options.getPattern();
+    const seam = pattern?.seams.find((s) => s.id === seamId);
+    const piece = seam ? pattern?.pieces?.find((p) => p.id === seam.a.pieceId) : undefined;
+    const name = piece?.name?.trim();
+    return name ? `Seam · ${name}` : 'Seam';
   }
 
   /** Is a seam already covering this position on this edge? */
@@ -361,21 +550,16 @@ export class ClothSewTool {
     return ref.t0 > ref.t1 ? flipped.vertices : [...flipped.vertices].reverse();
   }
 
-  private projectEdge(vertices: readonly number[] | null): Array<{ x: number; y: number }> | null {
+  private projectEdge(vertices: readonly number[] | null): ClothEdgePoint[] | null {
     if (!vertices || vertices.length < 2) return null;
     const positions = this.options.getCloth()?.getPositionsSnapshot?.() ?? null;
     if (!positions) return null;
     const camera = this.options.getCamera();
-    const points: Array<{ x: number; y: number }> = [];
+    const points: ClothEdgePoint[] = [];
     for (const vi of vertices) {
-      if (vi < 0 || vi * 3 + 2 >= positions.length) return null;
-      const px = worldToCanvasPx(
-        vec3.fromValues(positions[vi * 3], positions[vi * 3 + 1], positions[vi * 3 + 2]),
-        camera,
-        this.options.canvas
-      );
-      if (!px || px.behind) return null;
-      points.push({ x: px.x, y: px.y });
+      const point = this.projectVertex(vi, positions, camera);
+      if (!point) return null;
+      points.push(point);
     }
     return points.length >= 2 ? points : null;
   }

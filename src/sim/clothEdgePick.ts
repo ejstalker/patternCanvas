@@ -245,6 +245,68 @@ export function pickClothEdge(
   return best;
 }
 
+/** Evenly spaced distinct indices into `length`, ascending. */
+function evenIndices(length: number, count: number): number[] {
+  if (count <= 0) return [];
+  if (count >= length) return Array.from({ length }, (_, i) => i);
+  const out: number[] = [];
+  const used = new Set<number>();
+  for (let i = 0; i < count; i++) {
+    const f = count === 1 ? 0 : i / (count - 1);
+    let idx = Math.round(f * (length - 1));
+    if (used.has(idx)) {
+      let delta = 1;
+      while (used.has(idx) && delta < length) {
+        const lo = idx - delta;
+        const hi = idx + delta;
+        if (lo >= 0 && !used.has(lo)) {
+          idx = lo;
+          break;
+        }
+        if (hi < length && !used.has(hi)) {
+          idx = hi;
+          break;
+        }
+        delta++;
+      }
+    }
+    used.add(idx);
+    out.push(idx);
+  }
+  return out;
+}
+
+/** A picked edge's mesh vertices ordered the way `ref` reads them. */
+export function edgeVerticesInReadOrder(
+  edge: ClothBoundaryEdge,
+  ref: { t0: number; t1: number }
+): number[] {
+  return ref.t0 > ref.t1 ? [...edge.vertices].reverse() : edge.vertices;
+}
+
+/**
+ * The stitches a seam between these two edges would make, as mesh-vertex index
+ * pairs — the same rank-order zip the mesher performs (`resolveSeamParticlePairs`),
+ * so a preview shows exactly what committing the seam would stitch and reveals a
+ * crossing, reversed run before it is created.
+ */
+export function buildStitchPreviewPairs(
+  edgeA: ClothBoundaryEdge,
+  refA: { t0: number; t1: number },
+  edgeB: ClothBoundaryEdge,
+  refB: { t0: number; t1: number }
+): Array<[number, number]> {
+  const va = edgeVerticesInReadOrder(edgeA, refA);
+  const vb = edgeVerticesInReadOrder(edgeB, refB);
+  const count = Math.min(va.length, vb.length);
+  if (count < 1) return [];
+  const ia = evenIndices(va.length, count);
+  const ib = evenIndices(vb.length, count);
+  const pairs: Array<[number, number]> = [];
+  for (let i = 0; i < count; i++) pairs.push([va[ia[i]], vb[ib[i]]]);
+  return pairs;
+}
+
 /** A `SeamEdgeRef` for the whole of one picked edge. */export function seamRefForBoundaryEdge(edge: ClothBoundaryEdge): {
   pieceId: string;
   fromPointId: string;

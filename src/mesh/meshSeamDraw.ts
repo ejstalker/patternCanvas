@@ -222,15 +222,26 @@ export function drawMeshSeamConnectors(
   }
 }
 
+/** Draw already-computed connector pairs (used for seams and stitch previews). */
+export function drawSeamConnectorPairs(
+  svg: SVGSVGElement,
+  pairs: ReadonlyArray<readonly [Vec2, Vec2]>,
+  opts: SeamConnectorDrawOptions = {}
+): void {
+  const className = opts.className ?? 'mesh-seam-connector';
+  const strokeWidth = opts.strokeWidth ?? 0.28;
+  const opacity = opts.opacity ?? 0.6;
+  for (const [a, b] of pairs) {
+    appendConnectorLine(svg, a, b, className, strokeWidth, opacity);
+  }
+}
+
 function drawSeamBindingConnectors(
   svg: SVGSVGElement,
   seam: SeamBinding,
   pattern: PatternDocument,
   opts: SeamConnectorDrawOptions
 ): void {
-  const className = opts.className ?? 'mesh-seam-connector';
-  const strokeWidth = opts.strokeWidth ?? 0.28;
-  const opacity = opts.opacity ?? 0.6;
   const pieceA = pattern.pieces.find((p) => p.id === seam.a.pieceId);
   const pieceB = pattern.pieces.find((p) => p.id === seam.b.pieceId);
   if (!pieceA || !pieceB) return;
@@ -244,9 +255,7 @@ function drawSeamBindingConnectors(
     seam.b,
     opts.lineCount
   );
-  for (const [a, b] of pairs) {
-    appendConnectorLine(svg, a, b, className, strokeWidth, opacity);
-  }
+  drawSeamConnectorPairs(svg, pairs, opts);
 }
 
 /** Discretized mesh boundary segments that lie on sewn edges. */

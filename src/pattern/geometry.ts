@@ -163,6 +163,34 @@ export function sameSeamEdgeTopology(
   );
 }
 
+/**
+ * Which half of an edge a seam reference is read from.
+ *
+ * A click on the near half reads forward (t0→t1); the far half reads the other
+ * way. This is the Marvelous Designer direction gesture: the half you pick is the
+ * end the edge is read from, so both sew tools derive direction the same way.
+ */
+export function seamRefFromHalf(
+  pieceId: string,
+  fromPointId: string,
+  toPointId: string,
+  t: number
+): SeamEdgeRef {
+  const reversed = t > 0.5;
+  return {
+    pieceId,
+    fromPointId,
+    toPointId,
+    t0: reversed ? 1 : 0,
+    t1: reversed ? 0 : 1,
+  };
+}
+
+/** True when a directed reference is read from the far half (t0 > t1). */
+export function seamReadsFromSecondHalf(ref: { t0: number; t1: number }): boolean {
+  return ref.t0 > ref.t1;
+}
+
 export function sameSeamSpan(a: SeamEdgeRef, b: SeamEdgeRef): boolean {
   return (
     sameSeamEdgeTopology(a, b) &&

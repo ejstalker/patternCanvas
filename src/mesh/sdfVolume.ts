@@ -77,6 +77,15 @@ export class SdfVolume {
     return this.distances[this.index(ix, iy, iz)];
   }
 
+  /**
+   * Trilinear sample of the field at a world position.
+   *
+   * Cell `i` is read as living at `origin + i * voxelSize` — the index-to-world
+   * convention the GPU sampler in `collide_sdf.wgsl`, the OpenVDB importer and
+   * `bakeDistances` all use. This indexing is the contract between them; sample
+   * at cell centres instead and every surface reads half a voxel away from its
+   * geometry.
+   */
   sampleAt(pos: vec3): number {
     const rel = vec3.create();
     vec3.sub(rel, pos, this.origin);

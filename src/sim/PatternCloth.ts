@@ -58,6 +58,8 @@ export class PatternCloth {
   private particles: Particle[] = [];
   /** Parallel to particles; supports selecting and transforming one mesh island. */
   private vertexPieceIds: string[] = [];
+  /** Pieces pinned at their captured pose; their particles never integrate. */
+  private frozenPieceIds = new Set<string>();
   private connections: SpringDamper[] = [];
   private bendSprings: SpringDamper[] = [];
   private seamSprings: SpringDamper[] = [];
@@ -553,9 +555,92 @@ export class PatternCloth {
     this.syncBuffers();
   }
 
+  /**
+   * Pin every particle of a piece so it stops integrating, or release it.
+   * Freezing only touches integration velocity — fabric springs and seam
+   * springs still push on the other end, so sewing stays live.
+   */
+  setPieceFrozen(pieceId: string, frozen: boolean): void {
+    if (frozen) this.frozenPieceIds.add(pieceId);
+    else this.frozenPieceIds.delete(pieceId);
+    this.pinPieces();
+    this.syncBuffers();
+  }
+
+  isPieceFrozen(pieceId: string): boolean {
+    return this.frozenPieceIds.has(pieceId);
+  }
+
+  getFrozenPieceIds(): string[] {
+    return [...this.frozenPieceIds];
+  }
+
+  captureFrozenState(): Record<string, number[]> {
+    const state: Record<string, number[]> = {};
+    for (const pieceId of this.frozenPieceIds) {
+      const positions = this.capturePiecePositions(pieceId);
+      if (positions) state[pieceId] = positions;
+    }
+    return state;
+  }
+
+  applyFrozenState(state: Record<string, number[]> | null | undefined): void {
+    this.frozenPieceIds.clear();
+    if (state) {
+      for (const [pieceId, positions] of Object.entries(state)) {
+        let count = 0;
+        for (const id of this.vertexPieceIds) if (id === pieceId) count++;
+        if (count === 0) continue;
+        // Only place saved positions when the topology still matches; a remesh
+        // renumbers vertices, so freezing at rest is safer than a scramble.
+        if (positions.length === count * 3) {
+          let k = 0;
+          for (let i = 0; i < this.particles.length; i++) {
+            if (this.vertexPieceIds[i] !== pieceId) continue;
+            vec3.set(
+              this.particles[i].position,
+              positions[k * 3],
+              positions[k * 3 + 1],
+              positions[k * 3 + 2]
+            );
+            k++;
+          }
+        }
+        this.frozenPieceIds.add(pieceId);
+      }
+    }
+    this.pinPieces();
+    this.syncBuffers();
+  }
+
+  /** Flat xyz of one piece's particles, or null when the piece is not here. */
+  private capturePiecePositions(pieceId: string): number[] | null {
+    const out: number[] = [];
+    for (let i = 0; i < this.particles.length; i++) {
+      if (this.vertexPieceIds[i] !== pieceId) continue;
+      const p = this.particles[i].position;
+      out.push(p[0], p[1], p[2]);
+    }
+    return out.length ? out : null;
+  }
+
+  /** Apply the fixed flag to match `frozenPieceIds` (and shed velocity). */
+  private pinPieces(): void {
+    for (let i = 0; i < this.particles.length; i++) {
+      const frozen = this.frozenPieceIds.has(this.vertexPieceIds[i]);
+      const p = this.particles[i];
+      p.setFixed(frozen);
+      if (frozen) {
+        vec3.zero(p.getVelocity());
+        p.resetForce();
+      }
+    }
+  }
+
   resetToInitialState(): void {
     this.dragging = false;
     this.seamRampElapsed = 0;
+    this.frozenPieceIds.clear();
     for (let i = 0; i < this.particles.length; i++) {
       vec3.copy(this.particles[i].position, this.initialPositions[i]);
       vec3.zero(this.particles[i].getVelocity());
@@ -627,6 +712,9 @@ export class PatternCloth {
         const p = this.particles[pi];
         if (velRetain < 1) p.scaleVelocity(velRetain);
         p.clampSpeed(this.maxSpeed);
+        // A frozen piece must hold its exact pose, so contact projection is
+        // skipped for it rather than nudging it onto the floor or body.
+        if (p.isFixedParticle()) continue;
         p.groundCollision();
         this.avatar.resolveParticle(p, this.edgeLengths[pi] ?? this.avgEdgeLength);
       }
@@ -661,7 +749,8 @@ export class PatternCloth {
         vec3.set(v, pose.velocities[o], pose.velocities[o + 1], pose.velocities[o + 2]);
       }
     }
-    for (const p of this.particles) p.setFixed(false);
+    // Re-pin any frozen pieces so a restored pose cannot thaw them.
+    this.pinPieces();
     // A persisted drape is already sewn; do not replay the closure or briefly
     // push its joined edges apart using the original panel separation.
     this.seamRampElapsed = SEAM_RAMP_SECONDS;
