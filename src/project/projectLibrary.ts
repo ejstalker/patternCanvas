@@ -1,16 +1,14 @@
 import type { ProjectDocument } from '../project/types';
 import {
-  createDirtyState,
   projectStore,
-  type DirtyState,
   type SaveResult,
   type SavedProjectRecord,
 } from '../persistence/ProjectStore';
 import { downloadProjectArchive, importPortableProject } from '../persistence/projectArchive';
 import { normalizeProject, parseProject, serializeProject } from '../persistence/projectCodec';
 
-export type { SavedProjectRecord, SaveResult, DirtyState };
-export { createDirtyState };
+export type { SavedProjectRecord, SaveResult };
+export { projectStore };
 
 const AUTOSAVE_KEY = 'patternCanvas.autosaveMinutes';
 export const DEFAULT_AUTOSAVE_MINUTES = 5;
@@ -49,10 +47,9 @@ export async function getSavedProject(id: string): Promise<ProjectDocument | nul
 }
 
 export async function saveProjectToLibrary(
-  project: ProjectDocument,
-  dirty?: DirtyState
+  project: ProjectDocument
 ): Promise<SaveProjectResult> {
-  const result = await projectStore.saveProject(project, { dirty });
+  const result = await projectStore.saveProject(project);
   const record: SavedProjectRecord = {
     id: project.id,
     name: project.name,

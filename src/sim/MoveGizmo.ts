@@ -1,8 +1,23 @@
 import { vec3, vec4, mat4 } from 'gl-matrix';
-import type { Camera } from '../Camera';
+import { pointAxisDirections } from './axisScreen';
 
 export type MoveAxis = 'x' | 'y' | 'z' | 'free';
 export type TransformMode = 'translate' | 'rotate';
+
+/** Where the arrows are drawn from: a world point as the camera shows it. */
+export type AxisView = {
+  camera: { getViewProjectMtx(): mat4 };
+  /** World point the gizmo sits on. */
+  origin: vec3;
+  /** Viewport size in CSS px, which sets how long a world unit looks. */
+  width: number;
+  height: number;
+};
+
+/** Length of a full-length arrow, in gizmo px. */
+const ARROW_LEN = 42;
+/** Below this the axis points too close to the camera to draw a direction. */
+const MIN_FORESHORTEN = 0.06;
 
 export type MoveGizmoCallbacks = {
   onDragStart: (axis: MoveAxis, clientX: number, clientY: number) => void;
@@ -70,9 +85,9 @@ export class MoveGizmo {
   private build(): void {
     this.svg.innerHTML = '';
     const axes: { axis: MoveAxis; x2: number; y2: number; color: string; label: string }[] = [
-      { axis: 'x', x2: 42, y2: 0, color: '#e74c3c', label: 'X' },
-      { axis: 'y', x2: 0, y2: -42, color: '#2ecc71', label: 'Y' },
-      { axis: 'z', x2: -30, y2: 30, color: '#3498db', label: 'Z' },
+      { axis: 'x', x2: ARROW_LEN, y2: 0, color: '#e74c3c', label: 'X' },
+      { axis: 'y', x2: 0, y2: -ARROW_LEN, color: '#2ecc71', label: 'Y' },
+      { axis: 'z', x2: 0, y2: ARROW_LEN, color: '#3498db', label: 'Z' },
     ];
 
     for (const a of axes) {
@@ -156,46 +171,45 @@ export class MoveGizmo {
   }
 
   /** Update arrow directions from camera so axes stay world-aligned on screen. */
-  updateAxisLayout(camera: Camera): void {
-    const az = (camera.getAzimuth() * Math.PI) / 180;
-    const inc = (camera.getIncline() * Math.PI) / 180;
-
-    const projectDir = (wx: number, wy: number, wz: number): { x: number; y: number } => {
-      // Same view rotation as ViewportGnomon
-      const y1 = wy * Math.cos(inc) - wz * Math.sin(inc);
-      const z1 = wy * Math.sin(inc) + wz * Math.cos(inc);
-      const x2 = wx * Math.cos(az) + z1 * Math.sin(az);
-      return { x: x2 * 42, y: -y1 * 42 };
-    };
-
-    const dirs: Record<'x' | 'y' | 'z', { x: number; y: number }> = {
-      x: projectDir(1, 0, 0),
-      y: projectDir(0, 1, 0),
-      z: projectDir(0, 0, 1),
-    };
+  updateAxisLayout(view: AxisView): void {
+    const dirs = pointAxisDirections(
+      view.camera.getViewProjectMtx(),
+      view.origin,
+      view.width,
+      view.height
+    );
 
     for (const axis of ['x', 'y', 'z'] as const) {
-      const g = this.svg.querySelector(`g[data-axis="${axis}"]`);
+      const g = this.svg.querySelector(`g[data-axis="${axis}"]`) as SVGGElement | null;
       if (!g) continue;
       const d = dirs[axis];
+      // An axis pointing at the camera has no direction on screen — drop it
+      // rather than draw a stub in whatever direction rounding picked.
+      if (d.foreshorten < MIN_FORESHORTEN) {
+        g.style.display = 'none';
+        continue;
+      }
+      g.style.display = '';
+      const ax = d.x * ARROW_LEN * d.foreshorten;
+      const ay = d.y * ARROW_LEN * d.foreshorten;
       const lines = g.querySelectorAll('line');
       lines.forEach((line) => {
-        line.setAttribute('x2', String(d.x));
-        line.setAttribute('y2', String(d.y));
+        line.setAttribute('x2', String(ax));
+        line.setAttribute('y2', String(ay));
       });
       const tip = g.querySelector('polygon');
       if (tip) {
-        const ang = Math.atan2(d.y, d.x);
+        const ang = Math.atan2(ay, ax);
         const s = 7;
         tip.setAttribute(
           'points',
-          `${d.x},${d.y} ${d.x - s * Math.cos(ang - 0.4)},${d.y - s * Math.sin(ang - 0.4)} ${d.x - s * Math.cos(ang + 0.4)},${d.y - s * Math.sin(ang + 0.4)}`
+          `${ax},${ay} ${ax - s * Math.cos(ang - 0.4)},${ay - s * Math.sin(ang - 0.4)} ${ax - s * Math.cos(ang + 0.4)},${ay - s * Math.sin(ang + 0.4)}`
         );
       }
       const rotateTip = g.querySelector('circle');
       if (rotateTip) {
-        rotateTip.setAttribute('cx', String(d.x));
-        rotateTip.setAttribute('cy', String(d.y));
+        rotateTip.setAttribute('cx', String(ax));
+        rotateTip.setAttribute('cy', String(ay));
       }
     }
   }

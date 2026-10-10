@@ -23,6 +23,9 @@ import { loadAvatarBody } from './avatarAsset';
 import type { AvatarBody } from '../mesh/AvatarBody';
 import { SelectionOverlay } from './SelectionOverlay';
 import { ClothSewTool } from './ClothSewTool';
+import { ViewportShadingControl } from './ViewportShadingControl';
+import type { Environment } from '../render/environment';
+import type { MaterialLibrary } from '../render/materials';
 import { DEFAULT_MESH_SETTINGS, triangulatePattern } from '../mesh/triangulate';
 import {
   buildIncidentTriangles,
@@ -61,6 +64,12 @@ export type SimViewportRuntimeOptions = {
   onBeforeFreezeChange?: () => void;
   /** A piece was frozen or released: let the host persist / report it. */
   onFreezeChange?: (pieceId: string, frozen: boolean) => void;
+  /** The selected pieces changed (primary first) — the split view mirrors it. */
+  onSelectionChange?: (pieceIds: string[]) => void;
+  /** Shared HDRI environment; without it there is no background or PBR probe. */
+  environment?: Environment | null;
+  /** Shared scene materials; without one the demo's own colours are used. */
+  materials?: MaterialLibrary | null;
 };
 
 export type SharedGpu = {
@@ -108,6 +117,7 @@ export class SimViewportRuntime {
   private avatarBody: AvatarBody | null = null;
   private device: GPUDevice;
   private viewGnomon: ViewportGnomon | null = null;
+  private shadingControl: ViewportShadingControl | null = null;
   private moveGizmo: MoveGizmo | null = null;
   private selectionOverlay: SelectionOverlay | null = null;
   private transformToggle: HTMLButtonElement | null = null;
@@ -151,6 +161,18 @@ export class SimViewportRuntime {
   private sim: SimInstance;
   private defaultCamera: SimCameraState;
   private options: SimViewportRuntimeOptions;
+  private environmentUnsubscribe: (() => void) | null = null;
+  private materialsUnsubscribe: (() => void) | null = null;
+  /**
+   * A paused viewport redraws only when something changed. Rendering every
+   * mounted sim every frame saturated the main thread (and the GPU) on slower
+   * compositors, which is what made plain hover / select feel laggy; this keeps
+   * idle frames free.
+   */
+  private needsRender = true;
+  /** False while the viewport is off screen, so returning redraws immediately. */
+  private wasVisible = true;
+  private resizeObserver: ResizeObserver | null = null;
   /** Right-click popover on a piece (freeze / unfreeze). */
   private pieceMenu: HTMLElement | null = null;
   // Stable handlers so dispose() can remove the global dismiss listeners.
@@ -190,11 +212,19 @@ export class SimViewportRuntime {
    * a second set of controls on top.
    */
   dispose(): void {
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
     this.cloth?.destroy();
     this.cloth = null;
     this.renderer = null;
     this.viewGnomon?.destroy();
     this.viewGnomon = null;
+    this.shadingControl?.destroy();
+    this.shadingControl = null;
+    this.environmentUnsubscribe?.();
+    this.environmentUnsubscribe = null;
+    this.materialsUnsubscribe?.();
+    this.materialsUnsubscribe = null;
     this.moveGizmo?.destroy();
     this.moveGizmo = null;
     this.selectionOverlay?.destroy();
@@ -222,6 +252,7 @@ export class SimViewportRuntime {
 
   syncFromDocument(sim: SimInstance): void {
     this.sim = sim;
+    this.invalidate();
   }
 
   applyCamera(sim: SimInstance): void {
@@ -234,6 +265,7 @@ export class SimViewportRuntime {
     this.camera.setPanX(sim.camera.target[0]);
     this.camera.setPanY(sim.camera.target[1]);
     this.camera.setPanZ(sim.camera.target[2]);
+    this.invalidate();
   }
 
   /**
@@ -247,6 +279,7 @@ export class SimViewportRuntime {
     this.camera.setPanX(camera.target[0]);
     this.camera.setPanY(camera.target[1]);
     this.camera.setPanZ(camera.target[2]);
+    this.invalidate();
   }
 
   captureCamera(sim: SimInstance): void {
@@ -268,7 +301,22 @@ export class SimViewportRuntime {
       migrateLegacySimCamera(this.sim.camera, this.defaultCamera);
     }
     this.applyCamera(this.sim);
+    const materials = this.options.materials ?? null;
+    if (materials) {
+      renderer.attachMaterials(materials);
+      this.materialsUnsubscribe?.();
+      this.materialsUnsubscribe = materials.onChange(() => this.invalidate());
+    }
+    const environment = this.options.environment ?? null;
+    if (environment) {
+      renderer.attachEnvironment(environment);
+      renderer.setShadingMode(environment.currentSettings.shading);
+      // The environment is shared: a new HDRI has to reach every viewport.
+      this.environmentUnsubscribe?.();
+      this.environmentUnsubscribe = environment.onChange(() => this.invalidate());
+    }
     this.mountViewGnomon();
+    this.mountShadingControl();
     this.selectionOverlay = new SelectionOverlay(this.host);
     this.mountMoveGizmo();
     this.mountTransformToggle();
@@ -286,6 +334,15 @@ export class SimViewportRuntime {
     });
     this.mountSewToggle();
     this.bindPointer();
+    // A paused viewport is rendered on demand, so a layout change (resize,
+    // fullscreen switch, split) has to ask for a redraw explicitly.
+    if (typeof ResizeObserver !== 'undefined') {
+      this.resizeObserver = new ResizeObserver(() => {
+        this.resize();
+        this.invalidate();
+      });
+      this.resizeObserver.observe(this.canvas);
+    }
   }
 
   /**
@@ -347,6 +404,7 @@ export class SimViewportRuntime {
       this.buildPointMarkerEls();
       this.refreshPointMarkers();
     }
+    this.invalidate();
   }
 
   /** Map each pattern anchor to its nearest cloth vertex and index its triangles. */
@@ -512,11 +570,24 @@ export class SimViewportRuntime {
     this.viewGnomon.syncFromCamera(this.camera);
   }
 
+  /** The wireframe / simple / PBR toggle, sitting left of the gnomon. */
+  private mountShadingControl(): void {
+    this.shadingControl?.destroy();
+    if (!this.renderer) return;
+    this.shadingControl = new ViewportShadingControl(this.host, {
+      renderer: this.renderer,
+      environment: this.options.environment ?? null,
+      materials: this.options.materials ?? null,
+      onInvalidate: () => this.invalidate(),
+    });
+  }
+
   private mountMoveGizmo(): void {
     this.moveGizmo?.destroy();
     this.moveGizmo = new MoveGizmo(this.host, {
       onDragStart: (axis, clientX, clientY) => {
         if (!this.cloth || this.selectedPieceIds.size === 0) return;
+        this.invalidate();
         this.nav = 'gizmo';
         this.gizmoAxis = axis;
         this.cloth.setDragging(true);
@@ -547,6 +618,7 @@ export class SimViewportRuntime {
       },
       onDrag: (_axis, _dx, _dy, clientX, clientY) => {
         if (!this.cloth || !this.gizmoAxis || this.selectedPieceIds.size === 0) return;
+        this.invalidate();
         if (this.transformMode === 'rotate') {
           const axis = this.rotationAxis(this.gizmoAxis);
           const angle = (_dx - _dy) * 0.012;
@@ -598,6 +670,7 @@ export class SimViewportRuntime {
     this.lastAxisSnap = target;
     this.viewGnomon?.syncFromCamera(this.camera);
     this.syncMoveGizmo();
+    this.invalidate();
   }
 
   private setPieceSelected(pieceId: string | null): void {
@@ -623,6 +696,16 @@ export class SimViewportRuntime {
     this.selectedPieceId = primary;
     this.syncMoveGizmo();
     this.canvas.style.cursor = this.selectedPieceIds.size > 0 ? 'default' : 'grab';
+    this.invalidate();
+    this.options.onSelectionChange?.([...this.selectedPieceIds]);
+  }
+
+  /** Select whole pieces by id — the split view's 2D → 3D sync. */
+  setSelectedPieces(pieceIds: readonly string[], primary?: string | null): void {
+    this.setPieceSelection(
+      [...pieceIds],
+      primary ?? pieceIds[0] ?? null
+    );
   }
 
   getSelectedPieceId(): string | null {
@@ -710,7 +793,12 @@ export class SimViewportRuntime {
     }
     this.moveGizmo.setVisible(true);
     this.moveGizmo.setScreenPosition(pivotPx.x, pivotPx.y);
-    this.moveGizmo.updateAxisLayout(this.camera);
+    this.moveGizmo.updateAxisLayout({
+      camera: this.camera,
+      origin: pivot,
+      width: this.canvas.clientWidth,
+      height: this.canvas.clientHeight,
+    });
   }
 
   private rotationAxis(axis: MoveAxis): vec3 {
@@ -738,6 +826,7 @@ export class SimViewportRuntime {
       this.canvas.height = h;
       this.renderer?.resize(w, h);
       this.camera.setAspect(w / h);
+      this.needsRender = true;
     }
   }
 
@@ -781,11 +870,13 @@ export class SimViewportRuntime {
     this.setPieceSelected(null);
     this.buildPointMarkerEls();
     this.refreshPointMarkers();
+    this.invalidate();
   }
 
   setStrainMapEnabled(enabled: boolean): void {
     this.strainMapEnabled = enabled;
     this.cloth?.setStrainMapEnabled?.(enabled);
+    this.invalidate();
   }
 
   isStrainMapEnabled(): boolean {
@@ -795,6 +886,7 @@ export class SimViewportRuntime {
   setAvatarBody(body: AvatarBody): void {
     this.avatarBody = body;
     this.cloth?.setAvatar(body);
+    this.invalidate();
   }
 
   /**
@@ -902,6 +994,8 @@ export class SimViewportRuntime {
                     : 'grab'
                 : 'grabbing';
       this.canvas.setPointerCapture(e.pointerId);
+      // A press may change the selection or begin a drag on a paused viewport.
+      this.invalidate();
       e.preventDefault();
       e.stopPropagation();
     });
@@ -910,7 +1004,13 @@ export class SimViewportRuntime {
       if (this.isSewEnabled() && this.nav === 'none') {
         this.sewTool?.refreshHover(e.clientX, e.clientY);
       }
-      if (this.nav === 'none' || this.nav === 'gizmo') return;
+      if (this.nav === 'none' || this.nav === 'gizmo') {
+        // Only the sew highlight changes under a bare hover.
+        if (this.isSewEnabled()) this.invalidate();
+        return;
+      }
+      // Orbiting / panning / dragging the cloth all move the 3D image.
+      this.invalidate();
       const dx = e.clientX - this.lastX;
       const dy = e.clientY - this.lastY;
       if (Math.abs(dx) + Math.abs(dy) > 3) this.pointerMoved = true;
@@ -1023,6 +1123,7 @@ export class SimViewportRuntime {
         : this.selectedPieceIds.size > 0
           ? 'default'
           : 'grab';
+      this.invalidate();
     };
     this.canvas.addEventListener('pointerup', endDrag);
     this.canvas.addEventListener('pointercancel', endDrag);
@@ -1035,6 +1136,7 @@ export class SimViewportRuntime {
         this.camera.setDistance(Math.max(1.5, Math.min(80, this.camera.getDistance() * factor)));
         this.viewGnomon?.syncFromCamera(this.camera);
         this.syncMoveGizmo();
+        this.invalidate();
       },
       { passive: false }
     );
@@ -1095,13 +1197,32 @@ export class SimViewportRuntime {
    * stepping so it is not frozen by a glance at another stage, but nothing is
    * resized or drawn.
    */
+  /** Mark the viewport dirty so the next paused frame redraws it. */
+  invalidate(): void {
+    this.needsRender = true;
+  }
+
   frame(active: boolean, visible = true): void {
     if (!visible) {
-      if (active) this.cloth?.update(true);
+      // Off-screen: do nothing at all. Advancing the drape here kept a CPU
+      // simulation running behind whatever view you were actually using, and
+      // that main-thread load is what made plain hover / select stutter.
+      this.wasVisible = false;
       return;
     }
-    if (active) this.stepAndRender();
-    else this.renderPaused();
+    if (!this.wasVisible) {
+      // Coming back on screen: redraw before stepping, or the first frame after
+      // the switch would show the stale image.
+      this.wasVisible = true;
+      this.needsRender = true;
+    }
+    if (active) {
+      this.stepAndRender();
+      return;
+    }
+    // Paused: nothing to do unless a change asked for a redraw.
+    if (!this.needsRender) return;
+    this.renderPaused();
   }
 
   stepAndRender(): void {
@@ -1117,6 +1238,7 @@ export class SimViewportRuntime {
   }
 
   renderPaused(): void {
+    this.needsRender = false;
     if (!this.renderer || !this.cloth) return;
     this.resize();
     this.cloth.update(false);
@@ -1160,6 +1282,7 @@ export class SimViewportRuntime {
       : this.selectedPieceIds.size > 0
         ? 'default'
         : 'grab';
+    this.invalidate();
   }
 
   isSewEnabled(): boolean {

@@ -8,6 +8,7 @@ import { identity } from '../utils/math';
 import type { MeshGeometry, PatternDocument, SimParams, SimPose } from '../project/types';
 import { CM_TO_WORLD } from './units';
 import { buildClothTopology, FALLBACK_PIECE_ID } from './meshTopology';
+import { buildWireframeEdgeIndices } from './wireframeEdges';
 import { fillStrainColors, type StrainEdge } from './strainMap';
 
 /** @deprecated Import from `./units` instead. */
@@ -108,6 +109,8 @@ export class PatternCloth {
   private normalBuffer: GPUBuffer | null = null;
   private colorBuffer: GPUBuffer | null = null;
   private indexBuffer: GPUBuffer | null = null;
+  private wireframeEdgeBuffer: GPUBuffer | null = null;
+  private wireframeEdgeCount = 0;
   /** Flat (xyz interleaved) copy of the latest particle positions for CPU overlays. */
   private flatPositions = new Float32Array(0);
   private seamLinePositionBuffer: GPUBuffer | null = null;
@@ -305,6 +308,19 @@ export class PatternCloth {
     });
     new Uint32Array(this.indexBuffer.getMappedRange()).set(idx);
     this.indexBuffer.unmap();
+
+    const edgeIndices = buildWireframeEdgeIndices(this.indices);
+    this.wireframeEdgeCount = edgeIndices.length;
+    if (this.wireframeEdgeCount > 0) {
+      this.wireframeEdgeBuffer = this.device.createBuffer({
+        size: edgeIndices.byteLength,
+        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true,
+        label: 'cloth-wireframe-edges',
+      });
+      new Uint32Array(this.wireframeEdgeBuffer.getMappedRange()).set(edgeIndices);
+      this.wireframeEdgeBuffer.unmap();
+    }
 
     this.createSeamLineBuffers();
   }
@@ -846,6 +862,15 @@ export class PatternCloth {
     return null;
   }
 
+  getWireframeEdges(): { indexBuffer: GPUBuffer; indexFormat: GPUIndexFormat; indexCount: number } | null {
+    if (!this.wireframeEdgeBuffer || this.wireframeEdgeCount === 0) return null;
+    return {
+      indexBuffer: this.wireframeEdgeBuffer,
+      indexFormat: 'uint32',
+      indexCount: this.wireframeEdgeCount,
+    };
+  }
+
   getFPS(): number {
     return this.fps;
   }
@@ -880,6 +905,9 @@ export class PatternCloth {
     this.normalBuffer?.destroy();
     this.colorBuffer?.destroy();
     this.indexBuffer?.destroy();
+    this.wireframeEdgeBuffer?.destroy();
+    this.wireframeEdgeBuffer = null;
+    this.wireframeEdgeCount = 0;
     this.seamLinePositionBuffer?.destroy();
     this.seamLineNormalBuffer?.destroy();
     this.floor.destroy?.();

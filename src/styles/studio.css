@@ -508,6 +508,41 @@ body {
   gap: 4px;
 }
 
+/*
+ * A viewport's own actions float at the bottom middle of the canvas, so the
+ * header keeps only the close / fullscreen button.
+ */
+/*
+ * A bottom-anchored column: the bar sits on the floor of the viewport and
+ * anything stacked above it (the split's stale warning) grows upwards, so it
+ * clears the bar however many rows the buttons wrap onto.
+ */
+.node-viewport-actions {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  /* A definite width keeps the max-widths below from resolving against a
+     shrink-to-fit parent, which would let wide banners escape the viewport. */
+  width: 100%;
+  max-width: calc(100% - 16px);
+  transform: translateX(-50%);
+  z-index: 12;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.node-viewport-actions > .node-actions {
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(28, 26, 23, 0.86);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+  pointer-events: auto;
+}
+
 .node-actions button {
   font-size: 11px;
   padding: 2px 6px;
@@ -570,8 +605,9 @@ body {
   display: flex;
   padding: 20px;
   box-sizing: border-box;
-  background: rgba(12, 11, 9, 0.72);
-  backdrop-filter: blur(2px);
+  /* Opaque, not blurred: a full-viewport backdrop-filter is rasterised on the
+     CPU in Electron/VS Code webviews and stalls every interaction behind it. */
+  background: rgba(12, 11, 9, 0.9);
 }
 
 .canvas-node.is-expanded {
@@ -670,6 +706,7 @@ body {
  */
 .pattern-point-bar,
 .pattern-ruler-bar,
+.pattern-tool-settings,
 .pattern-block-bar,
 .pattern-avatar-bar,
 .pattern-xray-bar {
@@ -681,8 +718,8 @@ body {
   padding: 5px 8px;
   border: 1px solid var(--border);
   border-radius: 6px;
-  background: color-mix(in srgb, var(--bg-elev) 92%, transparent);
-  backdrop-filter: blur(4px);
+  /* Solid, not blurred — see the fullscreen overlay note. */
+  background: var(--bg-elev);
   font: 11px var(--mono);
   color: var(--ink);
   pointer-events: auto;
@@ -691,6 +728,7 @@ body {
 
 .pattern-point-bar[hidden],
 .pattern-ruler-bar[hidden],
+.pattern-tool-settings[hidden],
 .pattern-block-bar[hidden],
 .pattern-avatar-bar[hidden],
 .pattern-xray-bar[hidden] {
@@ -724,6 +762,73 @@ body {
 .pattern-point-bar label:has(input:disabled) {
   opacity: 0.45;
   cursor: default;
+}
+
+/* Tool settings: what the tool in hand is set to, in the top-left slot the
+   point settings use — the two are never up together. */
+.pattern-tool-settings {
+  top: 8px;
+  left: 8px;
+  flex-wrap: wrap;
+  gap: 10px;
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.35);
+}
+
+.pattern-settings-title {
+  color: var(--muted);
+}
+
+/* Segmented toggle: one button per setting, the one in force filled in — the
+   same control the block bar's mode and division rows are made of. */
+.pattern-settings-group {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.pattern-settings-group button {
+  padding: 3px 8px;
+  border: none;
+  border-radius: 0;
+  background: var(--panel);
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.pattern-settings-group button + button {
+  border-left: 1px solid var(--border);
+}
+
+.pattern-settings-group button:hover {
+  color: var(--ink);
+}
+
+.pattern-settings-group button.is-active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.pattern-settings-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+}
+
+.pattern-settings-field.is-disabled {
+  opacity: 0.45;
+}
+
+.pattern-settings-field input {
+  width: 58px;
+  padding: 2px 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--ink);
+  font: inherit;
 }
 
 .pattern-toolbar {
@@ -1299,6 +1404,42 @@ body {
   pointer-events: none;
 }
 
+/* The cut carried on to the outline beyond the clicks: faint, because it is
+   machinery, not what the draughtsperson drew. */
+.pattern-knife-extension {
+  stroke: var(--accent);
+  stroke-dasharray: 2 4;
+  fill: none;
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+/* Where the next click would carry the chain — not part of the cut yet, so it
+   is dashed back to the last point that is. */
+.pattern-knife-rubber {
+  stroke: var(--accent);
+  stroke-dasharray: 2 3;
+  opacity: 0.55;
+  fill: none;
+  pointer-events: none;
+}
+
+/* The loop cut: solid, because it is a cut that will be made, and the two
+   contours it is blended from behind it, faint so they read as context. */
+.pattern-knife-loop {
+  stroke: var(--accent);
+  fill: none;
+  pointer-events: none;
+}
+
+.pattern-knife-rail {
+  stroke: #8ec8e8;
+  stroke-dasharray: 2 4;
+  fill: none;
+  opacity: 0.45;
+  pointer-events: none;
+}
+
 .pattern-knife-hit {
   fill: #c45c26;
   stroke: var(--bg);
@@ -1480,9 +1621,90 @@ body {
   pointer-events: none;
 }
 
+/* Shift-marquee picks whole panels rather than the handles inside the
+   rectangle: solid and green, so the two modes are told apart at a glance. */
+.pattern-marquee-pieces {
+  fill: rgba(111, 196, 140, 0.16);
+  stroke: #6fc48c;
+  stroke-dasharray: none;
+}
+
+/* An image reference whose stored bytes are gone, and the inspector's warning
+   about it: amber, like the other "needs attention" states. */
+.image-missing {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  width: 100%;
+  height: 100%;
+  padding: 10px;
+  box-sizing: border-box;
+  border: 1px dashed rgba(212, 160, 23, 0.6);
+  border-radius: 6px;
+  background: rgba(212, 160, 23, 0.08);
+  color: #f1cf65;
+  font-size: 12px;
+  text-align: center;
+}
+
+.image-missing strong {
+  font-size: 12px;
+}
+
+.image-missing span {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.image-missing-relink {
+  align-self: center;
+  margin-top: 2px;
+  padding: 3px 8px;
+  border: 1px solid rgba(212, 160, 23, 0.6);
+  border-radius: 4px;
+  background: rgba(212, 160, 23, 0.18);
+  color: #f1cf65;
+  font: 11px var(--mono);
+  cursor: pointer;
+}
+
+.image-missing-relink:hover {
+  background: rgba(212, 160, 23, 0.3);
+}
+
+.muted.is-alert {
+  color: #f1cf65;
+}
+
 .pattern-shape-preview {
   fill: rgba(196, 92, 38, 0.1);
   stroke: var(--accent);
+  pointer-events: none;
+}
+
+/* Extrude tool: the edge in hand, and the tab being pulled out of it. */
+.pattern-extrude-hover {
+  stroke: var(--accent);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+  pointer-events: none;
+}
+
+.pattern-extrude-preview {
+  fill: none;
+  stroke: var(--accent);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.95;
+  pointer-events: none;
+}
+
+.pattern-extrude-point {
+  fill: var(--accent);
+  stroke: var(--bg);
   pointer-events: none;
 }
 
@@ -1948,6 +2170,104 @@ body {
   color: #fff;
 }
 
+/* The rail menus — Add, Modify, Remove, Sew: one button in the rail, one
+   popup beside it, and a row per tool. A row that opens a sub-view (the block
+   library, a tool's modes) hands the same popup over. */
+.pattern-rail-menu {
+  width: 268px;
+  min-width: 0;
+  padding: 5px;
+  gap: 3px;
+}
+
+/* The icon column takes its width out of the text, so the popup is a touch
+   wider than the other wide flyouts — descriptions stay on one line. */
+.pattern-tool-flyout-wide .pattern-tool-flyout-menu.pattern-rail-menu {
+  width: 284px;
+}
+
+.pattern-toolbar .pattern-rail-menu button[data-menu-item],
+.pattern-toolbar .pattern-rail-menu .pattern-menu-back {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  height: auto;
+  padding: 6px 8px;
+  white-space: normal;
+  /* Buttons centre their text by default; these rows read as a list. */
+  text-align: left;
+}
+
+/* Rows that carry an icon put it in its own column, level with the name. */
+.pattern-toolbar .pattern-rail-menu button[data-menu-item].has-icon {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 0;
+}
+
+.pattern-menu-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--muted);
+}
+
+.pattern-menu-icon svg {
+  display: block;
+}
+
+.pattern-menu-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* The block library shares the Add popup, so its rows read as a list too. */
+.pattern-rail-menu .pattern-block-menu button {
+  text-align: left;
+}
+
+.pattern-menu-name {
+  font: 600 11px var(--mono);
+}
+
+.pattern-menu-desc {
+  color: var(--muted);
+  font: 10.5px/1.4 var(--mono);
+}
+
+.pattern-toolbar .pattern-rail-menu button[data-menu-item]:hover .pattern-menu-icon,
+.pattern-toolbar .pattern-rail-menu button[data-menu-item].is-active .pattern-menu-icon,
+.pattern-toolbar .pattern-rail-menu button[data-menu-item]:hover .pattern-menu-desc {
+  color: #fff;
+}
+
+.pattern-toolbar .pattern-rail-menu .pattern-menu-back {
+  flex-direction: row;
+  align-items: center;
+  padding: 4px 8px;
+  color: var(--muted);
+}
+
+/* The block library lives inside the Add menu rather than beside it, so it
+   drops the popup chrome it wears when it stands on its own. */
+.pattern-rail-menu .pattern-block-menu {
+  position: static;
+  width: auto;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+}
+
 .pattern-ruler-bar-label {
   display: inline-flex;
   align-items: center;
@@ -2103,6 +2423,133 @@ body {
 
 .pattern-sew-bar [data-sew-next] {
   border-color: var(--seam);
+}
+
+/* Simplify bar: bottom middle, where the draftsperson is looking at the points
+   being reduced, and out of the way of the context menu that opened it. */
+.pattern-simplify-bar {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transform: translateX(-50%);
+  padding: 5px 6px 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: rgba(35, 31, 27, 0.94);
+  color: var(--ink);
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.35);
+  font: 11px var(--mono);
+  white-space: nowrap;
+}
+
+.pattern-simplify-bar[hidden] {
+  display: none !important;
+}
+
+.pattern-simplify-title {
+  color: var(--muted);
+}
+
+.pattern-simplify-count {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.pattern-simplify-field {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.pattern-simplify-field input[type='range'] {
+  width: 90px;
+}
+
+.pattern-simplify-value {
+  min-width: 30px;
+  text-align: right;
+}
+
+.pattern-simplify-bar button {
+  min-height: 24px;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
+/* Curve knife bar: same slot as the simplify bar — bottom middle, where the
+   piece being clicked is — with the cut's status between the two controls. */
+.pattern-knife-bar {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transform: translateX(-50%);
+  padding: 5px 6px 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: rgba(35, 31, 27, 0.94);
+  color: var(--ink);
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.35);
+  font: 11px var(--mono);
+  white-space: nowrap;
+}
+
+.pattern-knife-bar[hidden] {
+  display: none !important;
+}
+
+.pattern-knife-title {
+  color: var(--muted);
+}
+
+.pattern-knife-count {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.pattern-knife-status {
+  max-width: 32ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--muted);
+}
+
+.pattern-knife-field,
+.pattern-knife-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.pattern-knife-toggle {
+  cursor: pointer;
+  user-select: none;
+}
+
+.pattern-knife-toggle input[type='checkbox'] {
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.pattern-knife-bar button {
+  min-height: 24px;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
+.pattern-knife-bar [data-knife-done]:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .pattern-seam-connector {
@@ -2431,6 +2878,270 @@ body {
   gap: 2px;
   pointer-events: auto;
   user-select: none;
+}
+
+/*
+ * Shading control: sits immediately left of the navigation gnomon (84px wide,
+ * pinned 8px from the right edge), so its own row shares the gnomon's.
+ */
+.viewport-shading {
+  position: absolute;
+  top: 8px;
+  right: 100px;
+  z-index: 5;
+  display: flex;
+  align-items: flex-start;
+  gap: 2px;
+  pointer-events: auto;
+  user-select: none;
+}
+
+.viewport-shading-btn,
+.viewport-shading-caret {
+  padding: 2px 6px;
+  border: 1px solid rgba(242, 235, 227, 0.2);
+  border-radius: 4px;
+  background: rgba(28, 26, 23, 0.75);
+  color: #f2ebe3;
+  cursor: pointer;
+  font: 10px var(--mono);
+  white-space: nowrap;
+}
+
+.viewport-shading-caret {
+  padding: 2px 4px;
+}
+
+.viewport-shading-btn:hover,
+.viewport-shading-caret:hover {
+  border-color: #c45c26;
+}
+
+/* PBR is the only mode that depends on the environment, so it reads as active. */
+.viewport-shading-btn[data-mode='pbr'] {
+  border-color: #3d7ea6;
+  color: #8ec8e8;
+}
+
+.viewport-shading-panel {
+  position: absolute;
+  top: 26px;
+  right: 0;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 208px;
+  max-height: min(78vh, 560px);
+  overflow-y: auto;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #1a1815;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  font: 11px var(--font);
+  color: var(--ink);
+}
+
+.viewport-shading-panel[hidden] {
+  display: none;
+}
+
+.viewport-shading-modes {
+  display: flex;
+  gap: 2px;
+}
+
+.viewport-shading-mode {
+  flex: 1;
+  padding: 4px 2px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--muted);
+  font: 10px var(--mono);
+  cursor: pointer;
+}
+
+.viewport-shading-mode:hover {
+  border-color: #c45c26;
+  color: var(--ink);
+}
+
+.viewport-shading-mode.is-active {
+  border-color: #3d7ea6;
+  background: rgba(61, 126, 166, 0.22);
+  color: #8ec8e8;
+}
+
+.viewport-shading-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.viewport-shading-field > span {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.viewport-shading-field select {
+  width: 100%;
+  padding: 3px 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  font: 11px var(--mono);
+}
+
+.viewport-shading-blur,
+.viewport-shading-exposure {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.viewport-shading-blur-value,
+.viewport-shading-exposure-value {
+  color: var(--muted);
+  font: 10px var(--mono);
+  align-self: flex-end;
+}
+
+.viewport-shading-materials {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.viewport-shading-materials > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.viewport-shading-material-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 6px;
+}
+
+.viewport-shading-material {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.viewport-shading-material-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.viewport-shading-material-color {
+  width: 34px;
+  height: 16px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: none;
+  cursor: pointer;
+}
+
+.viewport-shading-material-color:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.viewport-shading-material-field {
+  display: grid;
+  grid-template-columns: 58px 1fr 34px;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.viewport-shading-material-roughness,
+.viewport-shading-material-metallic {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.viewport-shading-tonemap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.viewport-shading-tonemap > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.viewport-shading-tonemap-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding-top: 6px;
+}
+
+.viewport-shading-tonemap-option {
+  flex: 1 1 44%;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--muted);
+  font: 10px var(--mono);
+  text-align: left;
+  cursor: pointer;
+}
+
+.viewport-shading-tonemap-option:hover:not(:disabled) {
+  border-color: #c45c26;
+  color: var(--ink);
+}
+
+.viewport-shading-tonemap-option.is-active {
+  border-color: #3d7ea6;
+  background: rgba(61, 126, 166, 0.22);
+  color: #8ec8e8;
+}
+
+.viewport-shading-tonemap-option:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.viewport-shading-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.viewport-shading-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
 }
 
 .move-gizmo {
@@ -3657,19 +4368,19 @@ body {
 .canvas-node:not(.is-expanded) .pattern-xray-bar,
 .canvas-node:not(.is-expanded) .pattern-avatar-bar,
 .canvas-node:not(.is-expanded) .pattern-point-bar,
+.canvas-node:not(.is-expanded) .pattern-tool-settings,
 .canvas-node:not(.is-expanded) .pattern-block-bar,
 .canvas-node:not(.is-expanded) .pattern-ruler-bar {
   display: none !important;
 }
 
 /*
- * Transform 3D and Sim headers are bare on the board — only the full-screen
- * button. Once a node is expanded into the overlay (`is-expanded`), its action
- * buttons come back: Reset layout / Rebuild, Play / Pause / Reset / Rebuild /
- * Snapshot / Strain. Mesh keeps Remesh in both places.
+ * Transform 3D and Sim show their action bar (Reset layout / Rebuild, Play /
+ * Pause / Reset / Rebuild / Snapshot / Strain) only in fullscreen, where the
+ * floating bar has room. Mesh keeps Remesh in both places.
  */
-.node-transform3d:not(.is-expanded) .node-actions,
-.node-simViewport:not(.is-expanded) .node-actions {
+.node-transform3d:not(.is-expanded) .node-viewport-actions,
+.node-simViewport:not(.is-expanded) .node-viewport-actions {
   display: none;
 }
 
@@ -3702,6 +4413,150 @@ body {
 
 .canvas-node-placeholder.is-embedded {
   display: none;
+}
+
+/*
+ * Split fullscreen: the 2D pattern on the left, one 3D stage on the right, under
+ * a single header strip (the chips pick the stage; the banner warns of staleness).
+ */
+.node-fullscreen-overlay.is-split {
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Split mode hoists the expanded node's own chrome to the top of the overlay. */
+.node-fullscreen-overlay.is-split > .node-chrome {
+  position: static;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(18, 16, 14, 0.92);
+  cursor: default;
+}
+
+.node-fullscreen-overlay.is-split > .node-chrome .node-fullscreen-tabs {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+/* The pattern chip is informational in split mode — the 2D pane is always there. */
+.node-fullscreen-overlay.is-split .node-fullscreen-tab.is-fixed {
+  opacity: 0.75;
+}
+
+.node-split-body {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+}
+
+.node-split-pane {
+  flex: 1 1 50%;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #1a1815;
+}
+
+/* The stage pane rides under the hoisted title bar, so it keeps no chrome. */
+.node-split-pane > .canvas-node > .node-chrome {
+  display: none !important;
+}
+
+/*
+ * Stale build: the 3D viewport's border turns amber, and the warning rides in the
+ * viewport's action stack, directly above the buttons.
+ */
+.node-split-pane.is-stale::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 11;
+  border: 2px solid rgba(212, 160, 23, 0.85);
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.node-split-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  width: max-content;
+  max-width: 100%;
+  padding: 6px 10px;
+  pointer-events: auto;
+  border-radius: 6px;
+  border: 1px solid rgba(212, 160, 23, 0.6);
+  /* Near-opaque: it sits over the scene, not on the app's flat background. */
+  background: rgba(48, 38, 12, 0.94);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  font-size: 12px;
+  text-align: center;
+}
+
+.node-split-banner[hidden] {
+  display: none;
+}
+
+.node-split-banner-text {
+  color: #f1cf65;
+}
+
+.node-split-resync {
+  padding: 4px 10px;
+  border: 1px solid rgba(212, 160, 23, 0.6);
+  border-radius: 4px;
+  background: rgba(212, 160, 23, 0.2);
+  color: #f1cf65;
+  cursor: pointer;
+  font: 11px var(--mono);
+}
+
+.node-split-resync:hover {
+  background: rgba(212, 160, 23, 0.32);
+}
+
+/* Icon-only split toggle, sitting between the pattern and remesh chips. */
+.node-fullscreen-split-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 26px;
+  height: 22px;
+  padding: 0;
+  border: 1px dashed rgba(242, 235, 227, 0.4);
+  border-radius: 5px;
+  background: transparent;
+  color: #f2ebe3;
+  cursor: pointer;
+}
+
+.node-fullscreen-split-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.node-fullscreen-split-btn.is-active {
+  border-style: solid;
+  border-color: #d4a017;
+  background: rgba(212, 160, 23, 0.18);
+  color: #f1cf65;
 }
 
 /* ---------------------------------------------------------------------------
@@ -3819,4 +4674,132 @@ body {
 .seam-context-menu button.is-danger:hover {
   background: rgba(196, 92, 74, 0.22);
   color: #f0a091;
+}
+
+/* Join bar: where the two ends of a fuse are read, bottom centre with the other
+   tool bars. */
+.pattern-join-bar,
+.pattern-bridge-bar {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transform: translateX(-50%);
+  padding: 5px 6px 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: rgba(35, 31, 27, 0.94);
+  color: var(--ink);
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.35);
+  font: 11px var(--mono);
+  white-space: nowrap;
+}
+
+.pattern-join-bar[hidden],
+.pattern-bridge-bar[hidden] {
+  display: none !important;
+}
+
+.pattern-join-title,
+.pattern-bridge-title {
+  color: var(--muted);
+}
+
+.pattern-join-bar [data-join-instruction],
+.pattern-bridge-bar [data-bridge-instruction] {
+  max-width: 46ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pattern-join-bar [data-join-instruction].is-refused,
+.pattern-bridge-bar [data-bridge-instruction].is-refused {
+  color: #e08a5a;
+}
+
+.pattern-join-bar button,
+.pattern-bridge-bar button {
+  min-height: 24px;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
+.pattern-join-bar button[hidden],
+.pattern-bridge-bar button[hidden] {
+  display: none !important;
+}
+
+.pattern-join-bar button:disabled,
+.pattern-bridge-bar button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/*
+ * The buttons in the floating tool ribbons — the bars at the bottom middle.
+ * They are the app's buttons, not the browser's: left to the UA default they
+ * came out light grey, Arial and outset, which reads as a different, webby app
+ * sitting inside this one.
+ */
+.pattern-simplify-bar button,
+.pattern-knife-bar button,
+.pattern-join-bar button,
+.pattern-bridge-bar button {
+  min-height: 24px;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #3a342c;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.pattern-simplify-bar button:hover:not(:disabled),
+.pattern-knife-bar button:hover:not(:disabled),
+.pattern-join-bar button:hover:not(:disabled),
+.pattern-bridge-bar button:hover:not(:disabled) {
+  background: #463f35;
+  border-color: var(--muted);
+}
+
+.pattern-simplify-bar button:disabled,
+.pattern-knife-bar button:disabled,
+.pattern-join-bar button:disabled,
+.pattern-bridge-bar button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* The action each ribbon is really for carries an accent border. */
+.pattern-simplify-bar [data-simplify-done],
+.pattern-knife-bar [data-knife-done] {
+  border-color: var(--accent);
+}
+
+.pattern-join-bar [data-join-next],
+.pattern-bridge-bar [data-bridge-next] {
+  border-color: var(--seam);
+}
+
+.pattern-join-bar [data-join-commit],
+.pattern-bridge-bar [data-bridge-commit] {
+  border-color: var(--accent);
+}
+
+/* The outline the picks would fuse or bridge into: dashed, so it reads as a
+   proposal either way. */
+.pattern-join-preview {
+  stroke: var(--seam);
+  stroke-dasharray: 4 3;
+  pointer-events: none;
+}
+
+.pattern-bridge-preview {
+  stroke: var(--accent);
+  stroke-dasharray: 4 3;
+  pointer-events: none;
 }

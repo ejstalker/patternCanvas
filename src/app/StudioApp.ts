@@ -52,6 +52,8 @@ import { buildMeasurementRulers } from '../avatar/rulerOverlay';
 import { cachedMeasurementLibrary, loadMeasurementLibrary } from '../persistence/measurementLibrary';
 import { MeshPreview } from '../mesh/MeshPreview';
 import { createSharedGpu, SimViewportRuntime } from '../sim/SimViewportRuntime';
+import { Environment, loadEnvironmentSettings } from '../render/environment';
+import { MaterialLibrary } from '../render/materials';
 import { Transform3dRuntime } from '../sim/Transform3dRuntime';
 import { DEFAULT_TRANSFORM_PIECE_ROTATION_DEG } from '../sim/transformDefaults';
 import {
@@ -70,7 +72,6 @@ import {
 } from 'lucide';
 import {
   DEFAULT_AUTOSAVE_MINUTES,
-  createDirtyState,
   deleteProjectFromLibrary,
   exportProjectFile,
   formatProjectDate,
@@ -84,7 +85,6 @@ import {
   saveProjectToLibrary,
   setActiveProjectId,
   setAutosaveIntervalMinutes,
-  type DirtyState,
 } from '../project/projectLibrary';
 import { HistoryManager } from '../project/history/HistoryManager';
 import {
@@ -114,10 +114,21 @@ type WireDrag = WireSource & {
   y: number;
 };
 
-/** Live camera states captured so undo/redo can preserve the current view. */
+/** Visible pattern-space rectangle of a 2D editor (its zoom / pan). */
+type PatternViewBox = { x: number; y: number; w: number; h: number };
+
+/**
+ * Live view states captured so undo/redo can preserve the current view. Pan and
+ * zoom are the user's, not the document's: restoring history must never move a
+ * viewport — the 3D cameras, the 2D editors, or the board itself.
+ */
 type CameraSnapshot = {
   transforms: Map<string, SimCameraState>;
   sims: Map<string, SimCameraState>;
+  /** Board pan/zoom, kept across undo so the studio canvas stays put. */
+  board: { panX: number; panY: number; zoom: number };
+  /** Per pattern-frame node id: the editor's visible rectangle. */
+  patterns: Map<string, PatternViewBox>;
 };
 
 function ensureVisibleConnections(project: ProjectDocument): ProjectDocument {
@@ -162,6 +173,13 @@ export class StudioApp {
   private transformRuntimes = new Map<string, Transform3dRuntime>();
   private transformInspectorPieceId: string | null = null;
   private device: GPUDevice | null = null;
+  /**
+   * HDRI background + light probe. One per device, shared by every 3D viewport,
+   * so switching the environment moves them all together.
+   */
+  private environment: Environment | null = null;
+  /** Scene materials, shared by every 3D viewport like the environment. */
+  private materials = new MaterialLibrary();
   private selectedNodeId: string | null = null;
   /** Fixed-position tip host (escapes inspector overflow clipping). */
   private inspectorTipEl: HTMLDivElement | null = null;
@@ -193,7 +211,6 @@ export class StudioApp {
   private undoStack = new HistoryManager();
   private autosaveTimer: ReturnType<typeof setInterval> | null = null;
   private persistDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-  private dirty: DirtyState = createDirtyState(true);
   private saveInFlight = false;
   private saveQueued = false;
   private restoringUndo = false;
@@ -201,6 +218,24 @@ export class StudioApp {
   private expandPlaceholder: HTMLElement | null = null;
   private expandOverlay: HTMLElement | null = null;
   private expandEscHandler: ((e: KeyboardEvent) => void) | null = null;
+  /**
+   * Split fullscreen: the 2D pattern on the left and one 3D stage on the right,
+   * shown at once. Null when the normal single-node fullscreen is in use.
+   */
+  private splitView: {
+    patternNodeId: string;
+    stageNodeId: string;
+    patternPlaceholder: HTMLElement;
+    stagePlaceholder: HTMLElement;
+    /** The expanded node's own chrome, hoisted to the top of the overlay. */
+    chrome: HTMLElement;
+    body: HTMLElement;
+    /** The 3D pane; carries the stale tint and the banner over its action bar. */
+    stagePane: HTMLElement;
+    banner: HTMLElement;
+  } | null = null;
+  /** Guard so mirrored 2D ↔ 3D selection does not feed back on itself. */
+  private splitSelectionSyncing = false;
   private imageFileInput: HTMLInputElement;
   private resizeShiftKey = false;
 
@@ -280,11 +315,25 @@ export class StudioApp {
       /* ignore */
     }
     const project = ensureVisibleConnections(createDefaultProject());
-    const { write } = await saveProjectToLibrary(project, createDirtyState(true));
+    const { write } = await saveProjectToLibrary(project);
     if (!write.ok) {
       console.warn('Initial project save failed:', write.error);
     }
     return project;
+  }
+
+  /**
+   * Say so when a project came back with image bytes that are no longer in
+   * storage. Reading the document rather than remembering a load-time set keeps
+   * the warning honest: re-linking the image clears it.
+   */
+  private reportMissingImages(): void {
+    const count = this.project.canvas.nodes.filter(
+      (node) => node.type === 'image' && !node.src
+    ).length;
+    if (count === 0) return;
+    const what = count === 1 ? 'An image reference has' : `${count} image references have`;
+    this.setStatus(`${what} lost its stored data — use Re-link image… on the node to restore it`);
   }
 
   private async refreshStorageStatus(): Promise<void> {
@@ -295,12 +344,12 @@ export class StudioApp {
     }
   }
 
-  private markDirty(all = true): void {
-    if (all) {
-      this.dirty = createDirtyState(true);
-    } else {
-      this.dirty.manifest = true;
-    }
+  /**
+   * Something in the document changed. The save payload is derived from the
+   * project itself, so there is no dirty-bit bookkeeping to keep in step — this
+   * only debounces the write.
+   */
+  private markDirty(): void {
     this.scheduleDebouncedPersist();
   }
 
@@ -321,21 +370,17 @@ export class StudioApp {
     return ensureVisibleConnections(project);
   }
 
-  private async persistLocal(opts: { quiet?: boolean; label?: string; forceFull?: boolean } = {}): Promise<void> {
+  private async persistLocal(opts: { quiet?: boolean; label?: string } = {}): Promise<void> {
     if (this.saveInFlight) {
       this.saveQueued = true;
       return;
     }
     this.saveInFlight = true;
     this.persistSimStates();
-    const dirty =
-      opts.forceFull || !opts.quiet ? createDirtyState(true) : this.dirty;
-    this.dirty = createDirtyState(false);
     try {
-      const { write } = await saveProjectToLibrary(this.project, dirty);
+      const { write } = await saveProjectToLibrary(this.project);
       const label = opts.label ?? 'Saved';
       if (!write.ok) {
-        this.dirty.manifest = true;
         this.setStatus(write.error ?? 'Local save failed — export your project');
         return;
       }
@@ -367,7 +412,7 @@ export class StudioApp {
     const prev = this.undoStack.undo(this.project);
     this.updateHistoryButtons();
     if (!prev) return;
-    this.markDirty(true);
+    this.markDirty();
     void this.restoreHistoryProject(prev, `Undo (${this.undoStack.size} left)`, cameras);
   }
 
@@ -378,7 +423,7 @@ export class StudioApp {
     const next = this.undoStack.redo(this.project);
     this.updateHistoryButtons();
     if (!next) return;
-    this.markDirty(true);
+    this.markDirty();
     void this.restoreHistoryProject(next, `Redo (${this.undoStack.redoSize} left)`, cameras);
   }
 
@@ -473,7 +518,8 @@ export class StudioApp {
       if (node.type === 'patternFrame') {
         const pattern = this.project.patterns.find((p) => p.id === node.patternId);
         const editor = this.editors.get(node.id);
-        if (pattern && editor) editor.setPattern(pattern);
+        // Restoring history: keep the zoom/pan the user is looking through.
+        if (pattern && editor) editor.setPattern(pattern, { preserveView: true });
         continue;
       }
       if (node.type === 'meshFrame') {
@@ -487,7 +533,7 @@ export class StudioApp {
       if (node.type === 'image') {
         const el = this.findNodeEl(node.id);
         const img = el?.querySelector('img') as HTMLImageElement | null;
-        if (img && node.src && img.src !== node.src) img.src = node.src;
+        if (img && node.src && img.src !== node.src) this.refreshImageElement(node);
         continue;
       }
       if (node.type === 'text') {
@@ -714,6 +760,51 @@ export class StudioApp {
     };
   }
 
+  /** Ask for a file to point `node` at. Used to add a replacement or re-link. */
+  private pickImageFile(node: ImageNode): void {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.addEventListener('change', () => {
+      const file = input.files?.[0];
+      if (file) void this.applyImageFile(node, file);
+    });
+    input.click();
+  }
+
+  /** Point `node` at a new image's bytes and make sure they reach storage. */
+  private async applyImageFile(node: ImageNode, file: File): Promise<void> {
+    try {
+      this.pushUndo();
+      const src = await this.readFileAsDataUrl(file);
+      const { w, h } = await this.loadImageNaturalSize(src);
+      const wasMissing = !node.src;
+      node.src = src;
+      node.naturalAspect = w / h;
+      node.label = file.name.replace(/\.[^.]+$/, '') || node.label || 'Image';
+      this.refreshImageElement(node);
+      this.renderInspector();
+      // Re-linking an image whose bytes were lost is the point of this path, so
+      // the new bytes have to actually land in storage before we claim success.
+      await this.persistLocal();
+      this.setStatus(wasMissing ? 'Image re-linked' : 'Image replaced');
+    } catch {
+      this.setStatus('Could not read that image');
+    }
+  }
+
+  /** Swap the missing-note for the real image once the node has a src again. */
+  private refreshImageElement(node: ImageNode): void {
+    const el = this.board.querySelector(`.canvas-node[data-node-id="${node.id}"]`);
+    const img = el?.querySelector('img') as HTMLImageElement | null;
+    if (!img) return;
+    img.alt = node.label || 'image reference';
+    if (!node.src) return;
+    img.hidden = false;
+    img.src = node.src;
+    el?.querySelector('.image-missing')?.remove();
+  }
+
   private async addImagesFromFiles(
     files: File[],
     at?: { clientX?: number; clientY?: number }
@@ -756,7 +847,7 @@ export class StudioApp {
     this.layoutNodes();
     this.drawWires();
     this.renderInspector();
-    this.markDirty(true);
+    this.markDirty();
     void this.persistLocal();
     this.setStatus(
       images.length === 1 ? 'Image reference placed on canvas' : `${images.length} image references placed`
@@ -779,7 +870,7 @@ export class StudioApp {
   private switchToProject(project: ProjectDocument, opts: { resetUndo?: boolean } = {}): void {
     this.project = this.prepareLoadedProject(project);
     void setActiveProjectId(project.id);
-    this.markDirty(true);
+    this.markDirty();
     this.selectedNodeId = null;
     this.transformInspectorPieceId = null;
     if (opts.resetUndo !== false) {
@@ -812,7 +903,7 @@ export class StudioApp {
       void (async () => {
         try {
           const project = await importProjectFile(file);
-          const { write } = await saveProjectToLibrary(project, createDirtyState(true));
+          const { write } = await saveProjectToLibrary(project);
           this.switchToProject(project);
           if (!write.ok) {
             this.setStatus(write.error ?? 'Import loaded, but local save failed');
@@ -1018,7 +1109,7 @@ export class StudioApp {
   private startNewProject(): void {
     void (async () => {
       const project = ensureVisibleConnections(createDefaultProject());
-      const { write } = await saveProjectToLibrary(project, createDirtyState(true));
+      const { write } = await saveProjectToLibrary(project);
       this.switchToProject(project);
       if (!write.ok) {
         this.setStatus(write.error ?? 'New project started, but local save failed');
@@ -1317,7 +1408,7 @@ export class StudioApp {
       this.closeModal();
     });
     this.modalRoot.querySelector('[data-projects-act="save"]')?.addEventListener('click', () => {
-      void this.persistLocal({ forceFull: true }).then(() => this.renderProjectsModal());
+      void this.persistLocal().then(() => this.renderProjectsModal());
     });
     this.modalRoot.querySelector('[data-projects-act="import"]')?.addEventListener('click', () => {
       this.importFileInput.click();
@@ -1376,7 +1467,7 @@ export class StudioApp {
                 (nextId ? await getSavedProject(nextId) : null) ??
                 ensureVisibleConnections(createDefaultProject());
               if (!(await getSavedProject(next.id))) {
-                await saveProjectToLibrary(next, createDirtyState(true));
+                await saveProjectToLibrary(next);
               }
               this.switchToProject(next);
               this.setStatus(`Deleted “${record.name}”`);
@@ -1561,7 +1652,7 @@ export class StudioApp {
         this.editors.forEach((ed) => ed.setUnit(this.project.displayUnit));
         this.meshPreviews.forEach((p) => p.setUnit(this.project.displayUnit));
         // The unit is document data — make sure the choice reaches the file.
-        this.markDirty(true);
+        this.markDirty();
         break;
       case 'addPattern':
         this.pushUndo();
@@ -1774,9 +1865,14 @@ export class StudioApp {
   }
 
   private findNodeEl(nodeId: string): HTMLElement | null {
+    // `.canvas-node` only: the placeholder a fullscreen node leaves behind
+    // carries the same `data-node-id`, and matching it would move the
+    // placeholder instead of the node.
     return (
-      (this.board.querySelector(`[data-node-id="${nodeId}"]`) as HTMLElement | null) ||
-      (this.expandOverlay?.querySelector(`[data-node-id="${nodeId}"]`) as HTMLElement | null)
+      (this.board.querySelector(`.canvas-node[data-node-id="${nodeId}"]`) as HTMLElement | null) ||
+      (this.expandOverlay?.querySelector(
+        `.canvas-node[data-node-id="${nodeId}"]`
+      ) as HTMLElement | null)
     );
   }
 
@@ -1878,6 +1974,8 @@ export class StudioApp {
 
   private closeNodeFullscreen(): void {
     if (!this.expandedNodeId || !this.expandPlaceholder || !this.expandOverlay) return;
+    // Put the split's stage back on the board before the node elements move.
+    if (this.splitView) this.exitSplitView();
     const nodeId = this.expandedNodeId;
     const el = this.expandOverlay.querySelector(
       `[data-node-id="${nodeId}"]`
@@ -1960,6 +2058,8 @@ export class StudioApp {
   private switchFullscreenNode(nextId: string): void {
     if (!this.expandOverlay || !this.expandPlaceholder || !this.expandedNodeId) return;
     if (nextId === this.expandedNodeId) return;
+    // Collapse the split back to the pattern so the switch moves a plain overlay.
+    if (this.splitView) this.exitSplitView('pattern');
 
     const prevId = this.expandedNodeId;
     const prevEl = this.expandOverlay.querySelector(
@@ -2052,6 +2152,11 @@ export class StudioApp {
 
   /** Re-paint the fullscreen pipeline strip (stale markers change live). */
   private refreshFullscreenTabs(): void {
+    if (this.splitView) {
+      this.renderSplitHeader();
+      this.syncSplitBanner();
+      return;
+    }
     if (!this.expandedNodeId || !this.expandOverlay) return;
     const el = this.expandOverlay.querySelector(
       `[data-node-id="${this.expandedNodeId}"]`
@@ -2353,8 +2458,14 @@ export class StudioApp {
           this.pipelineTabLabel(n)
         )}</button>`;
         if (i >= pipeline.length - 1) return chip;
-        const link = `<span class="node-fullscreen-link" aria-hidden="true"><svg viewBox="0 0 26 10" width="26" height="10" fill="none"><path class="node-fullscreen-link-line" d="M0 5 H 17" /><path class="node-fullscreen-link-head" d="M16 2 L 21 5 L 16 8" /></svg></span>`;
-        return chip + link;
+        const link = this.splitLinkHtml();
+        // The 2D + 3D split toggle sits where the run leaves the pattern, before
+        // the remesh.
+        const splitBtn =
+          i === 0 && pipeline[0].type === 'patternFrame'
+            ? this.splitToggleButtonHtml() + link
+            : link;
+        return chip + splitBtn;
       })
       .join('');
 
@@ -2365,6 +2476,11 @@ export class StudioApp {
         const id = (btn as HTMLButtonElement).dataset.fsNode;
         if (id) this.switchFullscreenNode(id);
       });
+    });
+    tabs.querySelector('button[data-fs-split]')?.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.toggleSplitView();
     });
 
     // The strip scrolls horizontally; make sure the stage you are looking at is
@@ -2385,13 +2501,440 @@ export class StudioApp {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Split view: the 2D pattern and one 3D stage side by side.
+  // ---------------------------------------------------------------------------
+
+  /** Icon-only toggle that splits the fullscreen into 2D + 3D. */
+  private splitToggleButtonHtml(): string {
+    const active = this.splitView !== null;
+    return `<button type="button" class="node-fullscreen-split-btn${
+      active ? ' is-active' : ''
+    }" data-fs-split aria-pressed="${active}" title="Split view — 2D pattern beside the 3D stage" aria-label="Toggle split 2D and 3D view"><svg viewBox="0 0 16 14" width="15" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><rect x="1.4" y="1.4" width="13.2" height="11.2" rx="1.4"/><path d="M8 1.4 V 12.6"/></svg></button>`;
+  }
+
+  /** The 3D stages of the pipeline, in run order (remesh → transform → drape). */
+  private splitStageNodes(pipeline: CanvasNode[]): CanvasNode[] {
+    return pipeline.filter(
+      (n) => n.type === 'meshFrame' || n.type === 'transform3d' || n.type === 'simViewport'
+    );
+  }
+
+  private toggleSplitView(): void {
+    if (this.splitView) {
+      this.exitSplitView();
+      return;
+    }
+    const expandedId = this.expandedNodeId;
+    if (!expandedId) return;
+    const pipeline = this.pipelineNodesFor(expandedId);
+    const pattern = pipeline.find((n) => n.type === 'patternFrame');
+    const stages = this.splitStageNodes(pipeline);
+    // Splitting from a 3D view keeps that view on the right; the pattern (or a
+    // pipeline with no stage to inherit) falls back to the run's first stage.
+    const stage = stages.find((n) => n.id === expandedId) ?? stages[0];
+    if (!pattern || !stage) return;
+    this.enterSplitView(pattern.id, stage.id);
+  }
+
+  /**
+   * Show the pattern and a 3D stage at once. The pattern stays in the overlay as
+   * the active node; the stage is adopted off the board into the right pane. The
+   * pattern's own chrome is hoisted to the top of the existing overlay and its
+   * chips pick which stage fills the right pane.
+   */
+  private enterSplitView(patternNodeId: string, stageNodeId: string): void {
+    const overlay = this.expandOverlay;
+    if (!overlay || this.splitView) return;
+    const patternNode = this.canvasNode(patternNodeId);
+    const stageNode = this.canvasNode(stageNodeId);
+    if (!patternNode || !stageNode) return;
+
+    const patternEl = this.findNodeEl(patternNodeId);
+    const stageEl = this.findNodeEl(stageNodeId);
+    // The split reuses the expanded node's own chrome as its title bar, so this is
+    // the current overlay with its header kept at the top — not a second overlay.
+    const chrome = patternEl?.querySelector(':scope > .node-chrome') as HTMLElement | null;
+    const stageStack = this.viewportActionStack(stageEl);
+    // Everything that can bail out is checked before the first DOM move, so a
+    // refusal never leaves the overlay half-built.
+    if (!patternEl || !stageEl || !chrome || !stageStack) return;
+
+    this.remeshIfStale(stageNodeId);
+    // Whatever was fullscreen goes back on the board first, so both elements we
+    // are about to adopt still have their board parents.
+    this.restoreExpandedNodeToBoard();
+
+    const banner = document.createElement('div');
+    banner.className = 'node-split-banner';
+    banner.hidden = true;
+
+    const body = document.createElement('div');
+    body.className = 'node-split-body';
+    const left = document.createElement('div');
+    left.className = 'node-split-pane is-2d';
+    const right = document.createElement('div');
+    right.className = 'node-split-pane is-3d';
+
+    const patternPlaceholder = this.detachIntoPane(patternEl, patternNode, left);
+    const stagePlaceholder = this.detachIntoPane(stageEl, stageNode, right);
+
+    // The warning belongs in the 3D viewport it is talking about, riding above
+    // that viewport's floating action bar.
+    stageStack.insertBefore(banner, stageStack.firstElementChild);
+
+    body.append(left, right);
+    overlay.classList.add('is-split');
+    overlay.append(chrome, body);
+    this.setExpandButtonMode(chrome, true);
+
+    // The pattern owns the fullscreen lifecycle while split; the stage rides along.
+    this.expandedNodeId = patternNodeId;
+    this.expandPlaceholder = patternPlaceholder;
+    this.splitView = {
+      patternNodeId,
+      stageNodeId,
+      patternPlaceholder,
+      stagePlaceholder,
+      chrome,
+      body,
+      stagePane: right,
+      banner,
+    };
+    this.renderSplitHeader();
+    this.syncSplitBanner();
+    // Seed the 3D selection from whatever is picked in 2D.
+    this.syncSplitSelectionFrom2d(this.editors.get(patternNodeId)?.getSelectedPieces() ?? []);
+    this.layoutNodes();
+    requestAnimationFrame(() => {
+      this.notifyNodeViewportResize(patternNodeId);
+      this.notifyNodeViewportResize(stageNodeId);
+    });
+  }
+
+  /** Put the node that is currently fullscreen back on the board. */
+  private restoreExpandedNodeToBoard(): void {
+    const id = this.expandedNodeId;
+    if (id && this.expandPlaceholder) {
+      const el = this.findNodeEl(id);
+      const node = this.canvasNode(id);
+      if (el && node) this.restoreFromPane(el, node, this.expandPlaceholder);
+    }
+    this.expandedNodeId = null;
+    this.expandPlaceholder = null;
+  }
+
+  /** Take a node off the board into `pane`, leaving a placeholder behind. */
+  private detachIntoPane(
+    el: HTMLElement,
+    node: CanvasNode,
+    pane: HTMLElement
+  ): HTMLElement {
+    const placeholder = document.createElement('div');
+    placeholder.className = `canvas-node-placeholder${
+      this.isEmbeddedNode(node) ? ' is-embedded' : ''
+    }`;
+    placeholder.dataset.nodeId = node.id;
+    placeholder.style.left = `${node.x}px`;
+    placeholder.style.top = `${node.y}px`;
+    placeholder.style.width = `${node.width}px`;
+    placeholder.style.height = `${node.height}px`;
+    placeholder.style.zIndex = String(node.zIndex);
+    el.parentElement?.insertBefore(placeholder, el);
+
+    el.classList.add('is-expanded');
+    el.style.left = '';
+    el.style.top = '';
+    el.style.width = '';
+    el.style.height = '';
+    el.style.zIndex = '';
+    pane.appendChild(el);
+    return placeholder;
+  }
+
+  /** Put a node back on the board where its placeholder sits. */
+  private restoreFromPane(el: HTMLElement, node: CanvasNode, placeholder: HTMLElement): void {
+    el.classList.remove('is-expanded');
+    // A boarded node carries no fullscreen chrome of its own.
+    this.setExpandButtonMode(el, false);
+    this.clearFullscreenTabs(el);
+    el.style.left = `${node.x}px`;
+    el.style.top = `${node.y}px`;
+    el.style.width = `${node.width}px`;
+    el.style.height = `${node.height}px`;
+    el.style.zIndex = String(node.zIndex);
+    placeholder.replaceWith(el);
+  }
+
+  /**
+   * Leave split mode. The pane you keep becomes the single fullscreen node (the
+   * stage by default, so exiting lands you back in 3D); the other returns to the
+   * board.
+   */
+  private exitSplitView(focus: 'stage' | 'pattern' = 'stage'): void {
+    const split = this.splitView;
+    if (!split || !this.expandOverlay) return;
+    const overlay = this.expandOverlay;
+    const patternEl = this.findNodeEl(split.patternNodeId);
+    const patternNode = this.canvasNode(split.patternNodeId);
+    const stageEl = this.findNodeEl(split.stageNodeId);
+    const stageNode = this.canvasNode(split.stageNodeId);
+
+    const keepPattern = focus === 'pattern';
+    const keepEl = keepPattern ? patternEl : stageEl;
+    const keepNode = keepPattern ? patternNode : stageNode;
+    const keepId = keepPattern ? split.patternNodeId : split.stageNodeId;
+    const keepPlaceholder = keepPattern ? split.patternPlaceholder : split.stagePlaceholder;
+    const dropEl = keepPattern ? stageEl : patternEl;
+    const dropNode = keepPattern ? stageNode : patternNode;
+    const dropPlaceholder = keepPattern ? split.stagePlaceholder : split.patternPlaceholder;
+
+    if (dropEl && dropNode) this.restoreFromPane(dropEl, dropNode, dropPlaceholder);
+    else dropPlaceholder.remove();
+
+    // Hand the hoisted title bar back to the pattern it belongs to. Its close
+    // button only belongs in fullscreen mode when the pattern is the one kept.
+    this.clearFullscreenTabs(split.chrome);
+    this.setExpandButtonMode(split.chrome, keepPattern);
+    if (patternEl && split.chrome.parentElement !== patternEl) {
+      patternEl.insertBefore(split.chrome, patternEl.firstChild);
+    }
+    split.banner.remove();
+    split.body.remove();
+    overlay.classList.remove('is-split');
+
+    this.splitView = null;
+    if (keepEl && keepNode && keepId) {
+      overlay.appendChild(keepEl);
+      keepEl.classList.add('is-expanded');
+      this.setExpandButtonMode(keepEl, true);
+      keepEl.style.left = '';
+      keepEl.style.top = '';
+      keepEl.style.width = '';
+      keepEl.style.height = '';
+      keepEl.style.zIndex = '';
+      this.expandedNodeId = keepId;
+      this.expandPlaceholder = keepPlaceholder;
+      this.dockInspectorToFullscreen();
+      this.syncFullscreenTabs(keepEl, keepId);
+    } else {
+      this.expandedNodeId = null;
+      this.expandPlaceholder = null;
+    }
+    this.renderInspector();
+    this.layoutNodes();
+    requestAnimationFrame(() => {
+      this.notifyNodeViewportResize(split.patternNodeId);
+      this.notifyNodeViewportResize(split.stageNodeId);
+    });
+  }
+
+  /** Swap which 3D stage fills the right pane, keeping the pattern in place. */
+  private switchSplitStage(nextStageNodeId: string): void {
+    const split = this.splitView;
+    if (!split || split.stageNodeId === nextStageNodeId) return;
+    const prevEl = this.findNodeEl(split.stageNodeId);
+    const prevNode = this.canvasNode(split.stageNodeId);
+    const nextEl = this.findNodeEl(nextStageNodeId);
+    const nextNode = this.canvasNode(nextStageNodeId);
+    if (!nextEl || !nextNode) return;
+
+    // The 3D pane outlives the stage it shows, but the warning travels with the
+    // action stack of whichever viewport is now on the right.
+    const nextStack = this.viewportActionStack(nextEl);
+    if (!nextStack) return;
+
+    this.remeshIfStale(nextStageNodeId);
+    if (prevEl && prevNode) this.restoreFromPane(prevEl, prevNode, split.stagePlaceholder);
+    else split.stagePlaceholder.remove();
+
+    split.stagePlaceholder = this.detachIntoPane(nextEl, nextNode, split.stagePane);
+    nextStack.insertBefore(split.banner, nextStack.firstElementChild);
+    split.stageNodeId = nextStageNodeId;
+    this.renderSplitHeader();
+    this.syncSplitBanner();
+    this.syncSplitSelectionFrom2d(this.editors.get(split.patternNodeId)?.getSelectedPieces() ?? []);
+    this.layoutNodes();
+    requestAnimationFrame(() => this.notifyNodeViewportResize(nextStageNodeId));
+  }
+
+  /**
+   * The run the split's chips describe. A pattern can feed more than one 3D
+   * chain, so follow the chain the right pane is actually showing whenever the
+   * pattern's default chain does not contain it.
+   */
+  private splitPipeline(): CanvasNode[] {
+    const split = this.splitView;
+    if (!split) return [];
+    const fromPattern = this.pipelineNodesFor(split.patternNodeId);
+    if (fromPattern.some((n) => n.id === split.stageNodeId)) return fromPattern;
+    const fromStage = this.pipelineNodesFor(split.stageNodeId);
+    return fromStage.some((n) => n.type === 'patternFrame') ? fromStage : fromPattern;
+  }
+
+  /** The hoisted title bar's chips: the run's stages, the stage picking the 3D pane. */
+  private renderSplitHeader(): void {
+    const split = this.splitView;
+    if (!split) return;
+    const tabs = split.chrome.querySelector('.node-fullscreen-tabs') as HTMLElement | null;
+    if (!tabs) return;
+    const title = split.chrome.querySelector('.node-title') as HTMLElement | null;
+    if (title) title.hidden = true;
+    tabs.hidden = false;
+    const pipeline = this.splitPipeline();
+    tabs.innerHTML = pipeline
+      .map((n, i) => {
+        const isStage = this.splitStageNodes([n]).length > 0;
+        const active = isStage && n.id === split.stageNodeId;
+        const stale =
+          n.type === 'meshFrame' &&
+          !this.project.meshes.find((m) => m.id === n.meshId)?.geometry;
+        const chip = `<button type="button" role="tab" class="node-fullscreen-tab${
+          active ? ' is-active' : ''
+        }${stale ? ' is-stale' : ''}${isStage ? '' : ' is-fixed'}" data-split-node="${n.id}" aria-selected="${active}">${this.escapeHtml(
+          this.pipelineTabLabel(n)
+        )}</button>`;
+        if (i >= pipeline.length - 1) return chip;
+        if (n.type === 'patternFrame') {
+          return chip + this.splitToggleButtonHtml() + this.splitLinkHtml();
+        }
+        return chip + this.splitLinkHtml();
+      })
+      .join('');
+    tabs.querySelectorAll('button[data-split-node]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const id = (btn as HTMLButtonElement).dataset.splitNode;
+        if (!id) return;
+        const node = this.canvasNode(id);
+        if (node && this.splitStageNodes([node]).length > 0) this.switchSplitStage(id);
+        else this.exitSplitView();
+      });
+    });
+    tabs.querySelector('button[data-fs-split]')?.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.exitSplitView();
+    });
+  }
+
+  private splitLinkHtml(): string {
+    return `<span class="node-fullscreen-link" aria-hidden="true"><svg viewBox="0 0 26 10" width="26" height="10" fill="none"><path class="node-fullscreen-link-line" d="M0 5 H 17" /><path class="node-fullscreen-link-head" d="M16 2 L 21 5 L 16 8" /></svg></span>`;
+  }
+
+  private canvasNode(nodeId: string): CanvasNode | undefined {
+    return this.project.canvas.nodes.find((n) => n.id === nodeId);
+  }
+
+  /** The mesh behind the split's pattern that still needs a rebuild, if any. */
+  private staleMeshForSplit(): MeshDocument | undefined {
+    const split = this.splitView;
+    if (!split) return undefined;
+    const node = this.canvasNode(split.patternNodeId);
+    if (node?.type !== 'patternFrame') return undefined;
+    return this.project.meshes.find(
+      (m) => m.patternId === node.patternId && !m.geometry
+    );
+  }
+
+  /** Warn, over the split's 3D viewport, that the build behind it is out of date. */
+  private syncSplitBanner(): void {
+    const split = this.splitView;
+    if (!split) return;
+    const stale = this.staleMeshForSplit();
+    split.banner.hidden = !stale;
+    split.stagePane.classList.toggle('is-stale', !!stale);
+    if (!stale) {
+      split.banner.innerHTML = '';
+      return;
+    }
+    split.banner.innerHTML = `
+      <span class="node-split-banner-text">Pattern changed — the 3D build is out of date.</span>
+      <button type="button" class="node-split-resync" data-split-resync>Resync 3D</button>
+    `;
+    split.banner
+      .querySelector('button[data-split-resync]')
+      ?.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.resyncSplit();
+      });
+  }
+
+  /** Remesh and rebuild every stale mesh behind the split's pattern. */
+  private resyncSplit(): void {
+    const split = this.splitView;
+    if (!split) return;
+    const node = this.canvasNode(split.patternNodeId);
+    if (node?.type !== 'patternFrame') return;
+    this.pushUndo();
+    const meshes = this.project.meshes.filter(
+      (m) => m.patternId === node.patternId && !m.geometry
+    );
+    for (const mesh of meshes) this.remesh(mesh.id, { recordUndo: false });
+    this.syncSplitBanner();
+    this.renderSplitHeader();
+    this.renderInspector();
+    this.setStatus(
+      meshes.length
+        ? `Resynced ${meshes.length} mesh${meshes.length === 1 ? '' : 'es'} from the pattern`
+        : 'Resynced'
+    );
+  }
+
+  /** 2D → 3D: mirror the pattern editor's picked pieces onto the 3D stage. */
+  private syncSplitSelectionFrom2d(pieceIds: readonly string[]): void {
+    const split = this.splitView;
+    if (!split || this.splitSelectionSyncing) return;
+    const stage = this.canvasNode(split.stageNodeId);
+    if (!stage) return;
+    this.splitSelectionSyncing = true;
+    try {
+      if (stage.type === 'simViewport') {
+        this.simRuntimes.get(stage.simId)?.setSelectedPieces(pieceIds);
+      } else if (stage.type === 'transform3d') {
+        this.transformRuntimes.get(stage.transformId)?.setSelectedPieces(pieceIds);
+      }
+    } finally {
+      this.splitSelectionSyncing = false;
+    }
+  }
+
+  /** 3D → 2D: mirror the stage's piece selection onto the pattern editor. */
+  private syncSplitSelectionFrom3d(
+    kind: 'simViewport' | 'transform3d',
+    entityId: string,
+    pieceIds: readonly string[]
+  ): void {
+    const split = this.splitView;
+    if (!split || this.splitSelectionSyncing) return;
+    const stage = this.canvasNode(split.stageNodeId);
+    // Only the stage that is actually on screen in the split drives the 2D side.
+    const matches =
+      (kind === 'simViewport' && stage?.type === 'simViewport' && stage.simId === entityId) ||
+      (kind === 'transform3d' && stage?.type === 'transform3d' && stage.transformId === entityId);
+    if (!matches) return;
+    this.splitSelectionSyncing = true;
+    try {
+      this.editors.get(split.patternNodeId)?.setSelectedPieces(pieceIds);
+    } finally {
+      this.splitSelectionSyncing = false;
+    }
+  }
+
   private notifyNodeViewportResize(nodeId: string): void {
     const node = this.project.canvas.nodes.find((n) => n.id === nodeId);
     if (!node) return;
     if (node.type === 'simViewport') {
-      this.simRuntimes.get(node.simId)?.resize();
+      const rt = this.simRuntimes.get(node.simId);
+      // Paused viewports render on demand, so a resize has to ask for a redraw.
+      rt?.invalidate();
+      rt?.resize();
     } else if (node.type === 'transform3d') {
-      this.transformRuntimes.get(node.transformId)?.resize();
+      const rt = this.transformRuntimes.get(node.transformId);
+      rt?.invalidate();
+      rt?.resize();
     } else if (node.type === 'patternFrame') {
       this.editors.get(node.id)?.relayoutChrome();
     }
@@ -2428,6 +2971,37 @@ export class StudioApp {
     e.preventDefault();
   }
 
+  /**
+   * The floating action bar at the bottom middle of a viewport. Created on
+   * demand and returned as the `.node-actions` element, so the existing button
+   * styling and click handlers still apply.
+   */
+  private viewportActions(body: HTMLElement): HTMLElement {
+    let wrap = body.querySelector(':scope > .node-viewport-actions') as HTMLElement | null;
+    if (!wrap) {
+      wrap = document.createElement('div');
+      wrap.className = 'node-viewport-actions';
+      const actions = document.createElement('div');
+      actions.className = 'node-actions';
+      wrap.appendChild(actions);
+      body.appendChild(wrap);
+    }
+    return wrap.querySelector('.node-actions') as HTMLElement;
+  }
+
+  /**
+   * The bottom-centre action stack of a viewport node. It is a column, so
+   * anything added above the bar (the split's stale warning) rides with it.
+   */
+  private viewportActionStack(nodeEl: HTMLElement | null): HTMLElement | null {
+    // A docked inspector wraps the body in `.node-expand-main`.
+    const body = nodeEl?.querySelector(
+      ':scope > .node-body, :scope > .node-expand-main > .node-body'
+    ) as HTMLElement | null;
+    if (!body) return null;
+    return this.viewportActions(body).parentElement;
+  }
+
   private mountNode(node: CanvasNode): void {
     const el = document.createElement('div');
     // Remesh / transform stages owned by a drape live inside it: they keep their
@@ -2450,11 +3024,13 @@ export class StudioApp {
     if (node.type !== 'image') {
       chrome = document.createElement('div');
       chrome.className = 'node-chrome';
+      // Only the close / fullscreen button lives in the header; the node's own
+      // actions float at the bottom middle of the viewport (see
+      // `viewportActions`) so the top-right stays a single X.
       chrome.innerHTML = `
         <span class="node-title"></span>
         <div class="node-fullscreen-tabs" hidden role="tablist"></div>
         <div class="node-chrome-right">
-          <div class="node-actions"></div>
           <button type="button" class="node-expand-btn" title="Open full screen" aria-label="Open full screen">⛶</button>
         </div>
       `;
@@ -2528,17 +3104,19 @@ export class StudioApp {
           // Flag the remesh chip immediately when editing inside fullscreen.
           this.refreshFullscreenTabs();
           // Pattern edits are document data — make sure they reach the file.
-          this.markDirty(true);
+          this.markDirty();
         },
         // Rulers are drafting references: they repaint, but never invalidate.
-        onRulerChange: () => this.markDirty(true),
+        onRulerChange: () => this.markDirty(),
         getMeasurementLibrary: () => cachedMeasurementLibrary(),
+        // Picked pieces drive the split view's 3D half.
+        onSelectionChange: (pieceIds) => this.syncSplitSelectionFrom2d(pieceIds),
       });
       this.editors.set(node.id, editor);
     } else if (node.type === 'meshFrame') {
       const mesh = this.project.meshes.find((m) => m.id === node.meshId)!;
       chrome!.querySelector('.node-title')!.textContent = `Mesh · ${mesh.name}`;
-      const actions = chrome!.querySelector('.node-actions')!;
+      const actions = this.viewportActions(body);
       actions.innerHTML = `<button type="button" data-mesh="remesh">Remesh</button>`;
       actions.addEventListener('click', () => this.remesh(mesh.id));
       const previewHost = document.createElement('div');
@@ -2551,7 +3129,7 @@ export class StudioApp {
     } else if (node.type === 'simViewport') {
       const sim = this.project.sims.find((s) => s.id === node.simId)!;
       chrome!.querySelector('.node-title')!.textContent = `Sim · ${sim.name}`;
-      const actions = chrome!.querySelector('.node-actions')!;
+      const actions = this.viewportActions(body);
       const strainOn = this.simRuntimes.get(sim.id)?.isStrainMapEnabled() ?? false;
       actions.innerHTML = `
         <button type="button" data-sim="activate">Play</button>
@@ -2577,7 +3155,7 @@ export class StudioApp {
     } else if (node.type === 'transform3d') {
       const transform = this.project.transforms.find((t) => t.id === node.transformId)!;
       chrome!.querySelector('.node-title')!.textContent = `Transform 3D · ${transform.name}`;
-      const actions = chrome!.querySelector('.node-actions')!;
+      const actions = this.viewportActions(body);
       actions.innerHTML = `
         <button type="button" data-transform="reset">Reset layout</button>
         <button type="button" data-transform="rebuild">Rebuild</button>
@@ -2596,9 +3174,32 @@ export class StudioApp {
       (el as HTMLElement & { _transformHost?: HTMLElement })._transformHost = body;
     } else if (node.type === 'image') {
       const img = document.createElement('img');
-      img.src = node.src;
       img.alt = node.label || 'image reference';
       img.draggable = false;
+      if (node.src) {
+        img.src = node.src;
+      } else {
+        // Never leave a bare `<img>` with no source: the browser paints nothing,
+        // so a reference whose bytes went missing read as a dead node. The board
+        // inspector is only shown in fullscreen, so the note carries its own way
+        // back rather than pointing at a panel that is not there.
+        img.hidden = true;
+        const note = document.createElement('div');
+        note.className = 'image-missing';
+        note.innerHTML =
+          '<strong>Image data missing</strong>' +
+          '<span>The stored copy of this reference was lost.</span>' +
+          '<button type="button" class="image-missing-relink">Re-link image…</button>';
+        body.appendChild(note);
+        const relink = note.querySelector('.image-missing-relink') as HTMLButtonElement;
+        // The node body starts a drag on pointerdown; the button is not a drag.
+        relink.addEventListener('pointerdown', (e) => e.stopPropagation());
+        relink.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this.pickImageFile(node);
+        });
+      }
       body.appendChild(img);
       // Fill in aspect from the decoded image when missing (older snapshots).
       if (node.naturalAspect == null || !(node.naturalAspect > 0)) {
@@ -2687,6 +3288,19 @@ export class StudioApp {
         if (!stillCurrent()) return;
         this.device = gpu.device;
       }
+      if (!this.environment) {
+        // The constructor already starts the saved HDRI (or the neutral studio
+        // probe); this only reports a failure to load it.
+        this.environment = new Environment(this.device, navigator.gpu.getPreferredCanvasFormat());
+        const settings = loadEnvironmentSettings();
+        if (settings.hdri) {
+          void this.environment.whenIdle().catch((error: unknown) => {
+            this.setStatus(
+              `Could not load HDRI “${settings.hdri}”${error instanceof Error ? `: ${error.message}` : ''}`
+            );
+          });
+        }
+      }
     } catch (err) {
       if (!stillCurrent()) return;
       this.setStatus(`WebGPU unavailable: ${err}`);
@@ -2721,12 +3335,16 @@ export class StudioApp {
         {
           onApplyPatternEdit: (patternId, edited) =>
             this.applyPatternPointEdit(patternId, edited),
+          onSelectionChange: (pieceIds) =>
+            this.syncSplitSelectionFrom3d('simViewport', sim.id, pieceIds),
+          environment: this.environment,
+          materials: this.materials,
           onSewEdges: (a, b) => this.sewEdgesFromView(this.patternForSim(sim.id), a, b),
           onReverseSeam: (seamId) => this.reverseSeamFromView(this.patternForSim(sim.id), seamId),
           onDeleteSeam: (seamId) => this.deleteSeamFromView(this.patternForSim(sim.id), seamId),
           onBeforeFreezeChange: () => this.pushUndo(),
           onFreezeChange: (pieceId, frozen) => {
-            this.markDirty(true);
+            this.markDirty();
             const name = this.patternForSim(sim.id)?.pieces.find(
               (p) => p.id === pieceId
             )?.name;
@@ -2786,12 +3404,15 @@ export class StudioApp {
             this.rebuildSimsFromTransform(transform.id);
             if (this.selectedNodeId === node.id) this.renderInspector();
             // Transform settings are document data — make sure they reach the file.
-            this.markDirty(true);
+            this.markDirty();
           },
-          onSelectionChange: (pieceId) => {
-            this.transformInspectorPieceId = pieceId;
+          onSelectionChange: (pieceIds, primary) => {
+            this.transformInspectorPieceId = primary;
+            this.syncSplitSelectionFrom3d('transform3d', transform.id, pieceIds);
             if (this.selectedNodeId === node.id) this.renderInspector();
           },
+          environment: this.environment,
+          materials: this.materials,
           onSewEdges: (a, b) => this.sewEdgesFromView(this.patternForTransform(transform.id), a, b),
           onReverseSeam: (seamId) =>
             this.reverseSeamFromView(this.patternForTransform(transform.id), seamId),
@@ -2823,6 +3444,9 @@ export class StudioApp {
     this.raf = requestAnimationFrame(loop);
     this.layoutNodes();
     this.setStatus('Ready — Pattern → Mesh → Transform 3D → Sim');
+    // Re-asserted here because the pipeline line above is rewritten whenever the
+    // board redraws, and lost image bytes are not something to let scroll away.
+    this.reportMissingImages();
   }
 
   private teardownSims(): void {
@@ -3087,7 +3711,7 @@ export class StudioApp {
     for (const mesh of meshes) {
       this.remesh(mesh.id, { recordUndo: false });
     }
-    this.markDirty(true);
+    this.markDirty();
     this.setStatus(
       meshes.length
         ? `${status} — remeshed ${meshes.length} mesh${meshes.length === 1 ? '' : 'es'}`
@@ -3112,11 +3736,38 @@ export class StudioApp {
   private tick(): void {
     const active = this.project.activeSimId;
     for (const [simId, rt] of this.simRuntimes) {
-      rt.frame(simId === active);
+      rt.frame(simId === active, this.viewportIsVisible('simViewport', simId));
     }
-    for (const rt of this.transformRuntimes.values()) {
-      rt.frame();
+    for (const [transformId, rt] of this.transformRuntimes) {
+      rt.frame(this.viewportIsVisible('transform3d', transformId));
     }
+  }
+
+  /**
+   * Whether a viewport is on screen. A fullscreen stage covers the board, so the
+   * stages behind it must not keep rendering — that is continuous GPU work for
+   * something nobody can see, and it is what made interaction feel sluggish on
+   * slower compositors. The split view shows its two panes only.
+   */
+  private viewportIsVisible(
+    type: 'simViewport' | 'transform3d',
+    id: string
+  ): boolean {
+    const expanded = this.expandedNodeId;
+    if (!expanded && !this.splitView) return true;
+    const visibleId = (nodeId: string): boolean => {
+      if (this.splitView) {
+        return nodeId === this.splitView.patternNodeId || nodeId === this.splitView.stageNodeId;
+      }
+      return nodeId === expanded;
+    };
+    const node = this.project.canvas.nodes.find((n) =>
+      type === 'simViewport'
+        ? n.type === 'simViewport' && n.simId === id
+        : n.type === 'transform3d' && n.transformId === id
+    );
+    // A runtime with no node of its own cannot be judged — keep drawing it.
+    return node ? visibleId(node.id) : true;
   }
 
   private persistTransformStates(): void {
@@ -3161,7 +3812,18 @@ export class StudioApp {
       rt.captureCamera(sim);
       sims.set(sim.id, cloneSimCamera(sim.camera));
     }
-    return { transforms, sims };
+    const board = {
+      panX: this.project.canvas.panX,
+      panY: this.project.canvas.panY,
+      zoom: this.project.canvas.zoom,
+    };
+    const patterns = new Map<string, PatternViewBox>();
+    for (const node of this.project.canvas.nodes) {
+      if (node.type !== 'patternFrame') continue;
+      const editor = this.editors.get(node.id);
+      if (editor) patterns.set(node.id, editor.getViewBox());
+    }
+    return { transforms, sims, board, patterns };
   }
 
   /** Restore the captured cameras onto a freshly loaded history snapshot. */
@@ -3174,6 +3836,12 @@ export class StudioApp {
       const cam = snapshot.sims.get(sim.id);
       if (cam) sim.camera = cloneSimCamera(cam);
     }
+    // The board's pan/zoom rides in the document, so the freshly loaded snapshot
+    // would otherwise snap the canvas back to where it was at that edit.
+    this.project.canvas.panX = snapshot.board.panX;
+    this.project.canvas.panY = snapshot.board.panY;
+    this.project.canvas.zoom = snapshot.board.zoom;
+    this.applyBoardTransform();
   }
 
   /** Push the preserved cameras onto live runtimes verbatim (no migration). */
@@ -3185,6 +3853,13 @@ export class StudioApp {
     for (const sim of this.project.sims) {
       const cam = snapshot.sims.get(sim.id);
       if (cam) this.simRuntimes.get(sim.id)?.setCameraState(cam);
+    }
+    // Pattern editors are recreated (and re-framed) on a remount, so re-assert
+    // each one's captured zoom/pan after the runtimes have been rebuilt.
+    for (const node of this.project.canvas.nodes) {
+      if (node.type !== 'patternFrame') continue;
+      const box = snapshot.patterns.get(node.id);
+      if (box) this.editors.get(node.id)?.setViewBox(box);
     }
   }
 
@@ -3709,7 +4384,7 @@ export class StudioApp {
       this.inspector.querySelector('#transformName')?.addEventListener('change', (e) => {
         this.pushUndo();
         transform.name = (e.target as HTMLInputElement).value;
-        this.markDirty(true);
+        this.markDirty();
         this.renderAll();
         void this.initGpuAndSims();
       });
@@ -4074,7 +4749,7 @@ export class StudioApp {
         <h3>${pattern.name}</h3>
         <label>Name <input id="patName" value="${pattern.name}" /></label>
         <button type="button" id="addPt">Add point</button>
-        <p class="muted">Tools: Move · Pen · Rect · Circle · Knife · Dart · Bend. Middle-drag pan · scroll wheel zoom. Shift-drag a scale handle locks the aspect · Alt-drag one scales about the centre of the selection.</p>
+        <p class="muted">Tools: Move · Add (pen, rect, circle, blocks, SVG) · Modify (extrude, join, bridge) · Remove (knife, dart) · Sew · Ruler. Middle-drag pan · scroll wheel zoom. Shift-drag a scale handle locks the aspect · Alt-drag one scales about the centre of the selection.</p>
         ${this.deleteButtonHtml()}
       `;
       this.inspector.querySelector('#patName')?.addEventListener('change', (e) => {
@@ -4103,6 +4778,7 @@ export class StudioApp {
       this.inspector.innerHTML = `
         <h3>${this.escapeHtml(node.label || 'Image')}</h3>
         <p class="muted">Reference image — drag to move, corner handles to resize. Hold Shift to lock aspect.</p>
+        ${node.src ? '' : '<p class="muted is-alert">Its image data is no longer in storage. Use Replace image… to re-link it.</p>'}
         <label>Label <input id="imgLabel" value="${this.escapeHtml(node.label || '')}" /></label>
         <label>Width
           <input id="imgW" type="number" min="80" step="1" value="${Math.round(node.width)}" />
@@ -4140,36 +4816,7 @@ export class StudioApp {
         node.height = Math.max(60, v);
       });
       this.inspector.querySelector('#imgReplace')?.addEventListener('click', () => {
-        const input = document.createElement('input');
-        input.type = 'file';
-        input.accept = 'image/*';
-        input.addEventListener('change', () => {
-          const file = input.files?.[0];
-          if (!file) return;
-          void (async () => {
-            try {
-              this.pushUndo();
-              const src = await this.readFileAsDataUrl(file);
-              const { w, h } = await this.loadImageNaturalSize(src);
-              node.src = src;
-              node.naturalAspect = w / h;
-              node.label = file.name.replace(/\.[^.]+$/, '') || node.label || 'Image';
-              const imgEl = this.board.querySelector(
-                `[data-node-id="${node.id}"] img`
-              ) as HTMLImageElement | null;
-              if (imgEl) {
-                imgEl.src = src;
-                imgEl.alt = node.label;
-              }
-              this.renderInspector();
-              this.persistLocal();
-              this.setStatus('Image replaced');
-            } catch {
-              this.setStatus('Could not replace image');
-            }
-          })();
-        });
-        input.click();
+        this.pickImageFile(node);
       });
       this.bindDeleteButton(node.id);
     }

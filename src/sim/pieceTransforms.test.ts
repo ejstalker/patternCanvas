@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ClothSimulator } from './ClothSimulator';
 import type { PieceTransform3d } from '../project/types';
-import { keepPieceTransforms, recordPieceSuccessors } from './pieceTransforms';
+import { arrangementBelongsTo, keepPieceTransforms, recordPieceSuccessors } from './pieceTransforms';
 
 function stubCloth(centroids: Record<string, [number, number, number]>): ClothSimulator {
   return {
@@ -36,6 +36,50 @@ describe('keepPieceTransforms', () => {
     expect(kept.NEW).toBeUndefined();
   });
 
+  it('carries the arrangement onto another pattern, piece for piece in order', () => {
+    // The node was duplicated with its arrangement and a different pattern
+    // plugged in, so no id survives: the first piece of the new pattern takes the
+    // first piece's placement and the rest follow.
+    const saved = { A: t(1, 0, 0, 15), B: t(2, 0, 0, 30) };
+    const kept = keepPieceTransforms(saved, ['X', 'Y'], stubCloth({}));
+    expect(kept.X).toEqual(saved.A);
+    expect(kept.Y).toEqual(saved.B);
+    expect(kept.X).not.toBe(saved.A);
+  });
+
+  it('pairs as far as the shorter of the two patterns goes', () => {
+    const saved = { A: t(1), B: t(2), C: t(3) };
+    const kept = keepPieceTransforms(saved, ['X', 'Y'], stubCloth({}));
+    expect(Object.keys(kept)).toEqual(['X', 'Y']);
+    expect(kept.X.position).toEqual([1, 0, 0]);
+    expect(kept.Y.position).toEqual([2, 0, 0]);
+  });
+
+  it('does not pair by order while any id still matches', () => {
+    // Same pattern, one piece deleted and another added: the newcomer keeps its
+    // laid-out position rather than inheriting the deleted piece's.
+    const saved = { A: t(1), GONE: t(2) };
+    const kept = keepPieceTransforms(saved, ['A', 'NEW'], stubCloth({}));
+    expect(kept.A).toEqual(t(1));
+    expect(kept.NEW).toBeUndefined();
+  });
+
+  it('does not pair an arrangement onto a cloth with no pieces of its own', () => {
+    // A mesh predating per-vertex ownership has no piece ids to line anything up
+    // with, so the arrangement must not land on its `__cloth__` entry.
+    const saved = { A: t(1), B: t(2) };
+    const kept = keepPieceTransforms(saved, ['__cloth__'], stubCloth({}));
+    expect(kept).toEqual({});
+  });
+
+  it('leaves a legacy whole-cloth entry to be distributed rather than paired', () => {
+    const saved = { __cloth__: t(7) };
+    const cloth = stubCloth({ A: [0, 0, 0], B: [2, 0, 0] });
+    const kept = keepPieceTransforms(saved, ['A', 'B'], cloth);
+    expect(kept.A.position).toEqual([6, 0, 0]);
+    expect(kept.B.position).toEqual([8, 0, 0]);
+  });
+
   it('hands a replaced piece orientation to its successors, at their own layout positions', () => {
     const saved = { PARENT: t(9, 1, 2, 30) };
     const cloth = stubCloth({ A: [100, 0, 0], B: [200, 0, 0] });
@@ -65,6 +109,22 @@ describe('keepPieceTransforms', () => {
     const saved = { A: t(1), __cloth__: t(99) };
     const kept = keepPieceTransforms(saved, ['A'], stubCloth({}));
     expect(kept.A).toEqual(t(1));
+  });
+});
+
+describe('arrangementBelongsTo', () => {
+  it('recognises an arrangement whose pieces are still on the cloth', () => {
+    expect(arrangementBelongsTo({ A: t(1), B: t(2) }, ['A', 'B'])).toBe(true);
+    expect(arrangementBelongsTo({ A: t(1) }, ['A', 'NEW'])).toBe(true);
+  });
+
+  it('turns down another pattern’s arrangement', () => {
+    expect(arrangementBelongsTo({ A: t(1), B: t(2) }, ['X', 'Y'])).toBe(false);
+  });
+
+  it('has nothing to match on for a legacy whole-cloth entry', () => {
+    expect(arrangementBelongsTo({ __cloth__: t(1) }, ['X'])).toBe(true);
+    expect(arrangementBelongsTo({}, ['X'])).toBe(true);
   });
 });
 

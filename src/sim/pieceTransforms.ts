@@ -21,6 +21,11 @@ export function clonePieceTransform(t: PieceTransform3d): PieceTransform3d {
  * - Pieces that were *replaced* by new ids (e.g. a knife cut) hand their
  *   orientation down to their successors via `successors`, so the arrangement
  *   isn't thrown away. Successors keep their own laid-out position.
+ * - A whole *other* pattern (a duplicated node plugged into a different one):
+ *   not one of the saved ids is on the cloth any more, so the arrangement is
+ *   carried across piece for piece in the order the pieces are laid out — the
+ *   first piece of the new pattern takes the first piece's placement, the second
+ *   the second's, and so on — rather than being dropped for want of an id.
  * - Legacy `__cloth__` entries (meshes predating per-vertex piece ownership)
  *   are migrated/distributed as before.
  */
@@ -32,11 +37,13 @@ export function keepPieceTransforms(
 ): Record<string, PieceTransform3d> {
   const live = new Set(liveIds);
   const kept: Record<string, PieceTransform3d> = {};
+  let matched = 0;
 
   for (const [pieceId, t] of Object.entries(pieceTransforms)) {
     if (pieceId === FALLBACK_PIECE_ID) continue;
     if (live.has(pieceId)) {
       kept[pieceId] = clonePieceTransform(t);
+      matched++;
       continue;
     }
     const childIds = successors?.[pieceId];
@@ -53,6 +60,23 @@ export function keepPieceTransforms(
           : undefined,
       };
     }
+  }
+
+  // Nothing was recognised at all: this is another pattern rather than the same
+  // one rebuilt, so pair the two orders up and carry the arrangement over. Left
+  // alone when *any* id matched, so adding a piece to a pattern still leaves that
+  // piece at its laid-out position instead of inheriting a deleted one's.
+  if (matched === 0 && Object.keys(kept).length === 0) {
+    const saved = Object.keys(pieceTransforms).filter((id) => id !== FALLBACK_PIECE_ID);
+    // Only real pieces are paired: a cloth with no per-vertex ownership has
+    // nothing to line an arrangement up against, and is left to the whole-cloth
+    // handling below.
+    const order = liveIds.filter((id) => id !== FALLBACK_PIECE_ID);
+    const pairs = Math.min(saved.length, order.length);
+    for (let i = 0; i < pairs; i++) {
+      kept[order[i]] = clonePieceTransform(pieceTransforms[saved[i]]);
+    }
+    if (pairs > 0) return kept;
   }
 
   const fallback = pieceTransforms[FALLBACK_PIECE_ID];
@@ -90,6 +114,30 @@ export function keepPieceTransforms(
     };
   }
   return kept;
+}
+
+/**
+ * Does this saved arrangement belong to the pieces now on the cloth? True while
+ * any saved piece id is still there, and true for a record with nothing saved per
+ * piece (a legacy whole-cloth arrangement, which has no ids to go on).
+ *
+ * A stored *vertex pose* is only worth a look when this is true: vertex i of
+ * another pattern is a different point on a different panel, so a pose with the
+ * same vertex count and no piece in common is not a starting position, it is a
+ * pastiche of one.
+ */
+export function arrangementBelongsTo(
+  pieceTransforms: Record<string, PieceTransform3d>,
+  liveIds: readonly string[]
+): boolean {
+  const live = new Set(liveIds);
+  let savedPerPiece = 0;
+  for (const id of Object.keys(pieceTransforms)) {
+    if (id === FALLBACK_PIECE_ID) continue;
+    savedPerPiece++;
+    if (live.has(id)) return true;
+  }
+  return savedPerPiece === 0;
 }
 
 /**

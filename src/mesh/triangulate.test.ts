@@ -25,6 +25,32 @@ function diagonalStripRing(len: number, width: number): Vec2[] {
   ];
 }
 
+describe('pattern piece order through the mesh', () => {
+  // The 3D stages match an arrangement to the cloth by piece id, and fall back to
+  // pairing by order when a whole other pattern is plugged in — which needs the
+  // mesh to hand the pieces back in the pattern's own order.
+  it('tags the vertices piece by piece in the order the pattern lists them', () => {
+    const make = (id: string, x: number): PatternPiece => ({
+      id,
+      name: id,
+      closed: true,
+      points: rectPoints(`${id}-p`, x, 0, 10, 10),
+    });
+    const pattern: PatternDocument = {
+      id: 'pat',
+      name: 'pat',
+      pieces: [make('first', 0), make('second', 20)],
+      seams: [],
+    };
+    const mesh = triangulatePattern(pattern, DEFAULT_MESH_SETTINGS);
+    const seen: string[] = [];
+    for (const id of mesh.vertexPieceIds ?? []) {
+      if (id && !seen.includes(id)) seen.push(id);
+    }
+    expect(seen).toEqual(['first', 'second']);
+  });
+});
+
 function rectPoints(prefix: string, x: number, y: number, w: number, h: number): BezierPoint[] {
   return rectRing(x, y, w, h).map((p, i) => ({
     id: `${prefix}-${i}`,

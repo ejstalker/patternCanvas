@@ -1,4 +1,5 @@
 import type { Camera } from '../Camera';
+import { viewAxisDirections, type ScreenAxes } from './axisScreen';
 
 export type AxisId = 'x' | 'y' | 'z' | '-x' | '-y' | '-z';
 
@@ -26,6 +27,13 @@ const CX = SIZE / 2;
 const CY = SIZE / 2 - 4;
 const ARM = 28;
 
+/** Front-on Y-up reading, used only until a camera is handed over. */
+const DEFAULT_AXES: ScreenAxes = {
+  x: { x: 1, y: 0, foreshorten: 1, depth: 0 },
+  y: { x: 0, y: -1, foreshorten: 1, depth: 0 },
+  z: { x: 0, y: 0, foreshorten: 0, depth: -1 },
+};
+
 /**
  * Blender-style viewport navigation gizmo (orbit widget).
  * @see https://docs.blender.org/manual/en/latest/editors/3dview/navigate/introduction.html
@@ -41,8 +49,7 @@ export class ViewportGnomon {
   private lastY = 0;
   private tips: AxisTip[] = [];
   private hoverId: AxisId | null = null;
-  private azimuth = 0;
-  private incline = 20;
+  private camera: Camera | null = null;
   private orthographic = false;
 
   constructor(host: HTMLElement, cbs: GnomonCallbacks) {
@@ -74,8 +81,9 @@ export class ViewportGnomon {
   }
 
   syncFromCamera(camera: Camera): void {
-    this.azimuth = camera.getAzimuth();
-    this.incline = camera.getIncline();
+    this.camera = camera;
+    // The axes are read off the camera's own matrix, so it has to be current.
+    camera.update();
     this.orthographic = camera.isOrthographic();
     this.orthoBtn.textContent = this.orthographic ? 'Ortho' : 'Persp';
     this.orthoBtn.classList.toggle('is-ortho', this.orthographic);
@@ -151,39 +159,38 @@ export class ViewportGnomon {
     return best;
   }
 
-  /** Map world direction into view space matching Camera (Y-up). */
-  private worldToView(x: number, y: number, z: number): { x: number; y: number; z: number } {
-    const az = (this.azimuth * Math.PI) / 180;
-    const inc = (this.incline * Math.PI) / 180;
-    // rotX(incline)
-    const y1 = y * Math.cos(inc) - z * Math.sin(inc);
-    const z1 = y * Math.sin(inc) + z * Math.cos(inc);
-    const x1 = x;
-    // rotY(azimuth)
-    const x2 = x1 * Math.cos(az) + z1 * Math.sin(az);
-    const z2 = -x1 * Math.sin(az) + z1 * Math.cos(az);
-    return { x: x2, y: y1, z: z2 };
-  }
-
+  /** Lay the six axis arms out along the world axes the camera is showing. */
   private redraw(): void {
-    const axes: { id: AxisId; label: string; color: string; dir: [number, number, number]; positive: boolean }[] = [
-      { id: 'x', label: 'X', color: '#e74c3c', dir: [1, 0, 0], positive: true },
-      { id: 'y', label: 'Y', color: '#2ecc71', dir: [0, 1, 0], positive: true },
-      { id: 'z', label: 'Z', color: '#3498db', dir: [0, 0, 1], positive: true },
-      { id: '-x', label: '', color: '#e74c3c', dir: [-1, 0, 0], positive: false },
-      { id: '-y', label: '', color: '#2ecc71', dir: [0, -1, 0], positive: false },
-      { id: '-z', label: '', color: '#3498db', dir: [0, 0, -1], positive: false },
+    const dirs = this.camera ? viewAxisDirections(this.camera.getViewProjectMtx()) : null;
+    const axes: { id: AxisId; label: string; color: string; positive: boolean }[] = [
+      { id: 'x', label: 'X', color: '#e74c3c', positive: true },
+      { id: 'y', label: 'Y', color: '#2ecc71', positive: true },
+      { id: 'z', label: 'Z', color: '#3498db', positive: true },
+      { id: '-x', label: '', color: '#e74c3c', positive: false },
+      { id: '-y', label: '', color: '#2ecc71', positive: false },
+      { id: '-z', label: '', color: '#3498db', positive: false },
     ];
 
+    const arm = (id: AxisId) => {
+      const key = (id.startsWith('-') ? id.slice(1) : id) as 'x' | 'y' | 'z';
+      const sign = id.startsWith('-') ? -1 : 1;
+      const d = (dirs ?? DEFAULT_AXES)[key];
+      return {
+        x: CX + sign * d.x * d.foreshorten * ARM,
+        y: CY + sign * d.y * d.foreshorten * ARM,
+        depth: sign * d.depth,
+      };
+    };
+
     this.tips = axes.map((a) => {
-      const v = this.worldToView(a.dir[0], a.dir[1], a.dir[2]);
+      const end = arm(a.id);
       return {
         id: a.id,
         label: a.label,
         color: a.color,
-        x: CX + v.x * ARM,
-        y: CY - v.y * ARM,
-        depth: -v.z,
+        x: end.x,
+        y: end.y,
+        depth: end.depth,
         positive: a.positive,
       };
     });
@@ -208,6 +215,7 @@ export class ViewportGnomon {
       line.setAttribute('stroke-width', tip.positive ? '2.2' : '1.2');
       line.setAttribute('stroke-opacity', tip.positive ? '0.95' : '0.35');
       line.setAttribute('stroke-linecap', 'round');
+      line.dataset.axis = tip.id;
       this.svg.appendChild(line);
 
       const r = tip.positive ? (this.hoverId === tip.id ? 9 : 7.5) : this.hoverId === tip.id ? 6 : 4.5;

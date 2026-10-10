@@ -50,6 +50,11 @@ export function boxContains(box: SelectionBox, p: Vec2): boolean {
   return p.x >= box.minX && p.x <= box.maxX && p.y >= box.minY && p.y <= box.maxY;
 }
 
+/** True when two boxes share any area (touching edges count). */
+export function boxesOverlap(a: SelectionBox, b: SelectionBox): boolean {
+  return a.minX <= b.maxX && a.maxX >= b.minX && a.minY <= b.maxY && a.maxY >= b.minY;
+}
+
 /**
  * The corner whose rotate zone the pointer is in, or null.
  *

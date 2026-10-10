@@ -6,6 +6,8 @@ import type { IncomingMessage, ServerResponse } from 'http';
 
 function refPplPlugin(): Plugin {
   const refPplDir = resolve(__dirname, 'refPpl');
+  /** HDRIs live beside the repo, not in public/: served here and copied on build. */
+  const hdriDir = resolve(__dirname, 'hdri');
 
   const safePath = (name: string): string | null => {
     const decoded = decodeURIComponent(name).replace(/\\/g, '/');
@@ -21,7 +23,18 @@ function refPplPlugin(): Plugin {
     if (name.endsWith('.mtl')) return 'text/plain; charset=utf-8';
     if (name.endsWith('.target')) return 'text/plain; charset=utf-8';
     if (name.endsWith('.json')) return 'application/json; charset=utf-8';
+    if (name.endsWith('.exr')) return 'image/x-exr';
     return 'application/octet-stream';
+  };
+
+  /** Names of the HDRI files on disk, so the UI never carries a stale list. */
+  const listHdriFiles = async (): Promise<string[]> => {
+    try {
+      const entries = await fs.readdir(hdriDir);
+      return entries.filter((e) => !e.startsWith('.')).sort();
+    } catch {
+      return [];
+    }
   };
 
   const handleRefPpl = async (
@@ -40,6 +53,33 @@ function refPplPlugin(): Plugin {
         res.end('Bad path');
         return;
       }
+      try {
+        const data = await fs.readFile(filePath);
+        res.setHeader('Content-Type', contentTypeFor(name));
+        res.end(data);
+      } catch {
+        res.statusCode = 404;
+        res.end('Not found');
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && pathOnly.startsWith('/hdri/')) {
+      const name = decodeURIComponent(pathOnly.slice('/hdri/'.length));
+      if (name === 'index.json') {
+        const files = await listHdriFiles();
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        res.end(JSON.stringify({ files }));
+        return;
+      }
+      // Only plain file names from the folder itself — no traversal.
+      if (name.includes('/') || name.includes('\\') || name.includes('..')) {
+        res.statusCode = 400;
+        res.end('Bad path');
+        return;
+      }
+      const filePath = join(hdriDir, name);
       try {
         const data = await fs.readFile(filePath);
         res.setHeader('Content-Type', contentTypeFor(name));
@@ -139,6 +179,26 @@ function refPplPlugin(): Plugin {
 
   const copyRefPplToDist = (outDir: string) => copyRefPplDir(outDir);
 
+  /** Same deal for the HDRIs, plus the index the app reads. */
+  const copyHdriToDist = async (outDir: string): Promise<void> => {
+    const destDir = join(outDir, 'hdri');
+    try {
+      await fs.mkdir(destDir, { recursive: true });
+      for (const entry of await fs.readdir(hdriDir)) {
+        if (entry.startsWith('.')) continue;
+        await fs.copyFile(join(hdriDir, entry), join(destDir, entry));
+      }
+      const files = await listHdriFiles();
+      await fs.writeFile(
+        join(destDir, 'index.json'),
+        JSON.stringify({ files }),
+        'utf8'
+      );
+    } catch {
+      /* no hdri folder: nothing to publish */
+    }
+  };
+
   return {
     name: 'refPpl',
     configureServer(server) {
@@ -148,8 +208,10 @@ function refPplPlugin(): Plugin {
     configurePreviewServer(server) {
       server.middlewares.use(middleware);
     },
-    closeBundle() {
-      return copyRefPplToDist(resolve(__dirname, 'dist'));
+    async closeBundle() {
+      const outDir = resolve(__dirname, 'dist');
+      await copyRefPplToDist(outDir);
+      await copyHdriToDist(outDir);
     },
   };
 }

@@ -57,6 +57,7 @@ import {
   sameSeamEdgeTopology,
   seamReadsFromSecondHalf,
   seamRefFromHalf,
+  axisLockFromDelta,
   sampleEdgeByPointIds,
   sampleEdgeSpanByPointIds,
   segmentLengths,
@@ -68,15 +69,28 @@ import {
   type EdgeParamHit,
 } from './seamHit';
 import {
+  cutterPathThrough,
   findBoundaryHits,
+  pieceUnderChain,
   sampleCutterPath,
   slicePiece,
   snapAngleDegrees,
+  type BoundaryHit,
+  type CutterChainFit,
   type CutterPath,
 } from './slice';
+import {
+  loopCutAt,
+  loopCutCutter,
+  sampleLoopCutPath,
+  type LoopCut,
+} from './loopCut';
 import { parseSvgToPieces, scalePieces, type SvgImportResult } from './importSvg';
+import { keepCount, MIN_RUN, selectedPointRuns, simplifyRun, type SimplifyFit } from './simplify';
 import { buildGridGroup } from './grid';
 import { buildManyToManySeams } from './multiSew';
+import { bridgePieces } from './bridge';
+import { joinPieces, type JoinFit, type JoinResult } from './join';
 import { drivenPointIds } from './blocks/driven';
 import {
   createBlockInstance,
@@ -99,6 +113,7 @@ import {
 import {
   CORNER_HANDLES,
   angleAbout,
+  boxesOverlap,
   handleCentre,
   rotatePoint,
   rotateZoneAt,
@@ -117,6 +132,11 @@ export type PatternEditorCallbacks = {
   onRulerChange?: () => void;
   /** Body-measurement library (people + values) used to size and label rulers. */
   getMeasurementLibrary?: () => MeasurementLibrary | null;
+  /**
+   * The picked pieces changed (primary first). The split view mirrors this onto
+   * the 3D selection; it is not a document edit.
+   */
+  onSelectionChange?: (pieceIds: string[]) => void;
 };
 
 /** Figma-aligned vector tools inside a pattern frame. */
@@ -127,12 +147,102 @@ export type PatternTool =
   | 'circle'
   | 'knife'
   | 'dart'
+  | 'extrude'
   | 'sew'
-  | 'bend'
+  | 'join'
+  | 'bridge'
   | 'ruler';
 
-export type KnifeMode = 'linear' | 'circle' | 'curve';
+/** The rail's menus: what each one offers, and what its rows stand for. */
+export type AddKind = 'pen' | 'rect' | 'circle' | 'block' | 'import';
+
+/** A row in a rail menu: a tool, a mode, or a way into a sub-view. */
+type RailMenuEntry = {
+  id: string;
+  name: string;
+  desc: string;
+  icon?: string;
+  /** Opens this sub-view instead of choosing. */
+  view?: string;
+};
+
+/** One screenful of a rail menu. */
+type RailMenuView = {
+  entries?: RailMenuEntry[];
+  /** Views that build their own rows (the block library) write into `host`. */
+  render?: (host: HTMLElement) => void;
+  /** Which row reads as the current choice. */
+  active?: () => string | null;
+  /** What picking a row does. The menu has already closed by then. */
+  choose?: (id: string) => void;
+};
+
+type RailMenuKey = 'add' | 'modify' | 'remove' | 'sew';
+
+type RailMenuSpec = {
+  key: RailMenuKey;
+  label: string;
+  /** Tip while nothing from this menu is in hand. */
+  tip: string;
+  /** Tip naming the tool in hand, or null when none of its tools is up. */
+  toolTip: () => string | null;
+  icon: string;
+  /** Built on open, so the rows carry the current tool and mode. */
+  views: () => Record<string, RailMenuView>;
+};
+
+/** Inline icons, in the rail's own 16px line-art style. */
+const ICONS = {
+  add: `<path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M8 2.8 V13.2 M2.8 8 H13.2"/>`,
+  // A shape with a corner node and a handle: the outline is being edited.
+  modify: `<rect x="3" y="4.5" width="7.6" height="7.6" rx="0.6" fill="none" stroke="currentColor" stroke-width="1.3"/>
+           <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" d="M10.6 4.5 L12.6 2.5"/>
+           <circle cx="13" cy="2.1" r="1.15" fill="currentColor"/>
+           <rect x="1.8" y="3.3" width="2.4" height="2.4" fill="currentColor"/>`,
+  // Scissors: material is cut away.
+  remove: `<path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M4.9 11.2 L13.4 3.5 M4.9 4.8 L13.4 12.5"/>
+           <circle cx="3.9" cy="12.1" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/>
+           <circle cx="3.9" cy="3.9" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/>`,
+  sew: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3 12.5 L12.5 3"/>
+        <path fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="1.6 1.3" d="M2.8 8.2 L7.8 8.2"/>
+        <circle cx="2.6" cy="8.2" r="1" fill="currentColor"/>
+        <circle cx="8.2" cy="8.2" r="1" fill="currentColor"/>`,
+  pen: `<path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M10.3 2.4 L13.6 5.7 L8.9 11.4 L4.1 12.6 L4.9 7.8 Z"/>
+        <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" d="M4.9 7.8 L8.9 11.4"/>`,
+  rect: `<rect x="3" y="3.5" width="10" height="9" rx="0.5" fill="none" stroke="currentColor" stroke-width="1.4"/>`,
+  circle: `<circle cx="8" cy="8" r="5" fill="none" stroke="currentColor" stroke-width="1.4"/>`,
+  block: `<path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M2.6 5.6 L8 2.9 L13.4 5.6 L13.4 10.6 L8 13.3 L2.6 10.6 Z"/>
+          <circle cx="8" cy="8" r="1.5" fill="currentColor"/>`,
+  import: `<path fill="none" stroke="currentColor" stroke-width="1.3" d="M3.5 3.5h9v9h-9z"/>
+           <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M8 6.2v4.2M6.1 8.8 L8 11 L9.9 8.8"/>`,
+  extrude: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M2.5 11.5 L9.5 11.5"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M6 4.5 L13.5 4.5"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.6 1.2" d="M2.5 11.5 L6 4.5 M9.5 11.5 L13.5 4.5"/>`,
+  join: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M2.5 4 L2.5 12 M13.5 4 L13.5 12"/>
+         <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M5.2 5.6 L7.4 8 L5.2 10.4 M10.8 5.6 L8.6 8 L10.8 10.4"/>`,
+  bridge: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3.2 4 L3.2 12 M12.8 4 L12.8 12"/>
+           <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M3.2 4 L12.8 4 M3.2 12 L12.8 12"/>`,
+  dart: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" d="M2.5 3.5 L8 13.5 L13.5 3.5"/>
+         <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.5 1.2" d="M8 13.5 L8 5"/>`,
+  knife: `<path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3 13 L13 3"/>
+          <path fill="none" stroke="currentColor" stroke-width="1.2" d="M11.2 3.2 L13 3 L12.8 4.8"/>
+          <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.5 1.2" d="M4 8.5 L8.5 4"/>`,
+} as const;
+
+/** The tip the knives carry, per mode — the menu button borrows it. */
+const KNIFE_TIPS: Record<KnifeMode, string> = {
+  linear: 'Knife · Linear',
+  circle: 'Knife · Circle',
+  curve: 'Knife · Curve — click points, then Done (or Enter) to cut',
+  loop: 'Knife · Loop cut, following the contours (hover an edge)',
+  'loop-straight': 'Knife · Loop cut, straight across (hover an edge)',
+};
+
+
+export type KnifeMode = 'linear' | 'circle' | 'curve' | 'loop' | 'loop-straight';
 export type SewMode = 'segment' | 'many';
+/** Join picks edge by edge, or a whole run across the outline. */
+export type JoinMode = 'segment' | 'many';
 
 /**
  * The edge under the pointer. Carries the direction a click here would sew
@@ -140,6 +250,31 @@ export type SewMode = 'segment' | 'many';
  * so the hover stroke can preview it.
  */
 type HoverEdge = { pieceId: string; fromPointId: string; toPointId: string; t0: number; t1: number };
+
+/** A whole edge of a piece, in the piece's winding order. */
+type PieceEdge = { pieceId: string; fromPointId: string; toPointId: string };
+
+/**
+ * One open "simplify the picked points" session.
+ *
+ * Simplifying is previewed live — the outline really is rewritten as the slider
+ * moves — so everything needed to put it back is kept here: the piece's points as
+ * they were, the runs the draftsperson picked, and the pick itself, which has to
+ * survive points disappearing under it.
+ */
+type SimplifySession = {
+  pieceId: string;
+  /** Runs of picked point ids, in outline order, as they were when it began. */
+  runs: string[][];
+  /** The piece's outline before the session; every preview is rebuilt from this. */
+  originalPoints: BezierPoint[];
+  /** The picks on this piece — the runs' own points — so the reduce count reads them. */
+  runIds: string[];
+  /** Picks elsewhere, kept so a preview does not clear the rest of the selection. */
+  otherPickedIds: string[];
+  reduce: number;
+  fit: SimplifyFit;
+};
 
 /** Corner = free/proportional 2-axis; edge = single-axis (n/s → Y, e/w → X). */
 type PointSnapshot = {
@@ -154,7 +289,17 @@ type DragKind =
   | { type: 'handle'; pieceId: string; pointId: string; which: 'in' | 'out'; mirror: boolean }
   | { type: 'penCurve'; pieceId: string; pointId: string }
   | { type: 'pan'; startClient: Vec2; startView: { x: number; y: number } }
-  | { type: 'marquee'; start: Vec2; current: Vec2; additive: boolean }
+  | {
+      type: 'marquee';
+      start: Vec2;
+      current: Vec2;
+      /** Shift: the rectangle adds to the selection instead of replacing it. */
+      additive: boolean;
+      /** Cmd/Ctrl: the rectangle takes whole panels rather than the points in it. */
+      panels: boolean;
+      /** The panel under a Cmd/Ctrl press, for one drawn no further than a click. */
+      togglePieceId?: string;
+    }
   | {
       type: 'drawShape';
       shape: 'rect' | 'circle';
@@ -163,13 +308,22 @@ type DragKind =
       /** Shift locks rectangle to square; ignored for circle (always circular). */
       lockAspect: boolean;
     }
+  | {
+      type: 'extrudeEdge';
+      pieceId: string;
+      /** The edge being duplicated, by endpoint id, in the piece's winding order. */
+      fromPointId: string;
+      toPointId: string;
+      /** Where the drag began; the offset is `current - start`. */
+      start: Vec2;
+      current: Vec2;
+    }
   | { type: 'rulerCreate'; start: Vec2; current: Vec2; snap: boolean }
   | { type: 'rulerMove'; id: string; start: Vec2; origin: Vec2 }
   | { type: 'rulerTurn'; id: string; which: 'a' | 'b' }
   | { type: 'blockMove'; id: string; start: Vec2; origin: Vec2 }
   | { type: 'knifeLine'; start: Vec2; current: Vec2; shift: boolean }
   | { type: 'knifeCircle'; center: Vec2; radius: number; shift: boolean }
-  | { type: 'knifeCurveHandles'; a: Vec2; b: Vec2; c0: Vec2; c1: Vec2 }
   | { type: 'moveSelection'; start: Vec2; snapshots: PointSnapshot[] }
   | {
       type: 'rotateSelection';
@@ -221,6 +375,9 @@ type SnapMidTarget = { at: Vec2; a: Vec2; b: Vec2 };
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
+/** Samples used to ghost a curved edge while it is being extruded. */
+const EXTRUDE_PREVIEW_STEPS = 24;
+
 /**
  * Turn arrow for the rotate zone, inline because CSS has no rotate cursor and
  * the gesture — "grab beside the corner" — is exactly what the pointer has to
@@ -229,8 +386,30 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 const ROTATE_CURSOR =
   "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23f2ebe3' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M12 6.5a6 6 0 1 1-5.2 3'/%3E%3Cpath d='M12 2.6v5.2l-4.4-2.6z' fill='%23f2ebe3' stroke='none'/%3E%3C/svg%3E\") 12 12, grabbing";
 
+/** True for a target that wants keystrokes for itself, not for the canvas. */
+function isTextEntry(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el || !el.tagName) return false;
+  return (
+    el.tagName === 'INPUT' ||
+    el.tagName === 'SELECT' ||
+    el.tagName === 'TEXTAREA' ||
+    el.isContentEditable === true
+  );
+}
+
 function svgEl<K extends keyof SVGElementTagNameMap>(tag: K): SVGElementTagNameMap[K] {
   return document.createElementNS(SVG_NS, tag);
+}
+
+/** A point detached from the document, for snapshots and previews. */
+function clonePoint(pt: BezierPoint): BezierPoint {
+  return {
+    ...pt,
+    anchor: { ...pt.anchor },
+    handleIn: pt.handleIn ? { ...pt.handleIn } : null,
+    handleOut: pt.handleOut ? { ...pt.handleOut } : null,
+  };
 }
 
 function svgLine(
@@ -269,7 +448,7 @@ function normalizePattern(
 }
 
 /**
- * SVG pattern editor with Move / Pen / Bend tools (Figma-like) and
+ * SVG pattern editor with Move / Add tools (Figma-like) and
  * middle-mouse pan + scroll-wheel zoom.
  */
 export class PatternEditor {
@@ -278,6 +457,8 @@ export class PatternEditor {
   private toolbar: HTMLElement;
   private snapBtn: HTMLButtonElement;
   private pointBar: HTMLElement;
+  /** The tool in hand's own options, top-left of the canvas. */
+  private toolSettings: HTMLElement;
   private parallelCheck: HTMLInputElement;
   private cornerCheck: HTMLInputElement;
   private svg: SVGSVGElement;
@@ -301,21 +482,68 @@ export class PatternEditor {
   private unit: UnitDisplay;
   private tool: PatternTool = 'move';
   private knifeMode: KnifeMode = 'linear';
-  /** Curve knife: endpoints before handle edit. */
-  private knifeCurveA: Vec2 | null = null;
-  private knifeCurveB: Vec2 | null = null;
-  private knifeBtn: HTMLButtonElement;
-  private knifeFlyout: HTMLElement;
-  private knifeHoldTimer: ReturnType<typeof setTimeout> | null = null;
-  private knifeHoldOpened = false;
-  private knifeDocPointerDown: ((e: PointerEvent) => void) | null = null;
+  /**
+   * The loop knife's live cut: the pointer is on an edge, and this is what a
+   * click would cut. Hover-driven rather than dragged, so it lives outside
+   * `drag`.
+   */
+  private knifeLoop: { pieceId: string; edgeIndex: number; t: number; cut: LoopCut } | null =
+    null;
+  /**
+   * Curve knife: the points clicked down so far and where the pointer is now.
+   * The cut is the chain through them, carried out to the outline at both ends,
+   * so a cut started inside a panel still runs edge to edge.
+   */
+  private knifeChain: Vec2[] = [];
+  private knifeChainHover: Vec2 | null = null;
+  /** Why the last Done was refused, until the chain changes again. */
+  private knifeChainRefusal: string | null = null;
+  /** How the clicks are joined: a curve through them, or straight edges. */
+  private knifeChainFit: CutterChainFit = 'smooth';
+  /**
+   * Sew the two halves back together along the cut — cutting a piece to keep its
+   * cloth, not to separate it. Sticky, because it is a way of working.
+   */
+  private knifeSewSplit = false;
+  private knifeBar: HTMLElement;
   private sewMode: SewMode = 'segment';
-  private sewBtn: HTMLButtonElement;
-  private sewFlyout: HTMLElement;
-  private sewHoldTimer: ReturnType<typeof setTimeout> | null = null;
-  private sewHoldOpened = false;
-  private sewDocPointerDown: ((e: PointerEvent) => void) | null = null;
   private sewBar: HTMLElement;
+  private joinMode: JoinMode = 'segment';
+  /** Whether the moving piece is warped onto the other, or moved and scaled to match. */
+  private joinFit: JoinFit = 'match';
+  /** In Move & scale, how far apart the picked edges may sit and still match, in cm. */
+  private joinTolerance = 0.5;
+  private joinBar: HTMLElement;
+  /** Edges picked for the piece that moves, and for the piece it fuses onto. */
+  private joinMove: SeamEdgeRef[] = [];
+  private joinKeep: SeamEdgeRef[] = [];
+  /**
+   * Which side the next click is for. Edges of two pieces laid along the same
+   * boundary sit on top of each other, so a click there cannot say which piece
+   * it means; the side being worked on says it.
+   */
+  private joinPhase: 'move' | 'keep' = 'move';
+  /** Live result of the join the picks would make, so it can be drawn and explained. */
+  private joinPreview: { piece: PatternPiece | null; reason: string | null; gap: number } = {
+    piece: null,
+    reason: null,
+    gap: 0,
+  };
+  private bridgeMode: JoinMode = 'segment';
+  private bridgeBar: HTMLElement;
+  /** Edges picked for the first piece, and for the piece it is bridged to. */
+  private bridgeFirst: SeamEdgeRef[] = [];
+  private bridgeSecond: SeamEdgeRef[] = [];
+  /** Which side the next click is for — same problem as a fuse, same answer. */
+  private bridgePhase: 'first' | 'second' = 'first';
+  /** Live result of the bridge the picks would make, so it can be drawn and said. */
+  private bridgePreview: { piece: PatternPiece | null; reason: string | null } = {
+    piece: null,
+    reason: null,
+  };
+  private simplifyBar: HTMLElement;
+  /** The open simplify session, if the bottom bar is up. */
+  private simplify: SimplifySession | null = null;
   /** Primary selected point (for point bar / single-point UI). */
   private selectedPointId: string | null = null;
   private selectedIds = new Set<string>();
@@ -323,10 +551,12 @@ export class PatternEditor {
   private drag: DragKind | null = null;
   private viewBox = { x: -10, y: -10, w: 80, h: 90 };
   private cbs: PatternEditorCallbacks;
+  /** Last reported piece selection, so `onSelectionChange` only fires on change. */
+  private lastSelectionSig = '';
   /** Coalesce one undo checkpoint per gesture / discrete edit. */
   private historyArmed = false;
-  /** True while pen is placing an open stroke (before close). */
-  private penActive = false;
+  /** The open path the pen is drawing, while it has one in hand. */
+  private penStrokeId: string | null = null;
   /**
    * Figma "Snap to geometry": soft-align moving points to other anchors.
    * Hold Ctrl during drag to temporarily disable.
@@ -372,6 +602,8 @@ export class PatternEditor {
   private multiSewTarget: SeamEdgeRef[] = [];
   /** Edge under the cursor while the sew tool is active. */
   private hoverEdge: HoverEdge | null = null;
+  /** The edge the extrude tool would duplicate, under the pointer. */
+  private extrudeHover: PieceEdge | null = null;
   /** Corner whose rotate zone the pointer is in, while a selection has handles. */
   private hoverRotate: ScaleHandle | null = null;
   private svgFileInput!: HTMLInputElement;
@@ -416,9 +648,10 @@ export class PatternEditor {
    */
   private collapsedBlockGroups = new Set<string>();
   private hoverVarId: string | null = null;  private hoverDriven: Set<string> | null = null;
-  private blockBtn!: HTMLButtonElement;
-  private blockMenu!: HTMLElement;
-  private blockMenuDocPointerDown: ((e: PointerEvent) => void) | null = null;
+  /** One button and popup per rail menu, and the view each is showing. */
+  private railMenuSpecs = new Map<RailMenuKey, RailMenuSpec>();
+  private railMenuView = new Map<RailMenuKey, string>();
+  private railMenuDocPointerDown: ((e: PointerEvent) => void) | null = null;
   private blockBar!: HTMLElement;
   private blockPersonSelect!: HTMLSelectElement;
   private blockSourceNote!: HTMLElement;
@@ -447,52 +680,43 @@ export class PatternEditor {
     this.toolbar.className = 'pattern-toolbar';
     this.toolbar.innerHTML = `
       <div class="pattern-toolbar-tools">
-        <button type="button" data-tool="move" data-tip="Move" aria-label="Move">↖</button>
-        <button type="button" data-tool="pen" data-tip="Pen" aria-label="Pen">✎</button>
-        <button type="button" data-tool="rect" data-tip="Rectangle" aria-label="Rectangle">
+        <button type="button" data-tool="move" data-tip="Move · ⌘/Ctrl-click an edge to drop a point, a panel to pick it" aria-label="Move">
           <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-            <rect x="3" y="3.5" width="10" height="9" fill="none" stroke="currentColor" stroke-width="1.4" rx="0.5"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M3.6 1.9 L3.6 12.5 L6.5 9.8 L8.4 14.1 L10.5 13.1 L8.6 8.9 L12.7 8.9 Z"/>
           </svg>
         </button>
-        <button type="button" data-tool="circle" data-tip="Circle" aria-label="Circle">
-          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-            <circle cx="8" cy="8" r="5" fill="none" stroke="currentColor" stroke-width="1.4"/>
-          </svg>
-        </button>
-        <div class="pattern-tool-flyout" data-flyout="knife">
-          <button type="button" data-tool="knife" data-tip="Knife · Linear" aria-label="Knife" aria-haspopup="true" aria-expanded="false">
+        <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="add">
+          <button type="button" data-rail-menu="add" data-tip="Add · pen, rectangle, circle, blocks, SVG" aria-label="Add" aria-haspopup="true" aria-expanded="false">
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-              <path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3 13 L13 3"/>
-              <path fill="none" stroke="currentColor" stroke-width="1.2" d="M11.2 3.2 L13 3 L12.8 4.8"/>
-              <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.5 1.2" d="M4 8.5 L8.5 4"/>
+              ${ICONS.add}
             </svg>
           </button>
-          <div class="pattern-tool-flyout-menu" hidden role="menu">
-            <button type="button" role="menuitem" data-knife-mode="linear" data-tip="Linear knife">Linear</button>
-            <button type="button" role="menuitem" data-knife-mode="circle" data-tip="Circle knife">Circle</button>
-            <button type="button" role="menuitem" data-knife-mode="curve" data-tip="Curve knife">Curve</button>
-          </div>
+          <div class="pattern-tool-flyout-menu pattern-rail-menu" hidden role="menu" data-rail-popup="add"></div>
         </div>
-        <button type="button" data-tool="dart" data-tip="Dart" aria-label="Dart">
-          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-            <path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" d="M2.5 3.5 L8 13.5 L13.5 3.5"/>
-            <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.5 1.2" d="M8 13.5 L8 5"/>
-          </svg>
-        </button>
-        <div class="pattern-tool-flyout" data-flyout="sew">
-          <button type="button" data-tool="sew" data-tip="Sew · Segment" aria-label="Sew" aria-haspopup="true" aria-expanded="false">
+        <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="modify">
+          <button type="button" data-rail-menu="modify" data-tip="Modify · extrude, join and bridge" aria-label="Modify" aria-haspopup="true" aria-expanded="false">
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-              <path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M3 12.5 L12.5 3"/>
-              <path fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" d="M11 3.5 L13 3 L12.5 5"/>
-              <path fill="none" stroke="currentColor" stroke-width="1.1" stroke-dasharray="1.4 1.1" d="M4.5 5.5 L11.5 12.5"/>
+              ${ICONS.modify}
             </svg>
           </button>
-          <div class="pattern-tool-flyout-menu" hidden role="menu">
-            <button type="button" role="menuitem" data-sew-mode="segment" data-tip="Segment sewing">Segment sewing</button>
-            <button type="button" role="menuitem" data-sew-mode="many" data-tip="Many-to-many sewing">Many-to-many</button>
-          </div>
+          <div class="pattern-tool-flyout-menu pattern-rail-menu" hidden role="menu" data-rail-popup="modify"></div>
         </div>
-        <button type="button" data-tool="bend" data-tip="Bend" aria-label="Bend">∿</button>
+        <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="remove">
+          <button type="button" data-rail-menu="remove" data-tip="Remove · knife and dart" aria-label="Remove" aria-haspopup="true" aria-expanded="false">
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+              ${ICONS.remove}
+            </svg>
+          </button>
+          <div class="pattern-tool-flyout-menu pattern-rail-menu" hidden role="menu" data-rail-popup="remove"></div>
+        </div>
+        <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="sew">
+          <button type="button" data-rail-menu="sew" data-tip="Sew · Segment" aria-label="Sew" aria-haspopup="true" aria-expanded="false">
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+              ${ICONS.sew}
+            </svg>
+          </button>
+          <div class="pattern-tool-flyout-menu pattern-rail-menu" hidden role="menu" data-rail-popup="sew"></div>
+        </div>
         <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="ruler">
           <button type="button" data-tool="ruler" data-tip="Ruler · hold for measurements" aria-label="Ruler" aria-haspopup="true" aria-expanded="false">
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
@@ -510,21 +734,6 @@ export class PatternEditor {
             <div class="pattern-ruler-menu-tree" data-ruler-tree role="tree"></div>
           </div>
         </div>
-        <div class="pattern-tool-flyout pattern-tool-flyout-wide" data-flyout="block">
-          <button type="button" data-act="add-block" data-tip="Block · add a pattern block" aria-label="Add block" aria-haspopup="true" aria-expanded="false">
-            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-              <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" d="M2.6 5.6 L8 2.9 L13.4 5.6 L13.4 10.6 L8 13.3 L2.6 10.6 Z"/>
-              <circle cx="8" cy="8" r="1.5" fill="currentColor"/>
-            </svg>
-          </button>
-          <div class="pattern-tool-flyout-menu pattern-block-menu" hidden role="menu" data-block-menu></div>
-        </div>
-        <button type="button" data-act="import-svg" data-tip="Import SVG" aria-label="Import SVG">
-          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-            <path fill="none" stroke="currentColor" stroke-width="1.3" d="M3.5 3.5h9v9h-9z"/>
-            <path fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" d="M8 6.2v4.2M6.1 8.8 L8 11 L9.9 8.8"/>
-          </svg>
-        </button>
       </div>
       <div class="pattern-toolbar-spacer" aria-hidden="true"></div>
       <button type="button" data-opt="seam-links" class="pattern-seam-links-btn" data-tip="Seam links" aria-label="Seam links" aria-pressed="false">
@@ -570,27 +779,15 @@ export class PatternEditor {
     this.seamLinksBtn = this.toolbar.querySelector('button[data-opt="seam-links"]') as HTMLButtonElement;
     this.xrayBtn = this.toolbar.querySelector('button[data-opt="xray"]') as HTMLButtonElement;
     this.avatarToggleBtn = this.toolbar.querySelector('button[data-opt="avatar"]') as HTMLButtonElement;
-    this.knifeBtn = this.toolbar.querySelector('button[data-tool="knife"]') as HTMLButtonElement;
-    this.knifeFlyout = this.toolbar.querySelector(
-      '[data-flyout="knife"] .pattern-tool-flyout-menu'
-    ) as HTMLElement;
-    this.sewBtn = this.toolbar.querySelector('button[data-tool="sew"]') as HTMLButtonElement;
-    this.sewFlyout = this.toolbar.querySelector(
-      '[data-flyout="sew"] .pattern-tool-flyout-menu'
-    ) as HTMLElement;
     this.rulerBtn = this.toolbar.querySelector('button[data-tool="ruler"]') as HTMLButtonElement;
     this.rulerMenu = this.toolbar.querySelector(
       '[data-flyout="ruler"] .pattern-tool-flyout-menu'
     ) as HTMLElement;
-    this.blockBtn = this.toolbar.querySelector('button[data-act="add-block"]') as HTMLButtonElement;
-    this.blockMenu = this.toolbar.querySelector('[data-block-menu]') as HTMLElement;
-    this.bindBlockMenu();
+    this.bindRailMenus();
     this.rulerSearchInput = this.toolbar.querySelector(
       'input[data-ruler-search]'
     ) as HTMLInputElement;
     this.rulerTree = this.toolbar.querySelector('[data-ruler-tree]') as HTMLElement;
-    this.bindKnifeFlyout();
-    this.bindSewFlyout();
     this.bindRulerMenu();
     this.rulerSearchInput.addEventListener('input', () => this.renderRulerMenu());
     this.rulerTree.addEventListener('click', (e) => {
@@ -602,14 +799,6 @@ export class PatternEditor {
       this.chooseRulerMeasurement(item.dataset.personId ?? '', item.dataset.measureId ?? '');
     });
     this.toolbar.addEventListener('click', (e) => {
-      const importBtn = (e.target as HTMLElement).closest(
-        'button[data-act="import-svg"]'
-      ) as HTMLButtonElement | null;
-      if (importBtn) {
-        e.preventDefault();
-        this.svgFileInput.click();
-        return;
-      }
       const seamLinksBtn = (e.target as HTMLElement).closest(
         'button[data-opt="seam-links"]'
       ) as HTMLButtonElement | null;
@@ -639,40 +828,10 @@ export class PatternEditor {
         this.redraw();
         return;
       }
-      const knifeModeBtn = (e.target as HTMLElement).closest(
-        'button[data-knife-mode]'
-      ) as HTMLButtonElement | null;
-      if (knifeModeBtn) {
-        e.preventDefault();
-        e.stopPropagation();
-        this.setKnifeMode(knifeModeBtn.dataset.knifeMode as KnifeMode);
-        this.setTool('knife');
-        this.hideKnifeFlyout();
-        return;
-      }
-      const sewModeBtn = (e.target as HTMLElement).closest(
-        'button[data-sew-mode]'
-      ) as HTMLButtonElement | null;
-      if (sewModeBtn) {
-        e.preventDefault();
-        e.stopPropagation();
-        this.setSewMode(sewModeBtn.dataset.sewMode as SewMode);
-        this.setTool('sew');
-        this.hideSewFlyout();
-        return;
-      }
       const btn = (e.target as HTMLElement).closest('button[data-tool]') as HTMLButtonElement | null;
       if (!btn) return;
-      // Flyout main buttons are handled by press/click bindings.
-      if (
-        btn.dataset.tool === 'knife' ||
-        btn.dataset.tool === 'sew' ||
-        btn.dataset.tool === 'ruler'
-      ) {
-        return;
-      }
-      this.hideKnifeFlyout();
-      this.hideSewFlyout();
+      // The ruler's button is handled by its own press/click binding.
+      if (btn.dataset.tool === 'ruler') return;
       this.setTool(btn.dataset.tool as PatternTool);
     });
 
@@ -700,6 +859,46 @@ export class PatternEditor {
     // the viewport it used to shove the whole canvas down whenever you clicked
     // a point.
     this.viewport.appendChild(this.pointBar);
+
+    // Tool settings: the options the tool in hand needs, in the same top-left
+    // slot as the point settings. The two are never up together — a tool with
+    // settings of its own is not one you are picking points with.
+    this.toolSettings = document.createElement('div');
+    this.toolSettings.className = 'pattern-tool-settings';
+    this.toolSettings.hidden = true;
+    this.toolSettings.innerHTML = `
+      <span class="pattern-settings-title">Join</span>
+      <div class="pattern-settings-group" role="group" aria-label="Edges to pick">
+        <button type="button" data-join-mode="segment" title="One edge on each piece">1:1</button>
+        <button type="button" data-join-mode="many" title="Runs of whole edges, many to many">Many : many</button>
+      </div>
+      <div class="pattern-settings-group" role="group" aria-label="How the moving piece is brought over">
+        <button type="button" data-join-fit="match" title="Move, turn and scale the piece as it is: the edges match if they land within the tolerance, and what is left between them is filled in">Move &amp; scale</button>
+        <button type="button" data-join-fit="warp" title="Bend, stretch and turn the piece until its edges lie exactly on the other's">Warp</button>
+      </div>
+      <label class="pattern-settings-field" title="Move & scale: how far apart the picked edges may sit and still count as matched">
+        <span>Tolerance</span>
+        <input type="number" data-join-tolerance min="0" max="100" step="0.1" value="0.5" aria-label="Join match tolerance" />
+        <span class="pattern-settings-unit">cm</span>
+      </label>
+    `;
+    this.viewport.appendChild(this.toolSettings);
+    this.sealOverlay(this.toolSettings);
+    this.toolSettings.querySelectorAll('button[data-join-mode]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.addEventListener('click', () => this.setJoinMode(btn.dataset.joinMode as JoinMode));
+    });
+    this.toolSettings.querySelectorAll('button[data-join-fit]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.addEventListener('click', () => this.setJoinFit(btn.dataset.joinFit as JoinFit));
+    });
+    const joinTolerance = this.toolSettings.querySelector(
+      'input[data-join-tolerance]'
+    ) as HTMLInputElement;
+    joinTolerance.addEventListener('input', () => {
+      const value = parseFloat(joinTolerance.value);
+      this.setJoinTolerance(Number.isFinite(value) ? value : 0);
+    });
 
     // Ruler inspector — appears only while a reference ruler is selected.
     this.rulerBar = document.createElement('div');
@@ -902,6 +1101,147 @@ export class PatternEditor {
       this.redraw();
     });
 
+    // Join bar: both ends of a fuse, the swap that decides which piece moves,
+    // and the button that does it.
+    this.joinBar = document.createElement('div');
+    this.joinBar.className = 'pattern-join-bar';
+    this.joinBar.hidden = true;
+    this.joinBar.innerHTML = `
+      <span class="pattern-join-title">Join</span>
+      <span data-join-instruction></span>
+      <button type="button" data-join-next>Confirm edges →</button>
+      <button type="button" data-join-swap title="Fuse the other piece onto this one instead">Swap sides</button>
+      <button type="button" data-join-commit>Fuse pieces</button>
+      <button type="button" data-join-cancel aria-label="Cancel joining">Cancel</button>
+    `;
+    this.viewport.appendChild(this.joinBar);
+    this.sealOverlay(this.joinBar);
+    this.joinBar.querySelector('[data-join-commit]')?.addEventListener('click', () => {
+      this.commitJoin();
+    });
+    this.joinBar.querySelector('[data-join-next]')?.addEventListener('click', () => {
+      this.toggleJoinSide();
+    });
+    this.joinBar.querySelector('[data-join-swap]')?.addEventListener('click', () => {
+      this.swapJoinSides();
+    });
+    this.joinBar.querySelector('[data-join-cancel]')?.addEventListener('click', () => {
+      this.clearJoin();
+      this.redraw();
+    });
+
+    // Bridge bar: the two runs a bridge spans, and the button that draws it.
+    this.bridgeBar = document.createElement('div');
+    this.bridgeBar.className = 'pattern-bridge-bar';
+    this.bridgeBar.hidden = true;
+    this.bridgeBar.innerHTML = `
+      <span class="pattern-bridge-title">Bridge</span>
+      <span data-bridge-instruction></span>
+      <button type="button" data-bridge-next>Confirm edges →</button>
+      <button type="button" data-bridge-commit>Bridge pieces</button>
+      <button type="button" data-bridge-cancel aria-label="Cancel bridging">Cancel</button>
+    `;
+    this.viewport.appendChild(this.bridgeBar);
+    this.sealOverlay(this.bridgeBar);
+    this.bridgeBar.querySelector('[data-bridge-commit]')?.addEventListener('click', () => {
+      this.commitBridge();
+    });
+    this.bridgeBar.querySelector('[data-bridge-next]')?.addEventListener('click', () => {
+      this.toggleBridgeSide();
+    });
+    this.bridgeBar.querySelector('[data-bridge-cancel]')?.addEventListener('click', () => {
+      this.clearBridge();
+      this.redraw();
+    });
+
+    // Simplify bar: Reduce / Fit with a live preview, then Done or Cancel.
+    this.simplifyBar = document.createElement('div');
+    this.simplifyBar.className = 'pattern-simplify-bar';
+    this.simplifyBar.hidden = true;
+    this.simplifyBar.innerHTML = `
+      <span class="pattern-simplify-title">Simplify points</span>
+      <span class="pattern-simplify-count" data-simplify-count></span>
+      <label class="pattern-simplify-field" title="How many points to drop, as a share of the picked ones">
+        <span>Reduce</span>
+        <input data-simplify-reduce type="range" min="0" max="100" step="1" value="0" aria-label="Reduce points by percent" />
+        <span class="pattern-simplify-value" data-simplify-reduce-val>0%</span>
+      </label>
+      <label class="pattern-simplify-field" title="How the curve is fitted back through the points that remain">
+        <span>Fit</span>
+        <select data-simplify-fit aria-label="Curve fit">
+          <option value="smooth">Smooth</option>
+          <option value="corner">Corner</option>
+        </select>
+      </label>
+      <button type="button" data-simplify-done>Done</button>
+      <button type="button" data-simplify-cancel aria-label="Cancel simplifying">Cancel</button>
+    `;
+    this.viewport.appendChild(this.simplifyBar);
+    this.sealOverlay(this.simplifyBar);
+    const reduceInput = this.simplifyBar.querySelector(
+      'input[data-simplify-reduce]'
+    ) as HTMLInputElement;
+    reduceInput.addEventListener('input', () => {
+      const state = this.simplify;
+      if (!state) return;
+      state.reduce = Math.max(0, Math.min(100, parseFloat(reduceInput.value) || 0));
+      this.applySimplify();
+    });
+    const fitInput = this.simplifyBar.querySelector('select[data-simplify-fit]') as HTMLSelectElement;
+    fitInput.addEventListener('change', () => {
+      const state = this.simplify;
+      if (!state) return;
+      state.fit = fitInput.value === 'corner' ? 'corner' : 'smooth';
+      this.applySimplify();
+    });
+    this.simplifyBar.querySelector('[data-simplify-done]')?.addEventListener('click', () => {
+      this.finishSimplify();
+    });
+    this.simplifyBar.querySelector('[data-simplify-cancel]')?.addEventListener('click', () => {
+      this.cancelSimplify();
+    });
+
+    // Curve knife bar: the chain's options, where the eye already is while
+    // clicking points down the piece.
+    this.knifeBar = document.createElement('div');
+    this.knifeBar.className = 'pattern-knife-bar';
+    this.knifeBar.hidden = true;
+    this.knifeBar.innerHTML = `
+      <span class="pattern-knife-title">Curve knife</span>
+      <span class="pattern-knife-count" data-knife-count></span>
+      <span class="pattern-knife-status" data-knife-status></span>
+      <label class="pattern-knife-field" title="How the clicked points are joined up">
+        <span>Fit</span>
+        <select data-knife-fit aria-label="Chain fit">
+          <option value="smooth">Smooth</option>
+          <option value="straight">Straight</option>
+        </select>
+      </label>
+      <label class="pattern-knife-toggle" title="Sew the two halves back together along the cut">
+        <input type="checkbox" data-knife-sew /> Sew split
+      </label>
+      <button type="button" data-knife-done>Done</button>
+      <button type="button" data-knife-cancel aria-label="Cancel the curve knife">Cancel</button>
+    `;
+    this.viewport.appendChild(this.knifeBar);
+    this.sealOverlay(this.knifeBar);
+    const knifeFit = this.knifeBar.querySelector('select[data-knife-fit]') as HTMLSelectElement;
+    knifeFit.addEventListener('change', () => {
+      this.knifeChainFit = knifeFit.value === 'straight' ? 'straight' : 'smooth';
+      this.redraw();
+    });
+    const knifeSew = this.knifeBar.querySelector('input[data-knife-sew]') as HTMLInputElement;
+    knifeSew.addEventListener('change', () => {
+      this.knifeSewSplit = knifeSew.checked;
+      this.redraw();
+    });
+    this.knifeBar.querySelector('[data-knife-done]')?.addEventListener('click', () => {
+      this.commitKnifeChain();
+    });
+    this.knifeBar.querySelector('[data-knife-cancel]')?.addEventListener('click', () => {
+      this.cancelKnifeChain();
+    });
+
     this.xrayBar = document.createElement('div');
     this.xrayBar.className = 'pattern-xray-bar';
     this.xrayBar.hidden = true;
@@ -991,6 +1331,7 @@ export class PatternEditor {
       <button type="button" data-act="duplicate">Duplicate</button>
       <button type="button" data-act="mirror-x">Mirror duplicate X</button>
       <button type="button" data-act="mirror-y">Mirror duplicate Y</button>
+      <button type="button" data-act="simplify-points" hidden>Simplify points</button>
       <button type="button" data-act="delete-piece" class="danger">Delete piece</button>
       <button type="button" data-act="reverse-seam" hidden>Reverse seam</button>
       <button type="button" data-act="reverse-seam-order" hidden>Reverse seam order here</button>
@@ -1008,6 +1349,7 @@ export class PatternEditor {
       else if (act === 'mirror-x') this.mirrorDuplicateContextPiece('x');
       else if (act === 'mirror-y') this.mirrorDuplicateContextPiece('y');
       else if (act === 'delete-piece') this.deleteContextPiece();
+      else if (act === 'simplify-points') this.startSimplifyPoints();
       else if (act === 'reverse-seam') this.reverseContextSeam();
       else if (act === 'reverse-seam-order') this.reverseContextSeamOrder();
       else if (act === 'remove-seam') this.removeContextSeam();
@@ -1073,6 +1415,19 @@ export class PatternEditor {
   };
 
   private onDocKeyDown = (e: KeyboardEvent): void => {
+    // Enter takes the curve knife's chain, the way it would take a dialog's
+    // default — unless the pointer is in a control that wants the key itself.
+    if (
+      e.key === 'Enter' &&
+      this.tool === 'knife' &&
+      this.knifeMode === 'curve' &&
+      this.knifeChain.length >= 2 &&
+      !isTextEntry(e.target)
+    ) {
+      e.preventDefault();
+      this.commitKnifeChain();
+      return;
+    }
     if (e.key === 'Escape') {
       if (this.importDialog) {
         this.closeSvgImportDialog();
@@ -1089,21 +1444,53 @@ export class PatternEditor {
         this.hoverEdge = null;
         this.redraw();
       }
-      if (this.tool === 'knife' && (this.knifeCurveA || this.knifeCurveB)) {
-        this.clearKnifeDraft();
-        this.syncKnifeToolbar();
+      if (this.joinMove.length > 0 || this.joinKeep.length > 0) {
+        this.clearJoin();
+        this.hoverEdge = null;
         this.redraw();
+      }
+      if (this.bridgeFirst.length > 0 || this.bridgeSecond.length > 0) {
+        this.clearBridge();
+        this.hoverEdge = null;
+        this.redraw();
+      }
+      if (this.tool === 'knife' && this.knifeChain.length > 0) {
+        this.cancelKnifeChain();
+      }
+      if (this.simplify) {
+        this.cancelSimplify();
+        e.preventDefault();
+        return;
       }
       this.setRulerSelection(null);
       this.setSelectedBlock(null);
       this.hideRulerMenu();
-      this.hideBlockMenu();
+      this.hideRailMenu();
       this.hideContextMenu();
       return;
     }
     if (e.key === 'Enter' && this.tool === 'sew' && this.sewMode === 'many') {
       e.preventDefault();
       this.advanceMultiSew();
+      return;
+    }
+    if (e.key === 'Enter' && this.tool === 'join' && !isTextEntry(e.target)) {
+      e.preventDefault();
+      // Many mode: Enter is the Confirm edges button, then the commit.
+      if (this.joinMode === 'many' && this.joinPhase === 'move' && this.joinMove.length > 0) {
+        this.toggleJoinSide();
+      } else {
+        this.commitJoin();
+      }
+      return;
+    }
+    if (e.key === 'Enter' && this.tool === 'bridge' && !isTextEntry(e.target)) {
+      e.preventDefault();
+      if (this.bridgeMode === 'many' && this.bridgePhase === 'first' && this.bridgeFirst.length > 0) {
+        this.toggleBridgeSide();
+      } else {
+        this.commitBridge();
+      }
       return;
     }
     if (e.key !== 'Delete' && e.key !== 'Backspace') return;
@@ -1133,8 +1520,19 @@ export class PatternEditor {
     this.redraw();
   }
 
-  setPattern(pattern: PatternDocument): void {
+  /**
+   * Swap in a new pattern document.
+   *
+   * `preserveView` keeps the current zoom/pan instead of re-framing: the view is
+   * state of the user's, not of the document, so restoring history through here
+   * must not move it.
+   */
+  setPattern(pattern: PatternDocument, opts: { preserveView?: boolean } = {}): void {
     this.pattern = pattern;
+    // A new document replaces the pieces a simplify preview was drawn into, so
+    // the session cannot be finished — drop it (undo lands here).
+    this.simplify = null;
+    this.simplifyBar.hidden = true;
     // Block outlines are a cache of their variables, so rebuild them before
     // anything measures or draws: a document written by an older build, or one
     // whose variables were clamped on the way in, must not keep displaying the
@@ -1143,11 +1541,28 @@ export class PatternEditor {
     this.selectedRulerId = null;
     this.hoverRulerId = null;
     this.selectedBlockId = null;
+    // A pick in flight belongs to the document that was on screen.
+    this.clearJoin();
+    this.clearBridge();
+    this.clearMultiSew();
+    this.pendingSeam = null;
+    this.hoverEdge = null;
     this.syncRulerBar();
     this.syncBlockBar();
     this.selectedPieceId = pattern.pieces[0]?.id ?? null;
     this.clearSelection();
-    this.fitView();
+    if (!opts.preserveView) this.fitView();
+    this.redraw();
+  }
+
+  /** The visible pattern-space rectangle (the editor's zoom/pan), for history. */
+  getViewBox(): { x: number; y: number; w: number; h: number } {
+    return { ...this.viewBox };
+  }
+
+  /** Restore a saved visible rectangle verbatim — view state, not document. */
+  setViewBox(box: { x: number; y: number; w: number; h: number }): void {
+    this.viewBox = { ...box };
     this.redraw();
   }
 
@@ -1172,17 +1587,28 @@ export class PatternEditor {
 
   setTool(tool: PatternTool): void {
     this.tool = tool;
-    if (tool !== 'pen') this.penActive = false;
+    if (tool !== 'pen') this.penStrokeId = null;
+    if (tool !== 'extrude') this.extrudeHover = null;
     if (tool !== 'sew') {
       this.pendingSeam = null;
       this.hoverEdge = null;
       this.clearMultiSew();
-      this.hideSewFlyout();
+    }
+    if (tool !== 'join') {
+      this.hoverEdge = null;
+      this.clearJoin();
+    }
+    if (tool !== 'bridge') {
+      this.hoverEdge = null;
+      this.clearBridge();
     }
     if (tool !== 'knife') {
+      this.knifeLoop = null;
       this.clearKnifeDraft();
-      this.hideKnifeFlyout();
     }
+    // Changing tools is walking away from anything in hand: a simplify preview
+    // belongs to the tool it was started from.
+    if (this.simplify) this.cancelSimplify();
     if (tool !== 'ruler') {
       this.hideRulerMenu();
       // A measurement armed for the ruler tool is meaningless elsewhere.
@@ -1198,9 +1624,12 @@ export class PatternEditor {
     }
     this.syncKnifeToolbar();
     this.syncSewToolbar();
+    this.syncJoinToolbar();
+    this.syncBridgeToolbar();
     for (const btn of Array.from(this.toolbar.querySelectorAll('button[data-tool]'))) {
       btn.classList.toggle('active', (btn as HTMLElement).dataset.tool === tool);
     }
+    this.syncRailMenus();
     this.applyCursor(null);
     this.redraw();
   }
@@ -1211,7 +1640,9 @@ export class PatternEditor {
     if (
       tool === 'pen' ||
       tool === 'dart' ||
+      tool === 'extrude' ||
       tool === 'sew' ||
+      tool === 'bridge' ||
       tool === 'rect' ||
       tool === 'circle' ||
       tool === 'knife' ||
@@ -1219,7 +1650,7 @@ export class PatternEditor {
     ) {
       return 'crosshair';
     }
-    return tool === 'bend' ? 'pointer' : 'default';
+    return 'default';
   }
 
   /**
@@ -1233,95 +1664,6 @@ export class PatternEditor {
     if (this.svg.style.cursor !== next) this.svg.style.cursor = next;
   }
 
-  private bindKnifeFlyout(): void {
-    const HOLD_MS = 380;
-    this.knifeBtn.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-      this.hideToolbarTip();
-      this.knifeHoldOpened = false;
-      this.knifeHoldTimer = setTimeout(() => {
-        this.knifeHoldTimer = null;
-        this.knifeHoldOpened = true;
-        this.showKnifeFlyout();
-      }, HOLD_MS);
-      const onUp = (ev: PointerEvent) => {
-        window.removeEventListener('pointerup', onUp, true);
-        window.removeEventListener('pointercancel', onUp, true);
-        if (this.knifeHoldTimer) {
-          clearTimeout(this.knifeHoldTimer);
-          this.knifeHoldTimer = null;
-        }
-        if (this.knifeHoldOpened) {
-          // Menu is open — selection happens via menu click; don't force linear.
-          return;
-        }
-        // Quick click → linear knife
-        if ((ev.target as Node | null) && this.knifeBtn.contains(ev.target as Node)) {
-          this.setKnifeMode('linear');
-          this.setTool('knife');
-        }
-      };
-      window.addEventListener('pointerup', onUp, true);
-      window.addEventListener('pointercancel', onUp, true);
-    });
-  }
-
-  private bindSewFlyout(): void {
-    const HOLD_MS = 380;
-    this.sewBtn.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-      this.hideToolbarTip();
-      this.sewHoldOpened = false;
-      this.sewHoldTimer = setTimeout(() => {
-        this.sewHoldTimer = null;
-        this.sewHoldOpened = true;
-        this.showSewFlyout();
-      }, HOLD_MS);
-      const onUp = (ev: PointerEvent) => {
-        window.removeEventListener('pointerup', onUp, true);
-        window.removeEventListener('pointercancel', onUp, true);
-        if (this.sewHoldTimer) {
-          clearTimeout(this.sewHoldTimer);
-          this.sewHoldTimer = null;
-        }
-        if (this.sewHoldOpened) return;
-        if ((ev.target as Node | null) && this.sewBtn.contains(ev.target as Node)) {
-          this.setSewMode('segment');
-          this.setTool('sew');
-        }
-      };
-      window.addEventListener('pointerup', onUp, true);
-      window.addEventListener('pointercancel', onUp, true);
-    });
-  }
-
-  private showSewFlyout(): void {
-    this.sewFlyout.hidden = false;
-    this.sewBtn.setAttribute('aria-expanded', 'true');
-    this.syncSewToolbar();
-    if (!this.sewDocPointerDown) {
-      this.sewDocPointerDown = (e: PointerEvent) => {
-        const target = e.target as Node;
-        if (this.sewFlyout.contains(target) || this.sewBtn.contains(target)) return;
-        this.hideSewFlyout();
-      };
-      document.addEventListener('pointerdown', this.sewDocPointerDown, true);
-    }
-  }
-
-  private hideSewFlyout(): void {
-    this.sewFlyout.hidden = true;
-    this.sewBtn.setAttribute('aria-expanded', 'false');
-    if (this.sewDocPointerDown) {
-      document.removeEventListener('pointerdown', this.sewDocPointerDown, true);
-      this.sewDocPointerDown = null;
-    }
-  }
-
   private setSewMode(mode: SewMode): void {
     if (this.sewMode !== mode) {
       this.pendingSeam = null;
@@ -1332,38 +1674,10 @@ export class PatternEditor {
     this.redraw();
   }
 
+  /** The Sew menu carries the mode, so this just keeps the bar and rail current. */
   private syncSewToolbar(): void {
-    const tip = this.sewMode === 'many' ? 'Sew · Many-to-many' : 'Sew · Segment';
-    this.sewBtn.dataset.tip = tip;
-    this.sewBtn.setAttribute('aria-label', tip);
-    for (const btn of Array.from(this.sewFlyout.querySelectorAll('button[data-sew-mode]'))) {
-      const el = btn as HTMLButtonElement;
-      el.classList.toggle('is-active', el.dataset.sewMode === this.sewMode);
-    }
     this.syncSewBar();
-  }
-
-  private showKnifeFlyout(): void {
-    this.knifeFlyout.hidden = false;
-    this.knifeBtn.setAttribute('aria-expanded', 'true');
-    this.syncKnifeToolbar();
-    if (!this.knifeDocPointerDown) {
-      this.knifeDocPointerDown = (e: PointerEvent) => {
-        const t = e.target as Node;
-        if (this.knifeFlyout.contains(t) || this.knifeBtn.contains(t)) return;
-        this.hideKnifeFlyout();
-      };
-      document.addEventListener('pointerdown', this.knifeDocPointerDown, true);
-    }
-  }
-
-  private hideKnifeFlyout(): void {
-    this.knifeFlyout.hidden = true;
-    this.knifeBtn.setAttribute('aria-expanded', 'false');
-    if (this.knifeDocPointerDown) {
-      document.removeEventListener('pointerdown', this.knifeDocPointerDown, true);
-      this.knifeDocPointerDown = null;
-    }
+    this.syncRailMenus();
   }
 
   private setKnifeMode(mode: KnifeMode): void {
@@ -1374,22 +1688,14 @@ export class PatternEditor {
   }
 
   private clearKnifeDraft(): void {
-    this.knifeCurveA = null;
-    this.knifeCurveB = null;
+    this.knifeChain = [];
+    this.knifeChainHover = null;
+    this.knifeChainRefusal = null;
   }
 
+  /** The Remove menu carries the knife's modes, so this just keeps the rail current. */
   private syncKnifeToolbar(): void {
-    const tips: Record<KnifeMode, string> = {
-      linear: 'Knife · Linear',
-      circle: 'Knife · Circle',
-      curve: 'Knife · Curve',
-    };
-    this.knifeBtn.dataset.tip = tips[this.knifeMode];
-    this.knifeBtn.setAttribute('aria-label', tips[this.knifeMode]);
-    for (const btn of Array.from(this.knifeFlyout.querySelectorAll('button[data-knife-mode]'))) {
-      const el = btn as HTMLButtonElement;
-      el.classList.toggle('is-active', el.dataset.knifeMode === this.knifeMode);
-    }
+    this.syncRailMenus();
   }
 
   private ensureTipEl(): HTMLDivElement {
@@ -1457,6 +1763,37 @@ export class PatternEditor {
     this.selectedPointId = pointId;
     if (pieceId) this.selectedPieceId = pieceId;
     this.releaseBlockSelection();
+  }
+
+  /**
+   * Ids of the pieces with at least one picked point, primary piece first.
+   * This is what the split view mirrors onto the 3D selection.
+   */
+  getSelectedPieces(): string[] {
+    const ids: string[] = [];
+    for (const piece of this.pattern.pieces) {
+      if (piece.points.some((pt) => this.selectedIds.has(pt.id))) ids.push(piece.id);
+    }
+    const primary = this.selectedPieceId;
+    if (primary && ids.includes(primary) && ids[0] !== primary) {
+      ids.splice(ids.indexOf(primary), 1);
+      ids.unshift(primary);
+    }
+    return ids;
+  }
+
+  /** Select whole pieces by id — the 3D → 2D half of the split view's sync. */
+  setSelectedPieces(pieceIds: readonly string[], primary?: string | null): void {
+    const wanted = new Set(pieceIds);
+    this.selectedIds = new Set(
+      this.pattern.pieces
+        .filter((piece) => wanted.has(piece.id))
+        .flatMap((piece) => piece.points.map((pt) => pt.id))
+    );
+    this.selectedPointId = null;
+    this.selectedPieceId = primary ?? pieceIds[0] ?? null;
+    this.releaseBlockSelection();
+    this.redraw();
   }
 
   /**
@@ -1758,7 +2095,21 @@ export class PatternEditor {
     });
   }
 
+  /**
+   * Report a changed piece selection once per redraw. Every selection path ends
+   * in `redraw`, so this catches them all without threading a call through each.
+   */
+  private emitSelectionChange(): void {
+    if (!this.cbs.onSelectionChange) return;
+    const ids = this.getSelectedPieces();
+    const sig = ids.join('\u0000');
+    if (sig === this.lastSelectionSig) return;
+    this.lastSelectionSig = sig;
+    this.cbs.onSelectionChange(ids);
+  }
+
   private redraw(): void {
+    this.emitSelectionChange();
     const { x, y, w, h } = this.viewBox;
     // The single layout read for this redraw — see `viewScaleCache`. Taken before
     // anything is written so it cannot force a flush of its own.
@@ -1793,6 +2144,10 @@ export class PatternEditor {
 
     this.drawSeams();
 
+    // Extrude tool: the edge in hand, and the tab it is pulling out.
+    if (this.extrudeHover) this.drawExtrudeHover(this.extrudeHover);
+    if (this.drag?.type === 'extrudeEdge') this.drawExtrudePreview(this.drag);
+
     // Rulers are laid *over* the work like a real ruler on the table, so the
     // line you are measuring against is always visible and grabbable. The
     // readings come back separately so a later ruler's graduations can never
@@ -1808,26 +2163,34 @@ export class PatternEditor {
     }
 
     if (this.drag?.type === 'marquee') {
-      this.drawMarquee(this.drag.start, this.drag.current);
+      this.drawMarquee(this.drag.start, this.drag.current, this.drag.panels);
     }
 
     if (this.drag?.type === 'drawShape') {
       this.drawShapePreview(this.drag);
     }
 
-    if (
-      this.drag?.type === 'knifeLine' ||
-      this.drag?.type === 'knifeCircle' ||
-      this.drag?.type === 'knifeCurveHandles'
-    ) {
+    if (this.drag?.type === 'knifeLine' || this.drag?.type === 'knifeCircle') {
       this.drawKnifePreview(this.drag);
     } else if (this.tool === 'knife' && this.knifeMode === 'curve') {
-      this.drawKnifeCurveDraft();
+      this.drawKnifeChainDraft();
+    } else if (this.isLoopKnife() && this.knifeLoop) {
+      this.drawLoopCut(this.knifeLoop);
+    }
+
+    if (this.tool === 'join' && this.joinPreview.piece) {
+      this.drawJoinPreview(this.joinPreview.piece);
+    }
+
+    if (this.tool === 'bridge' && this.bridgePreview.piece) {
+      this.drawBridgePreview(this.bridgePreview.piece);
     }
 
     this.updatePointBar();
     this.updateRulerReadout();
     this.updateBlockReadouts();
+    this.syncKnifeBar();
+    this.syncJoinBar();
   }
 
   private selectedPoint(): BezierPoint | null {
@@ -1849,7 +2212,7 @@ export class PatternEditor {
 
   private updatePointBar(): void {
     const pt = this.selectedPoint();
-    if (!pt) {
+    if (!pt || this.hasToolSettings()) {
       this.pointBar.hidden = true;
       return;
     }
@@ -1950,7 +2313,7 @@ export class PatternEditor {
     return { minX, minY, maxX, maxY };
   }
 
-  private drawMarquee(a: Vec2, b: Vec2): void {
+  private drawMarquee(a: Vec2, b: Vec2, panels: boolean): void {
     const x = Math.min(a.x, b.x);
     const y = Math.min(a.y, b.y);
     const w = Math.abs(b.x - a.x);
@@ -1960,7 +2323,9 @@ export class PatternEditor {
     rect.setAttribute('y', String(y));
     rect.setAttribute('width', String(w));
     rect.setAttribute('height', String(h));
-    rect.setAttribute('class', 'pattern-marquee');
+    // Cmd/Ctrl reads as whole panels: solid and green, so the mode is legible
+    // while the rectangle is being drawn.
+    rect.setAttribute('class', panels ? 'pattern-marquee pattern-marquee-pieces' : 'pattern-marquee');
     rect.setAttribute('stroke-width', String(this.px(1.5)));
     rect.setAttribute(
       'stroke-dasharray',
@@ -2041,10 +2406,7 @@ export class PatternEditor {
   }
 
   private knifeCutterFromDrag(
-    drag: Extract<
-      DragKind,
-      { type: 'knifeLine' | 'knifeCircle' | 'knifeCurveHandles' }
-    >
+    drag: Extract<DragKind, { type: 'knifeLine' | 'knifeCircle' }>
   ): CutterPath | null {
     if (drag.type === 'knifeLine') {
       let b = drag.current;
@@ -2055,59 +2417,319 @@ export class PatternEditor {
       if (dist(drag.start, b) < 0.2) return null;
       return { kind: 'line', a: drag.start, b };
     }
-    if (drag.type === 'knifeCircle') {
-      let r = drag.radius;
-      if (drag.shift) r = Math.round(r * 2) / 2;
-      if (r < 0.25) return null;
-      return { kind: 'circle', center: drag.center, radius: r };
-    }
-    return {
-      kind: 'cubic',
-      a: drag.a,
-      c0: drag.c0,
-      c1: drag.c1,
-      b: drag.b,
-    };
+    let r = drag.radius;
+    if (drag.shift) r = Math.round(r * 2) / 2;
+    if (r < 0.25) return null;
+    return { kind: 'circle', center: drag.center, radius: r };
   }
 
   private drawKnifePreview(
-    drag: Extract<
-      DragKind,
-      { type: 'knifeLine' | 'knifeCircle' | 'knifeCurveHandles' }
-    >
+    drag: Extract<DragKind, { type: 'knifeLine' | 'knifeCircle' }>
   ): void {
     const cutter = this.knifeCutterFromDrag(drag);
     if (!cutter) return;
     this.strokeCutter(cutter, true);
   }
 
-  private drawKnifeCurveDraft(): void {
-    if (this.knifeCurveA) {
-      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-      c.setAttribute('cx', String(this.knifeCurveA.x));
-      c.setAttribute('cy', String(this.knifeCurveA.y));
-      c.setAttribute('r', String(this.px(4)));
-      c.setAttribute('class', 'pattern-knife-point');
-      c.setAttribute('pointer-events', 'none');
-      this.svg.appendChild(c);
+  /**
+   * The loop cut under the pointer: the cut itself, where it lands, and — in
+   * follow mode — the two contours it is blended from, faintly, so it is clear
+   * what it is following.
+   */
+  private drawLoopCut(hover: { cut: LoopCut }): void {
+    const { cut } = hover;
+
+    if (!cut.straight && cut.valid) {
+      for (const rail of cut.rails) {
+        if (rail.length < 2) continue;
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.setAttribute(
+          'd',
+          rail.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
+        );
+        path.setAttribute('class', 'pattern-knife-rail');
+        path.setAttribute('stroke-width', String(this.px(1)));
+        path.setAttribute('pointer-events', 'none');
+        this.svg.appendChild(path);
+      }
     }
-    if (this.knifeCurveA && this.knifeCurveB) {
-      this.strokeCutter(
-        {
-          kind: 'line',
-          a: this.knifeCurveA,
-          b: this.knifeCurveB,
-        },
-        false
+
+    const samples = sampleLoopCutPath(cut, 48);
+    if (samples.length >= 2) {
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute(
+        'd',
+        samples.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
       );
+      path.setAttribute('class', 'pattern-knife-loop');
+      path.setAttribute('stroke-width', String(this.px(1.75)));
+      path.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(path);
+    }
+
+    for (const point of [cut.entry, cut.exit]) {
       const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-      c.setAttribute('cx', String(this.knifeCurveB.x));
-      c.setAttribute('cy', String(this.knifeCurveB.y));
-      c.setAttribute('r', String(this.px(4)));
+      c.setAttribute('cx', String(point.x));
+      c.setAttribute('cy', String(point.y));
+      c.setAttribute('r', String(this.px(3.5)));
+      c.setAttribute(
+        'class',
+        cut.valid ? 'pattern-knife-hit-ok' : 'pattern-knife-hit'
+      );
+      c.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(c);
+    }
+  }
+
+  // ── Curve knife ──────────────────────────────────────────────────────────
+  //
+  // Click points down like the pen, and the chain through them is the cut: it is
+  // carried out to the outline at both ends, so a cut started in the middle of a
+  // panel still runs edge to edge. The bar at the bottom of the viewport holds
+  // the options — the fit between the clicks, whether to sew the halves back
+  // together — and Done or Cancel.
+
+  /**
+   * The chain as a cutter, with both ends carried on out of the piece.
+   *
+   * A cut has to start and finish on the outline, and the first click is usually
+   * well inside the piece. Extending along the end tangents (which a straight
+   * chain shares with its last segment) keeps the drawn shape and gives the
+   * cut something to terminate on.
+   */
+  /**
+   * The chain as a cutter, with each end carried out to *this* piece's outline.
+   *
+   * A cut has to start and finish on the boundary, and a click is usually inside
+   * the panel. The carry-on stops at the outline rather than running on by a
+   * fixed distance: a line that sails past the panel it is cutting would sit over
+   * whatever is behind it, and the cut would look like it belonged there.
+   */
+  private knifeChainCutter(piece: PatternPiece): CutterPath | null {
+    if (this.knifeChain.length < 2) return null;
+    const box = anchorsBounds(piece.points);
+    const reach = Math.max(box.maxX - box.minX, box.maxY - box.minY) * 2 + 1;
+    const poly = pieceToPolyline(piece.points, true);
+
+    // The point that carries an end on out of the piece, or null when the end is
+    // already outside it — there is nothing left to reach.
+    const carried = (from: Vec2, towards: Vec2): Vec2 | null => {
+      if (!pointInPolygon(from, poly)) return null;
+      const dx = from.x - towards.x;
+      const dy = from.y - towards.y;
+      const length = Math.hypot(dx, dy) || 1;
+      const dir = { x: dx / length, y: dy / length };
+      const ray: CutterPath = {
+        kind: 'line',
+        a: from,
+        b: { x: from.x + dir.x * reach, y: from.y + dir.y * reach },
+      };
+      const distances = findBoundaryHits(piece, ray)
+        .filter((hit) => hit.along > 1e-3)
+        .map((hit) => hit.along * reach);
+      if (distances.length === 0) return null;
+      const distance = Math.min(...distances) + 0.5;
+      return { x: from.x + dir.x * distance, y: from.y + dir.y * distance };
+    };
+
+    const anchors = [...this.knifeChain];
+    const before = carried(anchors[0]!, anchors[1]!);
+    const after = carried(anchors[anchors.length - 1]!, anchors[anchors.length - 2]!);
+    if (before) anchors.unshift(before);
+    if (after) anchors.push(after);
+    return cutterPathThrough(anchors, this.knifeChainFit);
+  }
+
+  /** The piece a chain cut is for: the one the chain is drawn through. */
+  private pieceForChain(points: readonly Vec2[]): PatternPiece | null {
+    const under = pieceUnderChain(this.pattern.pieces, points, this.knifeChainFit);
+    if (under) return under;
+    const active = this.activePiece();
+    return active?.closed && active.points.length >= 3 ? active : null;
+  }
+
+  /**
+   * What Done would do right now: the cut, the piece it lands on, and the
+   * crossings it makes. Drives both the preview and the bar's readout, so the
+   * two can never disagree — and the commit takes the piece from here rather than
+   * working it out again from the carried-on line.
+   */
+  private knifeChainCut(): { cutter: CutterPath; piece: PatternPiece; hits: BoundaryHit[] } | null {
+    if (this.knifeChain.length < 2) return null;
+    const piece = this.pieceForChain(this.knifeChain);
+    if (!piece) return null;
+    const cutter = this.knifeChainCutter(piece);
+    if (!cutter) return null;
+    return { cutter, piece, hits: findBoundaryHits(piece, cutter) };
+  }
+
+  /**
+   * Whether the chain's crossings are a cut: two of them, with panel left on both
+   * sides. One crossing, or a line that only clips a corner, leaves nothing to
+   * separate.
+   */
+  private knifeChainCutOk(cut: { cutter: CutterPath; piece: PatternPiece; hits: BoundaryHit[] }): boolean {
+    return this.knifeHasValidHitPair(cut.piece, cut.hits, cut.cutter);
+  }
+
+  private drawKnifeChainDraft(): void {
+    if (this.knifeChain.length === 0) return;
+    const cut = this.knifeChainCut();
+
+    // Faint first, under the drawn chain: where the cut carries on to the
+    // outline at both ends, which is what lets a cut started inside the panel
+    // finish edge to edge.
+    if (cut) this.strokeSampledPath(cut.cutter, 'pattern-knife-extension');
+    const drawn = cutterPathThrough(this.knifeChain, this.knifeChainFit);
+    if (drawn) this.strokeSampledPath(drawn, 'pattern-knife-preview');
+
+    for (const point of this.knifeChain) {
+      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      c.setAttribute('cx', String(point.x));
+      c.setAttribute('cy', String(point.y));
+      c.setAttribute('r', String(this.px(3.5)));
       c.setAttribute('class', 'pattern-knife-point');
       c.setAttribute('pointer-events', 'none');
       this.svg.appendChild(c);
     }
+
+    // The rubber band: where the next click would carry the chain. Dashed, and
+    // not part of the cut — what is drawn solid is what Done would do.
+    if (this.knifeChainHover) {
+      const last = this.knifeChain[this.knifeChain.length - 1]!;
+      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      line.setAttribute('x1', String(last.x));
+      line.setAttribute('y1', String(last.y));
+      line.setAttribute('x2', String(this.knifeChainHover.x));
+      line.setAttribute('y2', String(this.knifeChainHover.y));
+      line.setAttribute('class', 'pattern-knife-rubber');
+      line.setAttribute('stroke-width', String(this.px(1.25)));
+      line.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(line);
+    }
+
+    if (!cut) return;
+    const ok = this.knifeChainCutOk(cut);
+    for (const hit of cut.hits) {
+      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      c.setAttribute('cx', String(hit.point.x));
+      c.setAttribute('cy', String(hit.point.y));
+      c.setAttribute('r', String(this.px(3.5)));
+      c.setAttribute('class', ok ? 'pattern-knife-hit-ok' : 'pattern-knife-hit');
+      c.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(c);
+    }
+  }
+
+  /** A cutter's own line, sampled and stroked in the given class. */
+  private strokeSampledPath(cutter: CutterPath, className: string): void {
+    const points = sampleCutterPath(cutter);
+    if (points.length < 2) return;
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    let d = `M ${points[0]!.x} ${points[0]!.y}`;
+    for (let i = 1; i < points.length; i++) d += ` L ${points[i]!.x} ${points[i]!.y}`;
+    path.setAttribute('d', d);
+    path.setAttribute('class', className);
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke-width', String(this.px(1.75)));
+    path.setAttribute('pointer-events', 'none');
+    this.svg.appendChild(path);
+  }
+
+  /**
+   * Bottom bar: what the chain is doing, how the clicks are joined, and whether
+   * the halves are sewn back together. Kept in step from `redraw`, so the status
+   * line never lags the preview.
+   */
+  private syncKnifeBar(): void {
+    if (!this.knifeBar) return;
+    // One bar at the bottom of the viewport at a time: a simplify preview is the
+    // more modal of the two, so it takes the slot while it is up.
+    const active = this.tool === 'knife' && this.knifeMode === 'curve' && !this.simplify;
+    this.knifeBar.hidden = !active;
+    if (!active) return;
+
+    const count = this.knifeBar.querySelector('[data-knife-count]') as HTMLElement;
+    const count_ = this.knifeChain.length;
+    count.textContent = `${count_} ${count_ === 1 ? 'point' : 'points'}`;
+
+    const status = this.knifeBar.querySelector('[data-knife-status]') as HTMLElement;
+    const cut = this.knifeChainCut();
+    const ok = !!cut && this.knifeChainCutOk(cut);
+    if (this.knifeChainRefusal) {
+      status.textContent = this.knifeChainRefusal;
+      status.title = this.knifeChainRefusal;
+    } else if (count_ < 2) {
+      status.textContent = 'Click points along the cut';
+      status.title = '';
+    } else if (!cut) {
+      status.textContent = 'No panel under the chain';
+      status.title = '';
+    } else if (!ok) {
+      status.textContent = `The cut has to cross ${cut.piece.name} twice`;
+      status.title = 'Two crossings, with panel left on both sides of the line';
+    } else {
+      status.textContent = `Cuts ${cut.piece.name} in two`;
+      status.title = `The cut crosses ${cut.piece.name} twice`;
+    }
+
+    const fit = this.knifeBar.querySelector('select[data-knife-fit]') as HTMLSelectElement;
+    fit.value = this.knifeChainFit;
+    const sew = this.knifeBar.querySelector('input[data-knife-sew]') as HTMLInputElement;
+    sew.checked = this.knifeSewSplit;
+    const done = this.knifeBar.querySelector('[data-knife-done]') as HTMLButtonElement;
+    done.disabled = !ok;
+  }
+
+  /** Commit the chain as a cut, and stand the draft down. */
+  private commitKnifeChain(): void {
+    const cut = this.knifeChainCut();
+    if (!cut || !this.knifeChainCutOk(cut)) return;
+    const refusal = this.commitKnife(cut.cutter, this.knifeSewSplit, cut.piece);
+    if (refusal) {
+      // The cut looked good in the preview but the slicer would not take it:
+      // keep the chain, say why, and let the next click or Cancel decide.
+      this.knifeChainRefusal = refusal;
+      this.syncKnifeBar();
+      this.redraw();
+      return;
+    }
+    this.clearKnifeDraft();
+    this.syncKnifeBar();
+    this.redraw();
+  }
+
+  /** Throw the draft away — Escape, Cancel, or the tool going out of hand. */
+  private cancelKnifeChain(): void {
+    if (this.knifeChain.length === 0 && !this.knifeChainHover) return;
+    this.clearKnifeDraft();
+    this.syncKnifeBar();
+    this.redraw();
+  }
+
+  /**
+   * Where a click lands: snapped to an outline point or edge it is close to, so a
+   * cut can be started exactly on a corner or run out along an edge.
+   */
+  private snapKnifePoint(p: Vec2): Vec2 {
+    // A snap radius that shrinks with the zoom but never grows past a couple of
+    // centimetres: a click meant for the middle of a panel must not be dragged
+    // onto its outline just because the board is zoomed out.
+    const r = Math.min(this.hitRadius(), 2);
+    let best: { point: Vec2; dist: number } | null = null;
+    for (const piece of this.pattern.pieces) {
+      for (const point of piece.points) {
+        const d = dist(p, point.anchor);
+        if (d <= r && (!best || d < best.dist)) best = { point: point.anchor, dist: d };
+      }
+    }
+    for (const piece of this.pattern.pieces) {
+      if (piece.points.length < 2) continue;
+      const hit = findNearestEdge(piece.points, piece.closed, p);
+      if (!hit || hit.dist > r) continue;
+      if (!best || hit.dist < best.dist) best = { point: hit.point, dist: hit.dist };
+    }
+    return best ? { ...best.point } : { ...p };
   }
 
   private strokeCutter(cutter: CutterPath, showHits: boolean): void {
@@ -2174,9 +2796,10 @@ export class PatternEditor {
   private pieceForKnife(cutter: CutterPath): PatternPiece | null {
     const closed = this.pattern.pieces.filter((p) => p.closed && p.points.length >= 3);
 
-    // Prefer the piece the infinite cut actually crosses (works when drag
-    // endpoints sit outside opposite sides).
-    if (cutter.kind === 'line') {
+    // Prefer the piece the cut actually crosses. That covers a line dragged from
+    // outside the panel and a chain that dips into one, without caring where the
+    // gesture happened to start.
+    if (cutter.kind === 'line' || cutter.kind === 'path') {
       for (const piece of closed) {
         const hits = findBoundaryHits(piece, cutter);
         if (hits.length < 2) continue;
@@ -2189,34 +2812,47 @@ export class PatternEditor {
       }
     }
 
-    const probe =
-      cutter.kind === 'circle'
-        ? cutter.center
-        : lerp(
-            cutter.kind === 'line' ? cutter.a : cutter.a,
-            cutter.kind === 'line' ? cutter.b : cutter.b,
-            0.5
-          );
+    // Otherwise go by where the cut sits. A chain has to be probed part way
+    // along: its first point is a boundary hit, and a point on the outline is
+    // inside no piece.
+    const probe = this.knifeProbePoint(cutter);
     for (const piece of closed) {
       if (pointInPolygon(probe, pieceToPolyline(piece.points, true))) return piece;
     }
-    return this.activePiece()?.closed ? this.activePiece() : closed[0] ?? null;
+    // Nothing claimed it: the active piece is the only remaining candidate, and
+    // only if the cut is sitting over it at all.
+    const fallback = this.activePiece();
+    if (!fallback || !fallback.closed || fallback.points.length < 3) return null;
+    return pointInPolygon(probe, pieceToPolyline(fallback.points, true)) ? fallback : null;
   }
 
-  private commitKnife(cutter: CutterPath): void {
-    const piece = this.pieceForKnife(cutter);
-    if (!piece) return;
+  /** A point on the cut which is meant to be inside the piece it cuts. */
+  private knifeProbePoint(cutter: CutterPath): Vec2 {
+    if (cutter.kind === 'circle') return cutter.center;
+    if (cutter.kind === 'path') {
+      const samples = sampleCutterPath(cutter, 8);
+      return samples[Math.floor(samples.length / 2)] ?? { x: 0, y: 0 };
+    }
+    return lerp(cutter.a, cutter.b, 0.5);
+  }
+
+  private commitKnife(
+    cutter: CutterPath,
+    sewSplit = false,
+    piece: PatternPiece | null = this.pieceForKnife(cutter)
+  ): string | null {
+    if (!piece) return 'No panel under the cut';
     this.markBeforeChange();
     const result = slicePiece(piece, cutter, () => uid('id'));
     if (!result.ok) {
       this.endHistoryGesture();
-      return;
+      return result.reason;
     }
     const [a, b] = result.pieces;
     const idx = this.pattern.pieces.findIndex((p) => p.id === piece.id);
     if (idx < 0) {
       this.endHistoryGesture();
-      return;
+      return 'That panel is no longer in the pattern';
     }
     // The two halves get fresh ids; record the lineage so downstream Transform 3D
     // nodes hand the original arrangement down instead of resetting to default.
@@ -2258,13 +2894,24 @@ export class PatternEditor {
     }
 
     this.pattern.pieces.splice(idx, 1, a, b);
-    this.pattern.seams = remappedSeams;
+    this.pattern.seams = sewSplit
+      ? [
+          ...remappedSeams,
+          ...result.cutEdges.map(({ a: cutA, b: cutB }) => ({
+            id: uid('seam'),
+            a: cutA,
+            b: cutB,
+            restGapCm: DEFAULT_SEAM_GAP_CM,
+          })),
+        ]
+      : remappedSeams;
     this.selectedPieceId = a.id;
     this.selectEntirePiece(a);
     this.clearKnifeDraft();
     this.syncKnifeToolbar();
     this.cbs.onChange();
     this.endHistoryGesture();
+    return null;
   }
 
   private drawSnapGuides(): void {
@@ -2378,8 +3025,16 @@ export class PatternEditor {
     snapshots: PointSnapshot[],
     rawDx: number,
     rawDy: number,
-    enabled: boolean
+    enabled: boolean,
+    /** The axis the drag is locked to (Shift): the other one cannot move. */
+    constrainAxis: 'x' | 'y' | null = null
   ): { dx: number; dy: number; guides: SnapGuide[] } {
+    // Lock first, so the snapping below can never creep along the held axis.
+    if (constrainAxis === 'x') rawDy = 0;
+    else if (constrainAxis === 'y') rawDx = 0;
+    const allowX = constrainAxis !== 'y';
+    const allowY = constrainAxis !== 'x';
+
     if (!enabled || snapshots.length === 0) {
       return { dx: rawDx, dy: rawDy, guides: [] };
     }
@@ -2419,7 +3074,9 @@ export class PatternEditor {
       }
     }
 
-    if (bestMid) {
+    // A midpoint snap pulls on both axes, so it is only offered when the drag is
+    // free — under an axis lock it would break the constraint.
+    if (bestMid && !constrainAxis) {
       const dx = rawDx + midAdjX;
       const dy = rawDy + midAdjY;
       return {
@@ -2451,8 +3108,8 @@ export class PatternEditor {
       }
     }
 
-    const dx = rawDx + (bestAbsDx < threshold ? snapAdjX : 0);
-    const dy = rawDy + (bestAbsDy < threshold ? snapAdjY : 0);
+    const dx = allowX ? rawDx + (bestAbsDx < threshold ? snapAdjX : 0) : 0;
+    const dy = allowY ? rawDy + (bestAbsDy < threshold ? snapAdjY : 0) : 0;
 
     // Build guides for every alignment that holds after the snap
     const eps = Math.max(1e-4, threshold * 0.05);
@@ -2464,14 +3121,14 @@ export class PatternEditor {
       const mx = s.anchor.x + dx;
       const my = s.anchor.y + dy;
       for (const ref of refs) {
-        if (Math.abs(mx - ref.x) <= eps) {
+        if (allowX && Math.abs(mx - ref.x) <= eps) {
           const key = `v:${ref.x.toFixed(4)}:${Math.min(my, ref.y).toFixed(3)}:${Math.max(my, ref.y).toFixed(3)}`;
           if (!seenV.has(key)) {
             seenV.add(key);
             guides.push({ kind: 'axis', axis: 'x', at: ref.x, from: my, to: ref.y });
           }
         }
-        if (Math.abs(my - ref.y) <= eps) {
+        if (allowY && Math.abs(my - ref.y) <= eps) {
           const key = `h:${ref.y.toFixed(4)}:${Math.min(mx, ref.x).toFixed(3)}:${Math.max(mx, ref.x).toFixed(3)}`;
           if (!seenH.has(key)) {
             seenH.add(key);
@@ -2673,9 +3330,7 @@ export class PatternEditor {
     }
 
     const showHandles =
-      this.tool === 'bend' ||
-      this.tool === 'pen' ||
-      (this.tool === 'move' && this.selectedIds.size === 1);
+      this.tool === 'pen' || (this.tool === 'move' && this.selectedIds.size === 1);
 
     const pointR = this.px(5);
     const pointSw = this.px(1.5);
@@ -2899,6 +3554,71 @@ export class PatternEditor {
     return ids;
   }
 
+  /**
+   * The pieces a rectangle touches, judged on the bounds of their outline: the
+   * rectangle reaching any part of a panel means that panel, so a Cmd-drag
+   * picks out whole pieces however it is drawn.
+   */
+  private piecesInRect(a: Vec2, b: Vec2): PatternPiece[] {
+    const rect: BBox = {
+      minX: Math.min(a.x, b.x),
+      maxX: Math.max(a.x, b.x),
+      minY: Math.min(a.y, b.y),
+      maxY: Math.max(a.y, b.y),
+    };
+    const hits: PatternPiece[] = [];
+    for (const piece of this.pattern.pieces) {
+      if (piece.points.length === 0) continue;
+      if (!boxesOverlap(anchorsBounds(piece.points), rect)) continue;
+      hits.push(piece);
+    }
+    return hits;
+  }
+
+  /**
+   * Cmd/Ctrl-drag over the canvas: everything the rectangle touches joins the
+   * selection as whole pieces, so the panels come away with every point picked
+   * rather than a scatter of the handles that happened to fall inside it.
+   */
+  private addPiecesInRect(a: Vec2, b: Vec2): void {
+    const hits = this.piecesInRect(a, b);
+    if (hits.length === 0) return;
+    const ids = new Set(this.selectedIds);
+    for (const piece of hits) for (const pt of piece.points) ids.add(pt.id);
+    this.selectedPieceId = hits[hits.length - 1].id;
+    this.setSelection([...ids], this.selectedPointId);
+  }
+
+  /**
+   * Cmd/Ctrl-click on a panel takes the whole piece in or out of the selection,
+   * never the single corner of it under the pointer — the piece is the unit
+   * here, the way a point is the unit for Shift-click on a marker.
+   */
+  private toggleEntirePiece(piece: PatternPiece): void {
+    const own = new Set(piece.points.map((pt) => pt.id));
+    if (!this.isEntirePieceSelected(piece)) {
+      for (const id of own) this.selectedIds.add(id);
+      this.selectedPointId = null;
+      this.selectedPieceId = piece.id;
+      this.releaseBlockSelection();
+      return;
+    }
+
+    for (const id of own) this.selectedIds.delete(id);
+    if (this.selectedPointId && own.has(this.selectedPointId)) {
+      this.selectedPointId = this.selectedIds.values().next().value ?? null;
+    }
+    // Hand the piece in hand over to one that is still picked, so a later edit
+    // cannot land on the piece just dropped.
+    if (this.selectedPieceId === piece.id) {
+      const picked = this.pattern.pieces.find((entry) =>
+        entry.points.some((pt) => this.selectedIds.has(pt.id))
+      );
+      if (picked) this.selectedPieceId = picked.id;
+    }
+    this.releaseBlockSelection();
+  }
+
   private scaleFixedPoint(box: BBox, handle: ScaleHandle): Vec2 {
     const midX = (box.minX + box.maxX) / 2;
     const midY = (box.minY + box.maxY) / 2;
@@ -2993,6 +3713,14 @@ export class PatternEditor {
     e.preventDefault();
     this.root.focus({ preventScroll: true });
 
+    // A knife chain in progress owns the right-click: it throws it away rather
+    // than opening a menu about whatever happens to be underneath.
+    if (this.tool === 'knife' && this.knifeMode === 'curve' && this.knifeChain.length > 0) {
+      e.stopPropagation();
+      this.cancelKnifeChain();
+      return;
+    }
+
     // Cancel pending sew pick instead of opening the piece menu
     if (this.pendingSeam) {
       e.stopPropagation();
@@ -3040,7 +3768,10 @@ export class PatternEditor {
       return;
     }
     e.stopPropagation();
-    this.selectEntirePiece(piece);
+    // Right-clicking picks the whole piece so the menu's duplicate/mirror acts
+    // have something to work on — but not when the draftsperson has already
+    // picked a run of this piece's points, which is a selection in its own right.
+    if (this.pickedRuns(piece).length === 0) this.selectEntirePiece(piece);
     this.contextPieceId = piece.id;
     this.contextSeamId = null;
     this.showContextMenu(e.clientX, e.clientY, 'piece');
@@ -3055,6 +3786,21 @@ export class PatternEditor {
     const pieceActs = ['duplicate', 'mirror-x', 'mirror-y', 'delete-piece'];
     const seamActs = ['reverse-seam', 'reverse-seam-order', 'remove-seam'];
     const rulerActs = ['ruler-toggle-half', 'ruler-delete'];
+    // Simplifying needs a run of picked points to work on — and a piece whose
+    // points are its own: a block's points come from its variables, so reducing
+    // them would be undone by the next regeneration.
+    const simplifyPiece =
+      mode === 'piece'
+        ? this.pattern.pieces.find((p) => p.id === this.contextPieceId) ?? null
+        : null;
+    const simplifyRuns = simplifyPiece ? this.pickedRuns(simplifyPiece) : [];
+    const simplifyCount = simplifyRuns.reduce((sum, run) => sum + run.length, 0);
+    const simplifyOk =
+      simplifyCount >= MIN_RUN && !this.blockForPiece(this.contextPieceId ?? undefined);
+    const simplifyBtn = this.contextMenu.querySelector(
+      'button[data-act="simplify-points"]'
+    ) as HTMLButtonElement;
+    simplifyBtn.textContent = `Simplify points (${simplifyCount})`;
     // Reordering only means something where a run of seams shares one edge.
     const canReorder =
       !!this.contextSeamHit &&
@@ -3063,7 +3809,9 @@ export class PatternEditor {
       const act = (btn as HTMLElement).dataset.act!;
       const show =
         mode === 'piece'
-          ? pieceActs.includes(act)
+          ? act === 'simplify-points'
+            ? simplifyOk
+            : pieceActs.includes(act)
           : mode === 'ruler'
             ? rulerActs.includes(act)
             : act === 'reverse-seam-order'
@@ -3090,6 +3838,172 @@ export class PatternEditor {
     this.contextPieceId = null;
     this.contextSeamId = null;
     this.contextSeamHit = null;
+  }
+
+  // ── Simplify points ──────────────────────────────────────────────────────
+  //
+  // Pick a run of points on an outline — a dense hand-drawn curve, or every
+  // point on a piece — and reduce it to the ones that carry the shape, then fit
+  // the curve back through them. The bar at the bottom of the viewport previews
+  // the result live: the outline really is rewritten as the slider moves, and
+  // only Done commits it (Cancel, Escape or any fresh gesture on the canvas
+  // puts the points back).
+
+  /** Runs of picked points on a piece, in outline order. Empty for a single pick. */
+  private pickedRuns(piece: PatternPiece): string[][] {
+    return selectedPointRuns(piece.points, (id) => this.selectedIds.has(id), piece.closed);
+  }
+
+  /**
+   * Point ids on this piece that a seam or dart ends on.
+   *
+   * A seam is stored as an *edge* — a pair of adjacent points — so dropping one
+   * of its ends would leave the piece's stitching pointing at an outline that no
+   * longer has that edge. These survive whatever reduction is asked for.
+   */
+  private seamPinnedPointIds(piece: PatternPiece): Set<string> {
+    const ids = new Set<string>();
+    for (const seam of this.pattern.seams) {
+      for (const ref of [seam.a, seam.b]) {
+        if (ref.pieceId !== piece.id) continue;
+        ids.add(ref.fromPointId);
+        ids.add(ref.toPointId);
+      }
+    }
+    return ids;
+  }
+
+  private startSimplifyPoints(): void {
+    const piece = this.pattern.pieces.find((p) => p.id === this.contextPieceId);
+    if (!piece) return;
+    const runs = this.pickedRuns(piece);
+    if (runs.length === 0) return;
+    const runIds = runs.flat();
+    const picked = new Set(runIds);
+    const byId = new Map(piece.points.map((pt) => [pt.id, pt]));
+    const cornersOnly = runIds.every((id) => {
+      const pt = byId.get(id);
+      return !!pt && this.isCornerPoint(pt);
+    });
+    this.simplify = {
+      pieceId: piece.id,
+      runs,
+      originalPoints: piece.points.map(clonePoint),
+      runIds,
+      otherPickedIds: [...this.selectedIds].filter((id) => !picked.has(id)),
+      reduce: 0,
+      // A run of corners is a run of straight-ish edges, so keep it that way;
+      // anything with curve handles reads as a curve and stays smooth.
+      fit: cornersOnly ? 'corner' : 'smooth',
+    };
+    this.hideContextMenu();
+    this.syncSimplifyBar();
+    this.applySimplify();
+  }
+
+  /**
+   * Rewrite the piece from the outline it started with. Every preview is a fresh
+   * pass over the original, so reduce and fit compose instead of compounding.
+   */
+  private applySimplify(): void {
+    const state = this.simplify;
+    if (!state) return;
+    const piece = this.pattern.pieces.find((p) => p.id === state.pieceId);
+    if (!piece) {
+      this.cancelSimplify();
+      return;
+    }
+    let points = state.originalPoints.map(clonePoint);
+    const pinned = this.seamPinnedPointIds(piece);
+    for (const run of state.runs) {
+      const result = simplifyRun(
+        points,
+        run,
+        keepCount(run.length, state.reduce),
+        state.fit,
+        piece.closed,
+        pinned
+      );
+      if (!result) {
+        // The outline has moved on: those picks are no longer one run of it, so
+        // the preview cannot be trusted. Put the piece back.
+        this.cancelSimplify();
+        return;
+      }
+      points = result.points;
+    }
+
+    const alive = new Set(points.map((pt) => pt.id));
+    const primary = this.selectedPointId;
+    piece.points = points;
+    this.selectedPieceId = piece.id;
+    this.setSelection(
+      [...state.otherPickedIds, ...state.runIds.filter((id) => alive.has(id))],
+      primary && alive.has(primary) ? primary : null
+    );
+    this.syncSimplifyBar();
+    this.redraw();
+  }
+
+  private syncSimplifyBar(): void {
+    const state = this.simplify;
+    this.simplifyBar.hidden = !state;
+    if (!state) return;
+    const piece = this.pattern.pieces.find((p) => p.id === state.pieceId);
+    const picked = new Set(state.runIds);
+    const kept = piece ? piece.points.filter((pt) => picked.has(pt.id)).length : 0;
+    const total = state.runIds.length;
+    const count = this.simplifyBar.querySelector('[data-simplify-count]') as HTMLElement;
+    count.textContent = `${total} → ${kept} ${kept === 1 ? 'point' : 'points'}${
+      state.runs.length > 1 ? ` · ${state.runs.length} runs` : ''
+    }`;
+    const reduce = this.simplifyBar.querySelector('input[data-simplify-reduce]') as HTMLInputElement;
+    reduce.value = String(Math.round(state.reduce));
+    const reduceVal = this.simplifyBar.querySelector('[data-simplify-reduce-val]') as HTMLElement;
+    reduceVal.textContent = `${Math.round(state.reduce)}%`;
+    const fit = this.simplifyBar.querySelector('select[data-simplify-fit]') as HTMLSelectElement;
+    fit.value = state.fit;
+  }
+
+  /**
+   * Accept the preview. History is armed *after* the piece is back as it was, so
+   * undo steps over the whole session in one go rather than over each preview.
+   */
+  private finishSimplify(): void {
+    const state = this.simplify;
+    if (!state) return;
+    const piece = this.pattern.pieces.find((p) => p.id === state.pieceId);
+    const applied = piece ? piece.points : null;
+    this.simplify = null;
+    this.simplifyBar.hidden = true;
+    if (!piece || !applied) {
+      this.redraw();
+      return;
+    }
+    piece.points = state.originalPoints.map(clonePoint);
+    this.markBeforeChange();
+    piece.points = applied;
+    this.cbs.onChange();
+    this.endHistoryGesture();
+    this.redraw();
+  }
+
+  /** Put the piece back and stand the bar down. Nothing was committed, so no history. */
+  private cancelSimplify(): void {
+    const state = this.simplify;
+    this.simplify = null;
+    this.simplifyBar.hidden = true;
+    this.syncKnifeBar();
+    if (!state) return;
+    const piece = this.pattern.pieces.find((p) => p.id === state.pieceId);
+    if (piece) {
+      piece.points = state.originalPoints.map(clonePoint);
+      this.setSelection(
+        [...state.otherPickedIds, ...state.runIds],
+        this.selectedPointId
+      );
+    }
+    this.redraw();
   }
 
   /**
@@ -3709,42 +4623,380 @@ export class PatternEditor {
 
   // — Placement —
 
-  private bindBlockMenu(): void {
-    this.blockBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      this.hideToolbarTip();
-      if (this.blockMenu.hidden) this.showBlockMenu();
-      else this.hideBlockMenu();
-    });
+  /**
+   * The rail's menus: the pen, the shapes and the library behind Add; extrude,
+   * join and bridge behind Modify; the knife and the dart behind Remove; the two
+   * seams behind Sew. Each is one button with a popup beside it, and a row that
+   * opens a sub-view (the library, the knife's modes) hands the same popup over
+   * rather than opening a second one.
+   */
+  private railMenus(): RailMenuSpec[] {
+    return [
+      {
+        key: 'add',
+        label: 'Add',
+        tip: 'Add · pen, rectangle, circle, blocks, SVG',
+        icon: ICONS.add,
+        toolTip: () => {
+          const names: Partial<Record<PatternTool, string>> = {
+            pen: 'Pen',
+            rect: 'Rectangle',
+            circle: 'Circle',
+          };
+          const name = names[this.tool];
+          return name ? `Add · ${name}` : null;
+        },
+        views: () => ({
+          tools: {
+            active: () => (this.tool === 'pen' || this.tool === 'rect' || this.tool === 'circle' ? this.tool : null),
+            choose: (id) => {
+              if (id === 'import') {
+                // A one-shot action rather than a tool: it hands over to the
+                // file picker and leaves whatever tool was in hand alone.
+                this.svgFileInput.click();
+                return;
+              }
+              this.setTool(id as PatternTool);
+            },
+            entries: [
+              {
+                id: 'pen',
+                name: 'Pen',
+                desc: 'Click points down, close on the first',
+                icon: ICONS.pen,
+              },
+              {
+                id: 'rect',
+                name: 'Rectangle',
+                desc: 'Drag out a rectangular panel',
+                icon: ICONS.rect,
+              },
+              {
+                id: 'circle',
+                name: 'Circle',
+                desc: 'Drag out a round piece',
+                icon: ICONS.circle,
+              },
+              {
+                id: 'block',
+                name: 'Block…',
+                desc: 'Draft a piece from the block library',
+                icon: ICONS.block,
+                view: 'blocks',
+              },
+              {
+                id: 'import',
+                name: 'Import SVG…',
+                desc: 'Bring an SVG in as pattern pieces',
+                icon: ICONS.import,
+              },
+            ],
+          },
+          blocks: { render: (host) => this.renderBlockMenu(host) },
+        }),
+      },
+      {
+        key: 'modify',
+        label: 'Modify',
+        tip: 'Modify · extrude, join and bridge',
+        icon: ICONS.modify,
+        toolTip: () => {
+          if (this.tool === 'extrude') return 'Modify · Extrude edge';
+          if (this.tool === 'join') {
+            return this.joinMode === 'many' ? 'Modify · Join · Edge runs' : 'Modify · Join · One edge each';
+          }
+          if (this.tool === 'bridge') {
+            return this.bridgeMode === 'many'
+              ? 'Modify · Bridge · Edge runs'
+              : 'Modify · Bridge · One edge each';
+          }
+          return null;
+        },
+        views: () => ({
+          tools: {
+            active: () =>
+              this.tool === 'extrude' || this.tool === 'join' || this.tool === 'bridge' ? this.tool : null,
+            choose: (id) => {
+              // A fuse's settings (one edge or a run, warped or matched) live in
+              // the tool settings popover, so the row simply starts the tool.
+              if (id === 'extrude' || id === 'join') this.setTool(id as PatternTool);
+            },
+            entries: [
+              {
+                id: 'extrude',
+                name: 'Extrude edge…',
+                desc: 'Drag away from an edge to grow a parallel copy',
+                icon: ICONS.extrude,
+              },
+              {
+                id: 'join',
+                name: 'Join…',
+                desc: 'Fuse two pieces along picked edges',
+                icon: ICONS.join,
+              },
+              {
+                id: 'bridge',
+                name: 'Bridge…',
+                desc: 'Fill between picked edges without moving them',
+                icon: ICONS.bridge,
+                view: 'bridge',
+              },
+            ],
+          },
+          bridge: {
+            // The mode rows say what the bridge is set to, whether or not it is up yet.
+            active: () => this.bridgeMode,
+            choose: (id) => {
+              this.setBridgeMode(id as JoinMode);
+              this.setTool('bridge');
+            },
+            entries: [
+              { id: 'segment', name: 'One edge each', desc: 'Two pieces, one edge onto one edge' },
+              { id: 'many', name: 'Edge runs (many)', desc: 'Runs of whole edges, many to many' },
+            ],
+          },
+        }),
+      },
+      {
+        key: 'remove',
+        label: 'Remove',
+        tip: 'Remove · knife and dart',
+        icon: ICONS.remove,
+        toolTip: () => {
+          if (this.tool === 'dart') return 'Remove · Dart';
+          if (this.tool === 'knife') return `Remove · ${KNIFE_TIPS[this.knifeMode]}`;
+          return null;
+        },
+        views: () => ({
+          tools: {
+            active: () => (this.tool === 'dart' || this.tool === 'knife' ? this.tool : null),
+            choose: (id) => {
+              if (id === 'dart') this.setTool('dart');
+            },
+            entries: [
+              {
+                id: 'dart',
+                name: 'Dart',
+                desc: 'Cut a dart into the outline',
+                icon: ICONS.dart,
+              },
+              {
+                id: 'knife',
+                name: 'Knife…',
+                desc: 'Cut a piece along a line, circle, chain or loop',
+                icon: ICONS.knife,
+                view: 'knife',
+              },
+            ],
+          },
+          knife: {
+            active: () => this.knifeMode,
+            choose: (id) => {
+              this.setKnifeMode(id as KnifeMode);
+              this.setTool('knife');
+            },
+            entries: [
+              { id: 'linear', name: 'Linear', desc: 'Drag a straight cutter across the piece' },
+              { id: 'circle', name: 'Circle', desc: 'Drag out a round cutter' },
+              { id: 'curve', name: 'Curve', desc: 'Click points down, then Done to cut' },
+              { id: 'loop', name: 'Loop (follow)', desc: 'Hover an edge; the cut bends with the contours' },
+              { id: 'loop-straight', name: 'Loop (straight)', desc: 'Hover an edge; the cut runs straight across' },
+            ],
+          },
+        }),
+      },
+      {
+        key: 'sew',
+        label: 'Sew',
+        tip: 'Sew · Segment',
+        icon: ICONS.sew,
+        toolTip: () =>
+          this.tool === 'sew' ? (this.sewMode === 'many' ? 'Sew · Many-to-many' : 'Sew · Segment') : null,
+        views: () => ({
+          tools: {
+            active: () => this.sewMode,
+            choose: (id) => {
+              this.setSewMode(id as SewMode);
+              this.setTool('sew');
+            },
+            entries: [
+              { id: 'segment', name: 'Segment sewing', desc: 'One edge onto one edge' },
+              { id: 'many', name: 'Many-to-many', desc: 'Runs of edges onto runs of edges' },
+            ],
+          },
+        }),
+      },
+    ];
   }
 
-  private showBlockMenu(): void {
-    this.renderBlockMenu();
-    this.blockMenu.hidden = false;
-    this.blockBtn.setAttribute('aria-expanded', 'true');
-    if (!this.blockMenuDocPointerDown) {
-      this.blockMenuDocPointerDown = (e: PointerEvent) => {
-        const t = e.target as Node;
-        if (this.blockMenu.contains(t) || this.blockBtn.contains(t)) return;
-        this.hideBlockMenu();
+  private railMenuSpec(key: RailMenuKey): RailMenuSpec {
+    let spec = this.railMenuSpecs.get(key);
+    if (!spec) {
+      spec = this.railMenus().find((entry) => entry.key === key)!;
+      this.railMenuSpecs.set(key, spec);
+    }
+    return spec;
+  }
+
+  private railMenuBtn(key: RailMenuKey): HTMLButtonElement {
+    return this.toolbar.querySelector(`button[data-rail-menu="${key}"]`) as HTMLButtonElement;
+  }
+
+  private railMenuPopup(key: RailMenuKey): HTMLElement {
+    return this.toolbar.querySelector(`[data-rail-popup="${key}"]`) as HTMLElement;
+  }
+
+  private bindRailMenus(): void {
+    for (const spec of this.railMenus()) {
+      const btn = this.railMenuBtn(spec.key);
+      const popup = this.railMenuPopup(spec.key);
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.hideToolbarTip();
+        if (popup.hidden) {
+          // Only ever one menu at a time.
+          this.hideRailMenu();
+          this.showRailMenu(spec.key);
+        } else {
+          this.hideRailMenu();
+        }
+      });
+      popup.addEventListener('click', (e) => {
+        const target = e.target as HTMLElement;
+        if (target.closest('[data-menu-back]')) {
+          e.preventDefault();
+          this.renderRailMenu(spec.key, 'tools');
+          return;
+        }
+        const item = target.closest('button[data-menu-item]') as HTMLButtonElement | null;
+        if (!item) return;
+        e.preventDefault();
+        this.chooseRailEntry(spec.key, item.dataset.menuItem ?? '');
+      });
+    }
+  }
+
+  private showRailMenu(key: RailMenuKey): void {
+    this.renderRailMenu(key, 'tools');
+    this.railMenuPopup(key).hidden = false;
+    this.railMenuBtn(key).setAttribute('aria-expanded', 'true');
+    if (!this.railMenuDocPointerDown) {
+      this.railMenuDocPointerDown = (e: PointerEvent) => {
+        const target = e.target as Node;
+        for (const spec of this.railMenus()) {
+          if (this.railMenuPopup(spec.key).contains(target) || this.railMenuBtn(spec.key).contains(target)) return;
+        }
+        this.hideRailMenu();
       };
-      document.addEventListener('pointerdown', this.blockMenuDocPointerDown, true);
+      document.addEventListener('pointerdown', this.railMenuDocPointerDown, true);
     }
   }
 
-  private hideBlockMenu(): void {
-    this.blockMenu.hidden = true;
-    this.blockBtn.setAttribute('aria-expanded', 'false');
-    if (this.blockMenuDocPointerDown) {
-      document.removeEventListener('pointerdown', this.blockMenuDocPointerDown, true);
-      this.blockMenuDocPointerDown = null;
+  private hideRailMenu(): void {
+    for (const spec of this.railMenus()) {
+      this.railMenuPopup(spec.key).hidden = true;
+      this.railMenuBtn(spec.key).setAttribute('aria-expanded', 'false');
+    }
+    if (this.railMenuDocPointerDown) {
+      document.removeEventListener('pointerdown', this.railMenuDocPointerDown, true);
+      this.railMenuDocPointerDown = null;
     }
   }
 
-  private renderBlockMenu(): void {
-    const menu = this.blockMenu;
-    menu.innerHTML = '';
+  private renderRailMenu(key: RailMenuKey, viewName: string): void {
+    const spec = this.railMenuSpec(key);
+    const views = spec.views();
+    const view = views[viewName] ?? views.tools;
+    // Whichever view is on screen is the one a row click belongs to.
+    this.railMenuView.set(key, viewName);
+    const popup = this.railMenuPopup(key);
+    popup.innerHTML = '';
+    if (viewName !== 'tools') popup.appendChild(this.railBackRow(spec));
+    if (view.render) {
+      view.render(popup);
+      return;
+    }
+    const active = view.active?.() ?? null;
+    for (const entry of view.entries ?? []) popup.appendChild(this.railMenuRow(entry, active));
+  }
+
+  private railBackRow(spec: RailMenuSpec): HTMLButtonElement {
+    const back = document.createElement('button');
+    back.type = 'button';
+    back.role = 'menuitem';
+    back.className = 'pattern-menu-back';
+    back.dataset.menuBack = '';
+    back.textContent = `‹ ${spec.label}`;
+    return back;
+  }
+
+  private railMenuRow(entry: RailMenuEntry, active: string | null): HTMLButtonElement {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.role = 'menuitem';
+    item.dataset.menuItem = entry.id;
+    item.dataset.tip = entry.desc;
+    item.classList.toggle('is-active', entry.id === active);
+    if (entry.icon) {
+      item.classList.add('has-icon');
+      const icon = document.createElement('span');
+      icon.className = 'pattern-menu-icon';
+      icon.setAttribute('aria-hidden', 'true');
+      icon.innerHTML = `<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">${entry.icon}</svg>`;
+      const text = document.createElement('span');
+      text.className = 'pattern-menu-text';
+      const name = document.createElement('span');
+      name.className = 'pattern-menu-name';
+      name.textContent = entry.name;
+      const desc = document.createElement('span');
+      desc.className = 'pattern-menu-desc';
+      desc.textContent = entry.desc;
+      text.append(name, desc);
+      item.append(icon, text);
+      return item;
+    }
+    const name = document.createElement('span');
+    name.className = 'pattern-menu-name';
+    name.textContent = entry.name;
+    const desc = document.createElement('span');
+    desc.className = 'pattern-menu-desc';
+    desc.textContent = entry.desc;
+    item.append(name, desc);
+    return item;
+  }
+
+  private chooseRailEntry(key: RailMenuKey, id: string): void {
+    const views = this.railMenuSpec(key).views();
+    const view = views[this.railMenuView.get(key) ?? 'tools'] ?? views.tools;
+    const entry = (view.entries ?? []).find((candidate) => candidate.id === id);
+    if (!entry) return;
+    if (entry.view) {
+      this.renderRailMenu(key, entry.view);
+      return;
+    }
+    this.hideRailMenu();
+    view.choose?.(id);
+  }
+
+  /** The rail buttons carry the tool in hand; the open popup carries its mark. */
+  private syncRailMenus(): void {
+    for (const spec of this.railMenus()) {
+      const btn = this.railMenuBtn(spec.key);
+      const tip = spec.toolTip();
+      const text = tip ?? spec.tip;
+      btn.dataset.tip = text;
+      btn.setAttribute('aria-label', spec.label);
+      btn.classList.toggle('active', !!tip);
+      const view = this.railMenuView.get(spec.key) ?? 'tools';
+      if (!this.railMenuPopup(spec.key).hidden) this.renderRailMenu(spec.key, view);
+    }
+  }
+
+  private renderBlockMenu(host: HTMLElement): void {
+    const menu = document.createElement('div');
+    menu.className = 'pattern-block-menu';
+    host.appendChild(menu);
     if (BLOCK_DEFINITIONS.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'pattern-block-menu-empty';
@@ -3775,7 +5027,7 @@ export class PatternEditor {
       desc.textContent = definition.description;
       item.append(name, desc);
       item.addEventListener('click', () => {
-        this.hideBlockMenu();
+        this.hideRailMenu();
         this.addBlock(definition.id);
       });
       menu.appendChild(item);
@@ -4792,6 +6044,11 @@ export class PatternEditor {
     if (e.button !== 0) return;
     e.stopPropagation();
 
+    // A preview is not committed until Done: any fresh gesture on the canvas
+    // (a new pick, a point drag) means the draftsperson has moved on, so put the
+    // points back before the gesture is read against them.
+    if (this.simplify) this.cancelSimplify();
+
     const target = e.target as SVGElement;
     const kind = target.dataset?.kind;
     const pointId = target.dataset?.pointId;
@@ -4815,6 +6072,47 @@ export class PatternEditor {
       }
     }
 
+    // ⌘/Ctrl-click with the move tool drops a new point on the edge under the
+    // pointer, the pen's edge insert without leaving the tool. A press that
+    // lands on a point or handle keeps its own meaning.
+    if (this.tool === 'move' && (e.metaKey || e.ctrlKey) && kind !== 'anchor' && kind !== 'handleIn' && kind !== 'handleOut') {
+      const edge = this.edgeNear(p, [this.pieceAt(e.target, p), ...this.pattern.pieces]);
+      const pt = edge ? this.insertEdgePoint(edge.piece, edge.edgeIndex, edge.point) : null;
+      if (pt && edge) {
+        this.selectOnly(pt.id, edge.piece.id);
+        this.drag = {
+          type: 'moveSelection',
+          start: p,
+          snapshots: this.snapshotSelection(),
+        };
+        this.svg.setPointerCapture(e.pointerId);
+        e.preventDefault();
+        this.cbs.onChange();
+        this.redraw();
+        return;
+      }
+    }
+
+    // Cmd/Ctrl is the panel modifier: the press takes the panel under the pointer
+    // in or out of the selection, and a drag from there is a rectangle over whole
+    // panels. A press that lands on an edge still drops a point (just above), and
+    // a generated block keeps its own intercept (just below).
+    if (this.tool === 'move' && (e.metaKey || e.ctrlKey) && !this.blockForPiece(pieceId)) {
+      const piece = this.pieceAt(e.target, p);
+      this.drag = {
+        type: 'marquee',
+        start: p,
+        current: p,
+        additive: false,
+        panels: true,
+        togglePieceId: piece?.id,
+      };
+      this.svg.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      this.redraw();
+      return;
+    }
+
     // The sew tool works on the *edges* of a piece, not on the shape inside it,
     // so it has to be offered the click before the block intercept below. A
     // block's outline is exactly what you sew its pieces together by; letting
@@ -4822,6 +6120,21 @@ export class PatternEditor {
     if (this.tool === 'sew') {
       this.setRulerSelection(null);
       this.onSewDown(p);
+      return;
+    }
+
+    // Join works on edges too, and on whole ones: which half a click lands on
+    // says nothing about a fuse, so the pick is the edge itself.
+    if (this.tool === 'join') {
+      this.setRulerSelection(null);
+      this.onJoinDown(p);
+      return;
+    }
+
+    // A bridge is picked the same way a fuse is, edge by whole edge.
+    if (this.tool === 'bridge') {
+      this.setRulerSelection(null);
+      this.onBridgeDown(p);
       return;
     }
 
@@ -4862,6 +6175,11 @@ export class PatternEditor {
 
     if (this.tool === 'pen') {
       this.onPenDown(e, p);
+      return;
+    }
+
+    if (this.tool === 'extrude') {
+      this.onExtrudeDown(e, p);
       return;
     }
 
@@ -5011,20 +6329,8 @@ export class PatternEditor {
         return;
       }
 
-      // Bend / other: single-point select + drag
+      // Every other tool picks the one point and drags it.
       this.selectOnly(pointId, pieceId);
-      const piece = this.pattern.pieces.find((x) => x.id === pieceId)!;
-      const pt = piece.points.find((x) => x.id === pointId)!;
-
-      if (this.tool === 'bend') {
-        if (!pt.handleIn && !pt.handleOut) {
-          this.markBeforeChange();
-          this.createDefaultHandles(piece, pt);
-          pt.handlesParallel = false;
-          this.cbs.onChange();
-        }
-      }
-
       this.markBeforeChange();
       this.markBeforeChange();
       this.drag = {
@@ -5037,27 +6343,14 @@ export class PatternEditor {
       return;
     }
 
-    // Bend: click empty path area near a segment midpoint → bend that edge
-    if (this.tool === 'bend') {
-      this.markBeforeChange();
-      const bent = this.bendNearestSegment(p);
-      if (bent) {
-        this.cbs.onChange();
-        this.endHistoryGesture();
-        this.redraw();
-      } else {
-        this.endHistoryGesture();
-      }
-      return;
-    }
-
     // Move tool: empty drag → marquee
     if (this.tool === 'move') {
       this.drag = {
         type: 'marquee',
         start: p,
         current: p,
-        additive: e.shiftKey,
+        additive: e.shiftKey && !(e.metaKey || e.ctrlKey),
+        panels: e.metaKey || e.ctrlKey,
       };
       this.svg.setPointerCapture(e.pointerId);
       e.preventDefault();
@@ -5081,6 +6374,237 @@ export class PatternEditor {
     this.redraw();
   }
 
+  /**
+   * Extrude an edge: drag away from it and the outline grows a copy of it, joined
+   * back to the original endpoints by two new edges — the tab a 3D modeller gets
+   * from extruding an edge. Like the shape tools nothing is written until the
+   * drag is released, so a click without a drag leaves the piece alone.
+   */
+  private onExtrudeDown(e: PointerEvent, p: Vec2): void {
+    const edge = this.extrudeEdgeAt(p);
+    if (!edge) return;
+    this.drag = {
+      type: 'extrudeEdge',
+      pieceId: edge.pieceId,
+      fromPointId: edge.fromPointId,
+      toPointId: edge.toPointId,
+      start: p,
+      current: p,
+    };
+    this.svg.setPointerCapture(e.pointerId);
+    e.preventDefault();
+    this.redraw();
+  }
+
+  /**
+   * The edge under the pointer, across every piece. Generated (block) geometry is
+   * skipped: it is rebuilt from its variables, so a new edge there would not
+   * survive the next regeneration.
+   */
+  /** Loop knife modes cut from a hovered edge rather than from a drag. */
+  private isLoopKnife(): boolean {
+    return this.tool === 'knife' && (this.knifeMode === 'loop' || this.knifeMode === 'loop-straight');
+  }
+
+  /**
+   * The cut the pointer would make: on the nearest outline edge within reach,
+   * square to it, across to the far side. Follow mode bends it with the piece's
+   * contours — see `loopCutAt`.
+   */
+  private loopCutAtPointer(p: Vec2): {
+    pieceId: string;
+    edgeIndex: number;
+    t: number;
+    cut: LoopCut;
+  } | null {
+    const hit = this.findNearestEdgeAcrossPieces(p);
+    if (!hit || this.isGeneratedPiece(hit.piece.id)) return null;
+    const cut = loopCutAt(hit.piece, {
+      edgeIndex: hit.edgeIndex,
+      t: hit.t,
+      follow: this.knifeMode === 'loop',
+    });
+    if (!cut) return null;
+    return { pieceId: hit.piece.id, edgeIndex: hit.edgeIndex, t: hit.t, cut };
+  }
+
+  private extrudeEdgeAt(p: Vec2): PieceEdge | null {
+    const hit = this.findNearestEdgeAcrossPieces(p);
+    if (!hit || this.isGeneratedPiece(hit.piece.id)) return null;
+    return {
+      pieceId: hit.piece.id,
+      fromPointId: hit.fromPointId,
+      toPointId: hit.toPointId,
+    };
+  }
+
+  /**
+   * Resolve a live extrude drag against the current document: the edge's two
+   * anchors and the offset the pointer has pulled them by. Ids are re-resolved
+   * rather than remembered, so a drag can never splice into a stale index.
+   */
+  private extrudeEdgeRef(drag: Extract<DragKind, { type: 'extrudeEdge' }>): {
+    piece: PatternPiece;
+    edgeIndex: number;
+    a: BezierPoint;
+    b: BezierPoint;
+    offset: Vec2;
+  } | null {
+    const piece = this.pattern.pieces.find((x) => x.id === drag.pieceId);
+    if (!piece) return null;
+    const edgeIndex = edgeIndexForPointIds(piece, drag.fromPointId, drag.toPointId);
+    if (edgeIndex === null) return null;
+    const n = piece.points.length;
+    const a = piece.points[edgeIndex];
+    const b = piece.points[(edgeIndex + 1) % n];
+    if (!a || !b) return null;
+    return {
+      piece,
+      edgeIndex,
+      a,
+      b,
+      offset: { x: drag.current.x - drag.start.x, y: drag.current.y - drag.start.y },
+    };
+  }
+
+  private finishExtrudeEdge(drag: Extract<DragKind, { type: 'extrudeEdge' }>): void {
+    const ref = this.extrudeEdgeRef(drag);
+    if (!ref || Math.hypot(ref.offset.x, ref.offset.y) < this.hitRadius() * 0.5) {
+      this.endHistoryGesture();
+      return;
+    }
+    const { piece, edgeIndex, a, b, offset } = ref;
+    // The copy carries the edge's own shape: handles travel with it, so a curved
+    // edge extrudes as a parallel curve rather than as its chord.
+    const carried = (handle: Vec2 | null): Vec2 | null =>
+      handle ? { x: handle.x + offset.x, y: handle.y + offset.y } : null;
+    const insertA: BezierPoint = {
+      id: uid('pt'),
+      anchor: { x: a.anchor.x + offset.x, y: a.anchor.y + offset.y },
+      handleIn: null,
+      handleOut: carried(a.handleOut),
+      handlesParallel: false,
+    };
+    const insertB: BezierPoint = {
+      id: uid('pt'),
+      anchor: { x: b.anchor.x + offset.x, y: b.anchor.y + offset.y },
+      handleIn: carried(b.handleIn),
+      handleOut: null,
+      handlesParallel: false,
+    };
+    this.markBeforeChange();
+    // The two edges leading in and out of the tab are straight, so whatever
+    // curvature the base edge had goes with the copy.
+    a.handleOut = null;
+    b.handleIn = null;
+    piece.points.splice(edgeIndex + 1, 0, insertA, insertB);
+    this.setSelection([insertA.id, insertB.id], insertB.id);
+    this.selectedPieceId = piece.id;
+    this.cbs.onChange();
+    this.endHistoryGesture();
+  }
+
+  /** The edge a click would extrude, lit up under the pointer. */
+  private drawExtrudeHover(hover: PieceEdge): void {
+    // The seam tool's edge-stroking routine, asked for the whole edge (0 → 1).
+    this.drawSeamEdgeStroke({ ...hover, t0: 0, t1: 1 }, 'pattern-extrude-hover', false);
+  }
+
+  /** The tab being pulled out: the raised copy of the edge and its connectors. */
+  private drawExtrudePreview(drag: Extract<DragKind, { type: 'extrudeEdge' }>): void {
+    const ref = this.extrudeEdgeRef(drag);
+    if (!ref) return;
+    const samples = sampleEdgeByPointIds(
+      ref.piece,
+      drag.fromPointId,
+      drag.toPointId,
+      EXTRUDE_PREVIEW_STEPS
+    );
+    if (!samples || samples.length < 2) return;
+    const sw = this.px(1.5);
+    const dash = `${this.px(5)} ${this.px(3.5)}`;
+
+    const edge = svgEl('polyline');
+    edge.setAttribute(
+      'points',
+      samples.map((pt) => `${pt.x + ref.offset.x},${pt.y + ref.offset.y}`).join(' ')
+    );
+    edge.setAttribute('class', 'pattern-extrude-preview');
+    edge.setAttribute('stroke-width', String(sw));
+    edge.setAttribute('stroke-dasharray', dash);
+    edge.setAttribute('pointer-events', 'none');
+    this.svg.appendChild(edge);
+
+    for (const end of [ref.a, ref.b]) {
+      const tip = { x: end.anchor.x + ref.offset.x, y: end.anchor.y + ref.offset.y };
+      const connector = svgEl('line');
+      connector.setAttribute('x1', String(end.anchor.x));
+      connector.setAttribute('y1', String(end.anchor.y));
+      connector.setAttribute('x2', String(tip.x));
+      connector.setAttribute('y2', String(tip.y));
+      connector.setAttribute('class', 'pattern-extrude-preview');
+      connector.setAttribute('stroke-width', String(sw));
+      connector.setAttribute('stroke-dasharray', dash);
+      connector.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(connector);
+
+      const dot = svgEl('circle');
+      dot.setAttribute('cx', String(tip.x));
+      dot.setAttribute('cy', String(tip.y));
+      dot.setAttribute('r', String(this.px(3.5)));
+      dot.setAttribute('class', 'pattern-extrude-point');
+      dot.setAttribute('stroke-width', String(this.px(1.2)));
+      dot.setAttribute('pointer-events', 'none');
+      this.svg.appendChild(dot);
+    }
+  }
+
+  /**
+   * Every edge within a screen-space threshold of a point, nearest first.
+   *
+   * A list rather than one edge because edges can be *on top of each other*: two
+   * pieces laid out along the same boundary — which is exactly how a piece split
+   * in two for drafting is drawn — put two edges in the same place, and only the
+   * caller knows which of them it means.
+   */
+  private edgesNear(p: Vec2): Array<{
+    piece: PatternPiece;
+    edgeIndex: number;
+    fromPointId: string;
+    toPointId: string;
+    /** Where along that edge the point is, in the edge's own winding. */
+    t: number;
+    dist: number;
+  }> {
+    const threshold = Math.max(0.5, 12 / this.screenToPatternScale());
+    const hits: Array<{
+      piece: PatternPiece;
+      edgeIndex: number;
+      fromPointId: string;
+      toPointId: string;
+      t: number;
+      dist: number;
+    }> = [];
+    for (const piece of this.pattern.pieces) {
+      if (piece.points.length < 2) continue;
+      const hit = findNearestEdge(piece.points, piece.closed, p);
+      if (!hit || hit.dist > threshold) continue;
+      const n = piece.points.length;
+      const a = piece.points[hit.edgeIndex];
+      const b = piece.points[(hit.edgeIndex + 1) % n];
+      hits.push({
+        piece,
+        edgeIndex: hit.edgeIndex,
+        fromPointId: a.id,
+        toPointId: b.id,
+        t: hit.t,
+        dist: hit.dist,
+      });
+    }
+    hits.sort((a, b) => a.dist - b.dist);
+    return hits;
+  }
+
   /** Nearest edge across all pieces within a screen-space threshold. */
   private findNearestEdgeAcrossPieces(p: Vec2): {
     piece: PatternPiece;
@@ -5091,34 +6615,7 @@ export class PatternEditor {
     t: number;
     dist: number;
   } | null {
-    const threshold = Math.max(0.5, 12 / this.screenToPatternScale());
-    let best: {
-      piece: PatternPiece;
-      edgeIndex: number;
-      fromPointId: string;
-      toPointId: string;
-      t: number;
-      dist: number;
-    } | null = null;
-    for (const piece of this.pattern.pieces) {
-      if (piece.points.length < 2) continue;
-      const hit = findNearestEdge(piece.points, piece.closed, p);
-      if (!hit || hit.dist > threshold) continue;
-      if (!best || hit.dist < best.dist) {
-        const n = piece.points.length;
-        const a = piece.points[hit.edgeIndex];
-        const b = piece.points[(hit.edgeIndex + 1) % n];
-        best = {
-          piece,
-          edgeIndex: hit.edgeIndex,
-          fromPointId: a.id,
-          toPointId: b.id,
-          t: hit.t,
-          dist: hit.dist,
-        };
-      }
-    }
-    return best;
+    return this.edgesNear(p)[0] ?? null;
   }
 
   private sameEdge(a: HoverEdge | SeamEdgeRef, b: HoverEdge | SeamEdgeRef): boolean {
@@ -5418,6 +6915,726 @@ export class PatternEditor {
     this.redraw();
   }
 
+  // ── Join ─────────────────────────────────────────────────────────────────
+  // Fusing two pieces along picked edges, like welding two boundaries in a 3D
+  // modeller: the first piece picked moves (and bends, and scales) until its
+  // edge lies on the second piece's, and the two become one outline.
+
+  private setJoinMode(mode: JoinMode): void {
+    if (this.joinMode !== mode) this.clearJoin();
+    this.joinMode = mode;
+    this.syncJoinToolbar();
+    this.redraw();
+  }
+
+  private setJoinFit(fit: JoinFit): void {
+    if (this.joinFit === fit) return;
+    this.joinFit = fit;
+    this.joinSettingsChanged();
+  }
+
+  private setJoinTolerance(cm: number): void {
+    const next = Math.max(0, Math.min(100, cm));
+    if (next === this.joinTolerance) return;
+    this.joinTolerance = next;
+    this.joinSettingsChanged();
+  }
+
+  /**
+   * A change of fit or tolerance re-reads the picks against it: the outline on
+   * screen, and the reason a join is being refused, are both that answer.
+   */
+  private joinSettingsChanged(): void {
+    this.syncJoinPreview();
+    this.syncJoinToolbar();
+    this.redraw();
+  }
+
+  /** True while the tool in hand has settings of its own, which own the popover. */
+  private hasToolSettings(): boolean {
+    return this.tool === 'join';
+  }
+
+  /**
+   * Keep the settings popover up to date: it is only there for the tools that
+   * have settings, and it shows what the join is set to.
+   */
+  private syncToolSettings(): void {
+    if (!this.toolSettings) return;
+    const showing = this.hasToolSettings();
+    this.toolSettings.hidden = !showing;
+    if (!showing) return;
+    this.toolSettings.querySelectorAll('button[data-join-mode]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.classList.toggle('is-active', btn.dataset.joinMode === this.joinMode);
+    });
+    this.toolSettings.querySelectorAll('button[data-join-fit]').forEach((el) => {
+      const btn = el as HTMLButtonElement;
+      btn.classList.toggle('is-active', btn.dataset.joinFit === this.joinFit);
+    });
+    const tolerance = this.toolSettings.querySelector(
+      'input[data-join-tolerance]'
+    ) as HTMLInputElement;
+    // Left alone while it is being typed in, or the field would fight the hand.
+    if (document.activeElement !== tolerance) tolerance.value = String(this.joinTolerance);
+    const matching = this.joinFit === 'match';
+    tolerance.disabled = !matching;
+    tolerance.closest('label')?.classList.toggle('is-disabled', !matching);
+  }
+
+  /** The Modify menu carries the mode, so this just keeps the bar and rail current. */
+  private syncJoinToolbar(): void {
+    this.syncJoinBar();
+    this.syncRailMenus();
+  }
+
+  /** Throw the picks away — Cancel, Escape, undo, or the tool going out of hand. */
+  private clearJoin(): void {
+    this.joinMove = [];
+    this.joinKeep = [];
+    this.joinPhase = 'move';
+    this.joinPreview = { piece: null, reason: null, gap: 0 };
+    this.syncJoinBar();
+  }
+
+  /**
+   * Which side a click lands on. The piece decides, not the order of clicks
+   * after the first: one piece moves and the other stays, so edges of the first
+   * piece picked are the moving side however they are clicked, and a piece
+   * nobody has picked yet becomes the side that stays.
+   */
+  private joinSideFor(pieceId: string): 'move' | 'keep' | 'restart' {
+    if (this.joinMove.length === 0) return 'move';
+    if (this.joinMove[0].pieceId === pieceId) return 'move';
+    if (this.joinKeep.length === 0) return 'keep';
+    if (this.joinKeep[0].pieceId === pieceId) return 'keep';
+    return 'restart';
+  }
+
+  private toggleJoinPick(edge: SeamEdgeRef): void {
+    const onMove = this.edgeIn(this.joinMove, edge);
+    if (onMove >= 0) {
+      this.joinMove.splice(onMove, 1);
+      // A fuse needs a side that moves, so the side left over becomes it.
+      if (this.joinMove.length === 0) {
+        this.joinMove = this.joinKeep;
+        this.joinKeep = [];
+        this.joinPhase = 'move';
+      }
+      return;
+    }
+    const onKeep = this.edgeIn(this.joinKeep, edge);
+    if (onKeep >= 0) {
+      this.joinKeep.splice(onKeep, 1);
+      return;
+    }
+    switch (this.joinSideFor(edge.pieceId)) {
+      case 'move':
+        if (this.joinMode === 'many') this.joinMove.push(edge);
+        else this.joinMove = [edge];
+        this.joinPhase = 'move';
+        break;
+      case 'keep':
+        if (this.joinMode === 'many') this.joinKeep.push(edge);
+        else this.joinKeep = [edge];
+        this.joinPhase = 'keep';
+        break;
+      default:
+        // A third piece: start a new fuse rather than guess which pick to drop.
+        this.joinMove = [edge];
+        this.joinKeep = [];
+        this.joinPhase = 'move';
+        break;
+    }
+  }
+
+  /**
+   * Many mode: through with the side that moves, now pick what it fuses onto.
+   * On a boundary the two pieces share there is no other way to say so.
+   */
+  /**
+   * Confirm the side in hand and pick the other one — the many-to-many button.
+   * It turns round once the picking has crossed over, so a run can be added to
+   * either side without starting the pick again.
+   */
+  private toggleJoinSide(): void {
+    if (this.tool !== 'join' || this.joinMode !== 'many') return;
+    if (this.joinPhase === 'move') {
+      if (this.joinMove.length === 0) return;
+      this.joinPhase = 'keep';
+    } else {
+      this.joinPhase = 'move';
+    }
+    this.hoverEdge = null;
+    this.syncJoinBar();
+    this.redraw();
+  }
+
+  /** Fuse the other piece onto this one instead — which piece moves is the choice. */
+  private swapJoinSides(): void {
+    if (this.joinMove.length === 0 || this.joinKeep.length === 0) return;
+    const move = this.joinMove;
+    this.joinMove = this.joinKeep;
+    this.joinKeep = move;
+    this.syncJoinPreview();
+    this.syncJoinBar();
+    this.redraw();
+  }
+
+  private describeJoinSide(edges: readonly SeamEdgeRef[]): string {
+    if (edges.length === 0) return 'nothing';
+    const name = this.pattern.pieces.find((p) => p.id === edges[0].pieceId)?.name ?? '?';
+    const count = edges.length === 1 ? '1 edge' : `${edges.length} edges`;
+    return `${name} · ${count}`;
+  }
+
+  private syncJoinBar(): void {
+    // The settings popover belongs to the same hand as this bar, so the two are
+    // kept current together.
+    this.syncToolSettings();
+    if (!this.joinBar) return;
+    const active = this.tool === 'join';
+    this.joinBar.hidden = !active;
+    if (!active) return;
+    const instruction = this.joinBar.querySelector('[data-join-instruction]') as HTMLElement;
+    const next = this.joinBar.querySelector('[data-join-next]') as HTMLButtonElement;
+    const swap = this.joinBar.querySelector('[data-join-swap]') as HTMLButtonElement;
+    const commit = this.joinBar.querySelector('[data-join-commit]') as HTMLButtonElement;
+    const cancel = this.joinBar.querySelector('[data-join-cancel]') as HTMLButtonElement;
+
+    const many = this.joinMode === 'many';
+    const bothPicked = this.joinMove.length > 0 && this.joinKeep.length > 0;
+    // Many-to-many is picked a side at a time, so it keeps a button to confirm
+    // the side in hand: one side picked, then the run it fuses onto. It stays in
+    // the bar for the whole pick so the hand-over is there to be found, and
+    // turns round afterwards to hand the picking back.
+    const onMoveSide = this.joinPhase === 'move';
+    const otherSidePicked = this.joinKeep.length > 0;
+    next.hidden = !many;
+    next.disabled = onMoveSide && this.joinMove.length === 0;
+    if (onMoveSide) {
+      next.textContent = otherSidePicked ? '→ Second side' : 'Confirm edges →';
+      next.title = otherSidePicked
+        ? 'Pick the run on the second piece again'
+        : 'Confirm the edges that move, then pick the run they fuse onto';
+    } else {
+      next.textContent = '← First side';
+      next.title = 'Pick more edges on the piece that moves — nothing is committed yet';
+    }
+    swap.disabled = !bothPicked;
+    commit.disabled = !bothPicked || !this.joinPreview.piece;
+    // Nothing picked is nothing to cancel, so the button stays out of reach
+    // until there is something to throw away.
+    cancel.disabled = !bothPicked && this.joinMove.length === 0 && this.joinKeep.length === 0;
+
+    if (!bothPicked) {
+      if (this.joinMove.length === 0) {
+        instruction.textContent = many
+          ? 'Click the edges that move, then Confirm edges for the run they fuse onto.'
+          : 'Click an edge on each piece. The first piece picked moves.';
+      } else if (this.joinPhase === 'move' && many) {
+        instruction.textContent = `Moves: ${this.describeJoinSide(this.joinMove)} — more edges, or Confirm edges`;
+      } else if (this.joinPhase === 'move') {
+        instruction.textContent = `Moves: ${this.describeJoinSide(this.joinMove)} — now click an edge on the other piece`;
+      } else {
+        instruction.textContent = `Moves ${this.describeJoinSide(this.joinMove)} — now click the edges it fuses onto`;
+      }
+    } else if (!this.joinPreview.piece) {
+      instruction.textContent = this.joinPreview.reason ?? 'Those edges cannot be fused';
+    } else {
+      const onto = `Moves ${this.describeJoinSide(this.joinMove)} onto ${this.describeJoinSide(this.joinKeep)}`;
+      // Say what the fuse is doing to the piece: bent onto the edges, or moved
+      // and scaled into place with whatever is left between the edges filled in.
+      const gap = this.joinPreview.gap;
+      if (this.joinFit === 'warp') {
+        instruction.textContent = onto;
+      } else if (gap >= 0.005) {
+        instruction.textContent = `${onto} · matched, filling ${formatLength(gap, this.unit, 2)}`;
+      } else {
+        instruction.textContent = `${onto} · matched`;
+      }
+    }
+    instruction.title = instruction.textContent;
+    instruction.classList.toggle('is-refused', bothPicked && !this.joinPreview.piece);
+  }
+
+  /** Work the fuse out ahead of committing, so the outline can be shown and said. */
+  private syncJoinPreview(): void {
+    if (this.joinMove.length === 0 || this.joinKeep.length === 0) {
+      this.joinPreview = { piece: null, reason: null, gap: 0 };
+      return;
+    }
+    const move = this.pattern.pieces.find((p) => p.id === this.joinMove[0].pieceId);
+    const keep = this.pattern.pieces.find((p) => p.id === this.joinKeep[0].pieceId);
+    if (!move || !keep) {
+      this.joinPreview = { piece: null, reason: 'Those pieces are no longer in the pattern', gap: 0 };
+      return;
+    }
+    const result = this.runJoin(move, keep);
+    this.joinPreview = result.ok
+      ? { piece: result.piece, reason: null, gap: result.gap }
+      : { piece: null, reason: this.joinRefusal(result), gap: 0 };
+  }
+
+  /** The fuse the picks and the settings in hand would make. */
+  private runJoin(move: PatternPiece, keep: PatternPiece): JoinResult {
+    return joinPieces(move, this.joinMove, keep, this.joinKeep, {
+      fit: this.joinFit,
+      tolerance: this.joinTolerance,
+    });
+  }
+
+  /**
+   * Why the fuse was refused, in the units the readouts use. A matched join that
+   * missed its tolerance is the one refusal worth putting numbers to, and those
+   * numbers are distances like any other.
+   */
+  private joinRefusal(result: Extract<JoinResult, { ok: false }>): string {
+    if (result.gap === undefined) return result.reason;
+    const gap = formatLength(result.gap, this.unit, 1);
+    const limit = formatLength(this.joinTolerance, this.unit, 1);
+    return `The edges would sit ${gap} apart — Move & scale matches within ${limit}. Raise the tolerance, or switch to Warp`;
+  }
+
+  /**
+   * The edge a join click means. Where two pieces share a boundary their edges
+   * are stacked, so the pick cannot just take the nearest: while the fusing side
+   * is still waiting for a partner, a click that lands on both means the other
+   * piece, and once both sides have something it means the side being worked on
+   * — otherwise a run of edges could never be picked along a shared boundary.
+   */
+  private joinEdgeAt(p: Vec2): {
+    piece: PatternPiece;
+    fromPointId: string;
+    toPointId: string;
+  } | null {
+    const hits = this.edgesNear(p);
+    const best = hits[0];
+    if (!best) return null;
+    const tied = hits.filter((hit) => hit.dist <= best.dist + 0.05);
+    // One edge each has no hand-over step, so a tie after the first pick has to
+    // mean the other piece. Edge runs do have one (Confirm edges), and there the
+    // tie belongs to the side still being worked on — otherwise a run along a
+    // shared boundary could never be picked past its first edge.
+    if (this.joinMode !== 'many' && this.joinMove.length > 0 && this.joinKeep.length === 0) {
+      const partner = tied.find((hit) => hit.piece.id !== this.joinMove[0].pieceId);
+      if (partner) return partner;
+    }
+    const onPhase = tied.filter((hit) => this.joinSideFor(hit.piece.id) === this.joinPhase);
+    const side = onPhase.length > 0 ? onPhase : tied;
+    // A piece already picked keeps the pick, so a click can take it back.
+    return side.find((hit) => this.joinSideFor(hit.piece.id) !== 'restart') ?? side[0];
+  }
+
+  private onJoinDown(p: Vec2): void {
+    const hit = this.joinEdgeAt(p);
+    if (!hit) return;
+    this.toggleJoinPick({
+      pieceId: hit.piece.id,
+      fromPointId: hit.fromPointId,
+      toPointId: hit.toPointId,
+      t0: 0,
+      t1: 1,
+    });
+    this.selectedPieceId = hit.piece.id;
+    this.syncJoinPreview();
+    this.syncJoinBar();
+    this.redraw();
+  }
+
+  private commitJoin(): void {
+    if (this.joinMove.length === 0 || this.joinKeep.length === 0) {
+      this.syncJoinBar();
+      return;
+    }
+    const move = this.pattern.pieces.find((p) => p.id === this.joinMove[0].pieceId);
+    const keep = this.pattern.pieces.find((p) => p.id === this.joinKeep[0].pieceId);
+    if (!move || !keep) return;
+    const result = this.runJoin(move, keep);
+    if (!result.ok) {
+      this.joinPreview = { piece: null, reason: this.joinRefusal(result), gap: 0 };
+      this.syncJoinBar();
+      this.redraw();
+      return;
+    }
+    const keepIndex = this.pattern.pieces.findIndex((p) => p.id === keep.id);
+    const moveIndex = this.pattern.pieces.findIndex((p) => p.id === move.id);
+    if (keepIndex < 0 || moveIndex < 0) return;
+
+    this.markBeforeChange();
+    // The fused piece takes the second piece's place in the pattern; the first
+    // piece is gone, its outline folded into the fused one.
+    this.pattern.pieces[keepIndex] = result.piece;
+    this.pattern.pieces.splice(moveIndex, 1);
+    // Downstream Transform 3D nodes hand the first piece's arrangement on.
+    this.pattern.pieceSuccessors = recordPieceSuccessors(
+      this.pattern.pieceSuccessors,
+      move.id,
+      [keep.id]
+    );
+
+    // Seams follow the pieces across the fuse. A seam on the moving piece is a
+    // seam on the fused piece; a seam whose end point was folded onto a
+    // neighbour is read at the point it became. What is left was on one of the
+    // two chains, which the fuse did away with.
+    const remapSeamEdge = (ref: SeamEdgeRef): SeamEdgeRef | null => {
+      let next: SeamEdgeRef = ref.pieceId === move.id ? { ...ref, pieceId: keep.id } : ref;
+      const fromPointId = result.idAliases[next.fromPointId];
+      const toPointId = result.idAliases[next.toPointId];
+      if (fromPointId || toPointId) {
+        next = {
+          ...next,
+          fromPointId: fromPointId ?? next.fromPointId,
+          toPointId: toPointId ?? next.toPointId,
+        };
+      }
+      return isSeamEdgeValid(this.pattern.pieces, next) ? next : null;
+    };
+    const seams: SeamBinding[] = [];
+    for (const seam of this.pattern.seams) {
+      const a = remapSeamEdge(seam.a);
+      const b = remapSeamEdge(seam.b);
+      if (!a || !b) continue;
+      seams.push(a === seam.a && b === seam.b ? seam : { ...seam, a, b });
+    }
+    this.pattern.seams = seams;
+
+    this.selectedPieceId = keep.id;
+    this.selectEntirePiece(result.piece);
+    this.clearJoin();
+    this.cbs.onChange();
+    this.endHistoryGesture();
+    this.redraw();
+  }
+
+  /** Ghost of the outline the picks would fuse into, so a fuse is never a surprise. */
+  private drawJoinPreview(piece: PatternPiece): void {
+    const poly = pieceToPolyline(piece.points, piece.closed, 8);
+    if (poly.length < 2) return;
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    let d = `M ${poly[0].x} ${poly[0].y}`;
+    for (let i = 1; i < poly.length; i++) d += ` L ${poly[i].x} ${poly[i].y}`;
+    path.setAttribute('d', `${d} Z`);
+    path.setAttribute('class', 'pattern-join-preview');
+    path.setAttribute('fill', 'none');
+    path.setAttribute('pointer-events', 'none');
+    path.setAttribute('stroke-width', String(this.px(2)));
+    this.svg.appendChild(path);
+  }
+
+
+  // ── Bridge ───────────────────────────────────────────────────────────────
+  // Closing the gap between two pieces with new edges, the way a modeller spans
+  // two boundaries with a strip of faces. Unlike a fuse, nothing moves: both
+  // outlines stay where they were drafted, and the two straight edges that
+  // close the gap are what the bridged piece gains.
+
+  private setBridgeMode(mode: JoinMode): void {
+    if (this.bridgeMode !== mode) this.clearBridge();
+    this.bridgeMode = mode;
+    this.syncBridgeToolbar();
+    this.redraw();
+  }
+
+  /** The Modify menu carries the mode, so this just keeps the bar and rail current. */
+  private syncBridgeToolbar(): void {
+    this.syncBridgeBar();
+    this.syncRailMenus();
+  }
+
+  /** Throw the picks away — Cancel, Escape, undo, or the tool going out of hand. */
+  private clearBridge(): void {
+    this.bridgeFirst = [];
+    this.bridgeSecond = [];
+    this.bridgePhase = 'first';
+    this.bridgePreview = { piece: null, reason: null };
+    this.syncBridgeBar();
+  }
+
+  /**
+   * Which side a click lands on. With two pieces the piece decides: the first
+   * one picked is the side that grows, and the other becomes the run it bridges
+   * to. Both runs may also be on one piece — a bay bridged across itself — so
+   * there the side being worked on decides instead, and in one-edge-each a
+   * second click on the first piece is the far side of its bay.
+   */
+  private bridgeSideFor(pieceId: string): 'first' | 'second' | 'restart' {
+    if (this.bridgeFirst.length === 0) return 'first';
+    const firstPiece = this.bridgeFirst[0].pieceId;
+    const secondPiece = this.bridgeSecond[0]?.pieceId ?? null;
+    if (this.bridgePhase === 'second') {
+      return !secondPiece || secondPiece === pieceId ? 'second' : 'restart';
+    }
+    if (pieceId !== firstPiece) {
+      return !secondPiece || secondPiece === pieceId ? 'second' : 'restart';
+    }
+    // The first piece again: either the run in hand is still being built, or the
+    // click is the far side of its own bay.
+    if (secondPiece && secondPiece !== pieceId) return 'first';
+    if (this.bridgeMode === 'many') return 'first';
+    return 'second';
+  }
+
+  private toggleBridgePick(edge: SeamEdgeRef): void {
+    const onFirst = this.edgeIn(this.bridgeFirst, edge);
+    if (onFirst >= 0) {
+      this.bridgeFirst.splice(onFirst, 1);
+      // A bridge still needs the piece that grows, so the side left over is it.
+      if (this.bridgeFirst.length === 0) {
+        this.bridgeFirst = this.bridgeSecond;
+        this.bridgeSecond = [];
+        this.bridgePhase = 'first';
+      }
+      return;
+    }
+    const onSecond = this.edgeIn(this.bridgeSecond, edge);
+    if (onSecond >= 0) {
+      this.bridgeSecond.splice(onSecond, 1);
+      return;
+    }
+    switch (this.bridgeSideFor(edge.pieceId)) {
+      case 'first':
+        if (this.bridgeMode === 'many') this.bridgeFirst.push(edge);
+        else this.bridgeFirst = [edge];
+        this.bridgePhase = 'first';
+        break;
+      case 'second':
+        if (this.bridgeMode === 'many') this.bridgeSecond.push(edge);
+        else this.bridgeSecond = [edge];
+        this.bridgePhase = 'second';
+        break;
+      default:
+        // A third piece: start a new bridge rather than guess which pick to drop.
+        this.bridgeFirst = [edge];
+        this.bridgeSecond = [];
+        this.bridgePhase = 'first';
+        break;
+    }
+  }
+
+  /**
+   * Confirm the side in hand and pick the other one, and back again: a run along
+   * a shared boundary can only be picked if the side being worked on owns the
+   * click, and the button is how the picking changes hands.
+   */
+  private toggleBridgeSide(): void {
+    if (this.tool !== 'bridge' || this.bridgeMode !== 'many') return;
+    if (this.bridgePhase === 'first') {
+      if (this.bridgeFirst.length === 0) return;
+      this.bridgePhase = 'second';
+    } else {
+      this.bridgePhase = 'first';
+    }
+    this.hoverEdge = null;
+    this.syncBridgeBar();
+    this.redraw();
+  }
+
+  private describeBridgeSide(edges: readonly SeamEdgeRef[]): string {
+    if (edges.length === 0) return 'nothing';
+    const name = this.pattern.pieces.find((p) => p.id === edges[0].pieceId)?.name ?? '?';
+    const count = edges.length === 1 ? '1 edge' : `${edges.length} edges`;
+    return `${name} · ${count}`;
+  }
+
+  private syncBridgeBar(): void {
+    if (!this.bridgeBar) return;
+    const active = this.tool === 'bridge';
+    this.bridgeBar.hidden = !active;
+    if (!active) return;
+    const instruction = this.bridgeBar.querySelector('[data-bridge-instruction]') as HTMLElement;
+    const next = this.bridgeBar.querySelector('[data-bridge-next]') as HTMLButtonElement;
+    const commit = this.bridgeBar.querySelector('[data-bridge-commit]') as HTMLButtonElement;
+    const cancel = this.bridgeBar.querySelector('[data-bridge-cancel]') as HTMLButtonElement;
+
+    const many = this.bridgeMode === 'many';
+    const bothPicked = this.bridgeFirst.length > 0 && this.bridgeSecond.length > 0;
+    const onFirstSide = this.bridgePhase === 'first';
+    const otherSidePicked = this.bridgeSecond.length > 0;
+    next.hidden = !many;
+    next.disabled = onFirstSide && this.bridgeFirst.length === 0;
+    if (onFirstSide) {
+      next.textContent = otherSidePicked ? '→ Second side' : 'Confirm edges →';
+      next.title = otherSidePicked
+        ? 'Pick the run on the second piece again'
+        : 'Confirm the edges picked, then pick the run they bridge to';
+    } else {
+      next.textContent = '← First side';
+      next.title = 'Pick more edges on the first piece — nothing is committed yet';
+    }
+    commit.disabled = !bothPicked || !this.bridgePreview.piece;
+    // Nothing picked is nothing to cancel.
+    cancel.disabled = this.bridgeFirst.length === 0 && this.bridgeSecond.length === 0;
+
+    if (!bothPicked) {
+      if (this.bridgeFirst.length === 0) {
+        instruction.textContent = many
+          ? 'Click a run, then Confirm edges for the run it bridges to.'
+          : 'Click a run, then the run it bridges to.';
+      } else if (this.bridgePhase === 'first' && many) {
+        instruction.textContent = `Spans: ${this.describeBridgeSide(this.bridgeFirst)} — more edges, or Confirm edges`;
+      } else if (this.bridgePhase === 'first') {
+        instruction.textContent = `Spans: ${this.describeBridgeSide(this.bridgeFirst)} — click the run it bridges to`;
+      } else {
+        instruction.textContent = `Spans ${this.describeBridgeSide(this.bridgeFirst)} — now click the edges it bridges to`;
+      }
+    } else if (!this.bridgePreview.piece) {
+      instruction.textContent = this.bridgePreview.reason ?? 'Those edges cannot be bridged';
+    } else if (this.bridgeFirst[0].pieceId === this.bridgeSecond[0].pieceId) {
+      const name =
+        this.pattern.pieces.find((p) => p.id === this.bridgeFirst[0].pieceId)?.name ?? '?';
+      const count = (edges: readonly SeamEdgeRef[]): string =>
+        edges.length === 1 ? '1 edge' : `${edges.length} edges`;
+      instruction.textContent = `Fills the bay in ${name}: ${count(this.bridgeFirst)} to ${count(this.bridgeSecond)}`;
+    } else {
+      instruction.textContent = `Bridge ${this.describeBridgeSide(this.bridgeFirst)} to ${this.describeBridgeSide(this.bridgeSecond)}`;
+    }
+    instruction.title = instruction.textContent;
+    instruction.classList.toggle('is-refused', bothPicked && !this.bridgePreview.piece);
+  }
+
+  /** Work the bridge out ahead of committing, so the outline can be shown and said. */
+  private syncBridgePreview(): void {
+    if (this.bridgeFirst.length === 0 || this.bridgeSecond.length === 0) {
+      this.bridgePreview = { piece: null, reason: null };
+      return;
+    }
+    const first = this.pattern.pieces.find((p) => p.id === this.bridgeFirst[0].pieceId);
+    const second = this.pattern.pieces.find((p) => p.id === this.bridgeSecond[0].pieceId);
+    if (!first || !second) {
+      this.bridgePreview = { piece: null, reason: 'Those pieces are no longer in the pattern' };
+      return;
+    }
+    const result = bridgePieces(first, this.bridgeFirst, second, this.bridgeSecond);
+    this.bridgePreview = result.ok
+      ? { piece: result.piece, reason: null }
+      : { piece: null, reason: result.reason };
+  }
+
+  /**
+   * The edge a bridge click means. Two pieces laid along the same boundary stack
+   * their edges, so while a partner is still wanted a click that lands on both
+   * means the other piece, and once both sides have something it means the side
+   * being worked on — otherwise a run along a shared boundary could not be picked
+   * past its first edge.
+   */
+  private bridgeEdgeAt(p: Vec2): {
+    piece: PatternPiece;
+    fromPointId: string;
+    toPointId: string;
+  } | null {
+    const hits = this.edgesNear(p);
+    const best = hits[0];
+    if (!best) return null;
+    const tied = hits.filter((hit) => hit.dist <= best.dist + 0.05);
+    if (this.bridgeMode !== 'many' && this.bridgeFirst.length > 0 && this.bridgeSecond.length === 0) {
+      const partner = tied.find((hit) => hit.piece.id !== this.bridgeFirst[0].pieceId);
+      if (partner) return partner;
+    }
+    const onPhase = tied.filter((hit) => this.bridgeSideFor(hit.piece.id) === this.bridgePhase);
+    const side = onPhase.length > 0 ? onPhase : tied;
+    // A piece already picked keeps the pick, so a click can take it back.
+    return side.find((hit) => this.bridgeSideFor(hit.piece.id) !== 'restart') ?? side[0];
+  }
+
+  private onBridgeDown(p: Vec2): void {
+    const hit = this.bridgeEdgeAt(p);
+    if (!hit) return;
+    this.toggleBridgePick({
+      pieceId: hit.piece.id,
+      fromPointId: hit.fromPointId,
+      toPointId: hit.toPointId,
+      t0: 0,
+      t1: 1,
+    });
+    this.selectedPieceId = hit.piece.id;
+    this.syncBridgePreview();
+    this.syncBridgeBar();
+    this.redraw();
+  }
+
+  private commitBridge(): void {
+    if (this.bridgeFirst.length === 0 || this.bridgeSecond.length === 0) {
+      this.syncBridgeBar();
+      return;
+    }
+    const first = this.pattern.pieces.find((p) => p.id === this.bridgeFirst[0].pieceId);
+    const second = this.pattern.pieces.find((p) => p.id === this.bridgeSecond[0].pieceId);
+    if (!first || !second) return;
+    const result = bridgePieces(first, this.bridgeFirst, second, this.bridgeSecond);
+    if (!result.ok) {
+      this.bridgePreview = { piece: null, reason: result.reason };
+      this.syncBridgeBar();
+      this.redraw();
+      return;
+    }
+    const secondIndex = this.pattern.pieces.findIndex((p) => p.id === second.id);
+    const firstIndex = this.pattern.pieces.findIndex((p) => p.id === first.id);
+    const foldingIn = result.bridgedPieceId !== null;
+    if (secondIndex < 0 || (foldingIn && firstIndex < 0)) return;
+
+    this.markBeforeChange();
+    // The bridged piece takes the second piece's place; when the two runs were
+    // on separate pieces the first one's outline is part of it now, at the size
+    // and place it was drafted at.
+    this.pattern.pieces[secondIndex] = result.piece;
+    if (foldingIn) {
+      this.pattern.pieces.splice(firstIndex, 1);
+      // Downstream Transform 3D nodes hand the first piece's arrangement on.
+      this.pattern.pieceSuccessors = recordPieceSuccessors(
+        this.pattern.pieceSuccessors,
+        first.id,
+        [second.id]
+      );
+    }
+
+    // Seams follow the pieces across the bridge: both outlines are still there,
+    // point for point. Only the runs are gone — those edges are interior now.
+    const remapSeamEdge = (ref: SeamEdgeRef): SeamEdgeRef | null => {
+      let next: SeamEdgeRef = ref.pieceId === first.id ? { ...ref, pieceId: second.id } : ref;
+      const fromPointId = result.idAliases[next.fromPointId];
+      const toPointId = result.idAliases[next.toPointId];
+      if (fromPointId || toPointId) {
+        next = {
+          ...next,
+          fromPointId: fromPointId ?? next.fromPointId,
+          toPointId: toPointId ?? next.toPointId,
+        };
+      }
+      return isSeamEdgeValid(this.pattern.pieces, next) ? next : null;
+    };
+    const seams: SeamBinding[] = [];
+    for (const seam of this.pattern.seams) {
+      const a = remapSeamEdge(seam.a);
+      const b = remapSeamEdge(seam.b);
+      if (!a || !b) continue;
+      seams.push(a === seam.a && b === seam.b ? seam : { ...seam, a, b });
+    }
+    this.pattern.seams = seams;
+
+    this.selectedPieceId = second.id;
+    this.selectEntirePiece(result.piece);
+    this.clearBridge();
+    this.cbs.onChange();
+    this.endHistoryGesture();
+    this.redraw();
+  }
+
+  /** Ghost of the outline the picks would bridge into, so a bridge is never a surprise. */
+  private drawBridgePreview(piece: PatternPiece): void {
+    const poly = pieceToPolyline(piece.points, piece.closed, 8);
+    if (poly.length < 2) return;
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    let d = `M ${poly[0].x} ${poly[0].y}`;
+    for (let i = 1; i < poly.length; i++) d += ` L ${poly[i].x} ${poly[i].y}`;
+    path.setAttribute('d', `${d} Z`);
+    path.setAttribute('class', 'pattern-bridge-preview');
+    path.setAttribute('fill', 'none');
+    path.setAttribute('pointer-events', 'none');
+    path.setAttribute('stroke-width', String(this.px(2)));
+    this.svg.appendChild(path);
+  }
+
   private drawSeams(): void {
     if (this.seamConnectorsOn) {
       drawMeshSeamConnectors(this.svg, this.pattern, {
@@ -5443,6 +7660,18 @@ export class PatternEditor {
       this.drawSeamEdgeStroke(edge, 'pattern-seam-pending pattern-seam-multi-source', true);
     }
     for (const edge of this.multiSewTarget) {
+      this.drawSeamEdgeStroke(edge, 'pattern-seam-pending pattern-seam-multi-target', true);
+    }
+    for (const edge of this.joinMove) {
+      this.drawSeamEdgeStroke(edge, 'pattern-seam-pending pattern-seam-multi-source', true);
+    }
+    for (const edge of this.joinKeep) {
+      this.drawSeamEdgeStroke(edge, 'pattern-seam-pending pattern-seam-multi-target', true);
+    }
+    for (const edge of this.bridgeFirst) {
+      this.drawSeamEdgeStroke(edge, 'pattern-seam-pending pattern-seam-multi-source', true);
+    }
+    for (const edge of this.bridgeSecond) {
       this.drawSeamEdgeStroke(edge, 'pattern-seam-pending pattern-seam-multi-target', true);
     }
 
@@ -5589,8 +7818,60 @@ export class PatternEditor {
     }
   }
 
+  /**
+   * The pen acts on the piece the click lands on, not on whichever panel happens
+   * to be selected: that was how a point aimed at one piece used to land on
+   * another (or, when the selected ring was closed, vanish entirely).
+   *
+   * Alt is the pan gesture and never reaches here — see `onPointerDown`. Points
+   * come off with Delete / Backspace, like any other selection.
+   */
   private onPenDown(e: PointerEvent, p: Vec2): void {
-    let piece = this.activePiece();
+    // Clicking an existing anchor selects it (don't add a duplicate)
+    const nearAnchor = this.findPointNear(p);
+    if (nearAnchor) {
+      const { piece, point } = nearAnchor;
+      // Close open path by clicking first point
+      if (!piece.closed && piece.points.length >= 3 && point.id === piece.points[0].id) {
+        this.markBeforeChange();
+        piece.closed = true;
+        this.penStrokeId = null;
+        this.selectOnly(point.id, piece.id);
+        this.cbs.onChange();
+        this.endHistoryGesture();
+        this.redraw();
+        return;
+      }
+      this.selectOnly(point.id, piece.id);
+      this.redraw();
+      return;
+    }
+
+    const under = this.pieceAt(e.target, p);
+
+    // Figma: click on a segment → insert a point ON that segment. Any piece's
+    // outline will take it, so a panel you never selected is still editable.
+    const edge = this.edgeNear(p, [this.penStrokePiece(), under, ...this.pattern.pieces]);
+    if (edge) {
+      this.insertPenPoint(e, edge.piece, edge.edgeIndex, edge.point);
+      return;
+    }
+
+    if (under) {
+      // An open path has an end to append to; a closed ring does not, so the new
+      // point goes onto its outline instead (a point dropped inside the fill has
+      // nowhere else to belong).
+      if (!under.closed) {
+        this.appendPenPoint(e, under, p);
+        return;
+      }
+      const own = findNearestEdge(under.points, under.closed, p);
+      if (own) this.insertPenPoint(e, under, own.edgeIndex, own.point);
+      return;
+    }
+
+    // Empty canvas: carry on with the path in hand, or start a new one.
+    let piece = this.penStrokePiece();
     if (!piece) {
       this.markBeforeChange();
       piece = {
@@ -5602,101 +7883,135 @@ export class PatternEditor {
       this.pattern.pieces.push(piece);
       this.selectedPieceId = piece.id;
     }
+    this.appendPenPoint(e, piece, p);
+  }
 
-    // Alt-click deletes anchor (Figma pen)
-    if (e.altKey) {
-      const hit = this.findPointNear(p);
-      if (hit && hit.piece.points.length > 2) {
-        this.markBeforeChange();
-        hit.piece.points = hit.piece.points.filter((pt) => pt.id !== hit.point.id);
-        this.selectedIds.delete(hit.point.id);
-        if (this.selectedPointId === hit.point.id) {
-          this.selectedPointId = this.selectedIds.values().next().value ?? null;
-        }
-        this.cbs.onChange();
-        this.endHistoryGesture();
-        this.redraw();
-      }
-      return;
+  /**
+   * The open path the pen has in hand: the stroke it is drawing (which survives a
+   * detour onto another piece's edge), or else the selected piece while that is
+   * still open. Unlike the other tools the pen never falls back to `pieces[0]` —
+   * clicking empty canvas should start a panel, not grow a stranger's outline.
+   */
+  private penStrokePiece(): PatternPiece | null {
+    const open = (id: string | null) => {
+      const piece = this.pattern.pieces.find((entry) => entry.id === id);
+      return piece && !piece.closed ? piece : null;
+    };
+    return open(this.penStrokeId) ?? open(this.selectedPieceId);
+  }
+
+  /**
+   * The piece a click landed on: the artwork the event hit, or — for clicks
+   * that reach the grid because what was under them is `pointer-events: none`
+   * (seams, length labels, rulers) — the topmost fill containing the point.
+   */
+  private pieceAt(target: EventTarget | null, p: Vec2): PatternPiece | null {
+    const el = target instanceof Element ? target.closest('[data-piece-id]') : null;
+    const id = el ? (el as SVGElement).dataset.pieceId : undefined;
+    if (id) {
+      const piece = this.pattern.pieces.find((entry) => entry.id === id);
+      if (piece && !this.isGeneratedPiece(piece.id)) return piece;
     }
-
-    // Clicking an existing anchor selects it (don't add a duplicate)
-    const nearAnchor = this.findPointNear(p);
-    if (nearAnchor && nearAnchor.piece.id === piece.id) {
-      // Close open path by clicking first point
-      if (
-        !piece.closed &&
-        piece.points.length >= 3 &&
-        nearAnchor.point.id === piece.points[0].id
-      ) {
-        this.markBeforeChange();
-        piece.closed = true;
-        this.penActive = false;
-        this.selectOnly(nearAnchor.point.id, piece.id);
-        this.cbs.onChange();
-        this.endHistoryGesture();
-        this.redraw();
-        return;
-      }
-      this.selectOnly(nearAnchor.point.id, piece.id);
-      this.redraw();
-      return;
+    for (let i = this.pattern.pieces.length - 1; i >= 0; i--) {
+      const piece = this.pattern.pieces[i];
+      if (piece.points.length < 3 || this.isGeneratedPiece(piece.id)) continue;
+      if (pointInPolygon(p, pieceToPolyline(piece.points, true))) return piece;
     }
+    return null;
+  }
 
+  /**
+   * True for a piece drafted by a block. Its geometry is regenerated from the
+   * block's variables, so a hand-added point would not survive — the whole tool
+   * layer leaves these pieces to their block (see the intercept in
+   * `onPointerDown`).
+   */
+  private isGeneratedPiece(pieceId: string): boolean {
+    return this.blockOwnership.has(pieceId);
+  }
+
+  /**
+   * The segment a pen click splits, searched across every piece. Nearest wins;
+   * ties go to the path being drawn (so drafting a panel along a neighbour's
+   * outline keeps extending your own), then to the piece actually clicked.
+   */
+  private edgeNear(
+    p: Vec2,
+    candidates: Array<PatternPiece | null>
+  ): { piece: PatternPiece; edgeIndex: number; point: Vec2 } | null {
     const threshold = this.hitRadius() * 2.5;
-
-    // Figma: click on an existing segment → insert a point ON that segment
-    if (piece.points.length >= 2) {
-      const edgeHit = findNearestEdge(piece.points, piece.closed, p);
-      if (edgeHit && edgeHit.dist <= threshold) {
-        // Don't insert extremely close to an existing endpoint
-        const a = piece.points[edgeHit.edgeIndex];
-        const b = piece.points[(edgeHit.edgeIndex + 1) % piece.points.length];
-        if (
-          dist(edgeHit.point, a.anchor) < this.hitRadius() ||
-          dist(edgeHit.point, b.anchor) < this.hitRadius()
-        ) {
-          return;
-        }
-        const pt: BezierPoint = {
-          id: uid('pt'),
-          anchor: { ...edgeHit.point },
-          handleIn: null,
-          handleOut: null,
-          handlesParallel: false,
-        };
-        // Split the edge: clear handles that spanned this segment
-        this.markBeforeChange();
-        a.handleOut = null;
-        b.handleIn = null;
-        piece.points.splice(edgeHit.edgeIndex + 1, 0, pt);
-        this.selectOnly(pt.id, piece.id);
-        this.penActive = false;
-        this.drag = { type: 'penCurve', pieceId: piece.id, pointId: pt.id };
-        this.svg.setPointerCapture(e.pointerId);
-        this.cbs.onChange();
-        this.redraw();
-        return;
+    const order: PatternPiece[] = [];
+    for (const piece of candidates) {
+      if (piece && !order.includes(piece)) order.push(piece);
+    }
+    let best: { piece: PatternPiece; edgeIndex: number; point: Vec2; dist: number } | null = null;
+    for (const piece of order) {
+      if (piece.points.length < 2 || this.isGeneratedPiece(piece.id)) continue;
+      const hit = findNearestEdge(piece.points, piece.closed, p);
+      if (!hit || hit.dist > threshold) continue;
+      if (!best || hit.dist < best.dist) {
+        best = { piece, edgeIndex: hit.edgeIndex, point: hit.point, dist: hit.dist };
       }
     }
+    if (!best) return null;
+    return { piece: best.piece, edgeIndex: best.edgeIndex, point: best.point };
+  }
 
-    // Continue / start an open path: append only when not closed (or empty)
-    if (piece.closed && piece.points.length >= 3) {
-      // Closed shape + click off the path: do not append (that would reshape the ring)
-      return;
-    }
-
-    this.markBeforeChange();
+  /**
+   * Split `piece`'s edge with a new anchor at `at`, as one undo step. Refused
+   * (null) when the spot sits almost on top of an existing endpoint, where a
+   * second point would only read as noise.
+   */
+  private insertEdgePoint(piece: PatternPiece, edgeIndex: number, at: Vec2): BezierPoint | null {
+    const n = piece.points.length;
+    const a = piece.points[edgeIndex];
+    const b = piece.points[(edgeIndex + 1) % n];
+    if (!a || !b) return null;
+    if (dist(at, a.anchor) < this.hitRadius() || dist(at, b.anchor) < this.hitRadius()) return null;
     const pt: BezierPoint = {
       id: uid('pt'),
-      anchor: { ...p },
+      anchor: { x: at.x, y: at.y },
       handleIn: null,
       handleOut: null,
       handlesParallel: false,
     };
+    this.markBeforeChange();
+    // Split the edge: the handles that spanned it no longer apply.
+    a.handleOut = null;
+    b.handleIn = null;
+    piece.points.splice(edgeIndex + 1, 0, pt);
+    return pt;
+  }
+
+  /** The pen's version of the edge insert: the new point is dragged into a curve. */
+  private insertPenPoint(
+    e: PointerEvent,
+    piece: PatternPiece,
+    edgeIndex: number,
+    at: Vec2
+  ): void {
+    const pt = this.insertEdgePoint(piece, edgeIndex, at);
+    if (!pt) return;
+    this.selectOnly(pt.id, piece.id);
+    this.drag = { type: 'penCurve', pieceId: piece.id, pointId: pt.id };
+    this.svg.setPointerCapture(e.pointerId);
+    this.cbs.onChange();
+    this.redraw();
+  }
+
+  /** Add an anchor to the end of an open path — the "keep clicking to draw" step. */
+  private appendPenPoint(e: PointerEvent, piece: PatternPiece, at: Vec2): void {
+    const pt: BezierPoint = {
+      id: uid('pt'),
+      anchor: { x: at.x, y: at.y },
+      handleIn: null,
+      handleOut: null,
+      handlesParallel: false,
+    };
+    this.markBeforeChange();
     piece.points.push(pt);
     piece.closed = false;
-    this.penActive = true;
+    this.penStrokeId = piece.id;
     this.selectOnly(pt.id, piece.id);
     this.drag = { type: 'penCurve', pieceId: piece.id, pointId: pt.id };
     this.svg.setPointerCapture(e.pointerId);
@@ -5725,40 +8040,21 @@ export class PatternEditor {
     };
   }
 
-  private bendNearestSegment(p: Vec2): boolean {
-    const piece = this.activePiece();
-    if (!piece || piece.points.length < 2) return false;
-    const n = piece.points.length;
-    const edgeCount = piece.closed ? n : n - 1;
-    let bestI = -1;
-    let bestD = this.hitRadius() * 2;
-    for (let i = 0; i < edgeCount; i++) {
-      const a = piece.points[i].anchor;
-      const b = piece.points[(i + 1) % n].anchor;
-      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-      const d = dist(p, mid);
-      if (d < bestD) {
-        bestD = d;
-        bestI = i;
-      }
-    }
-    if (bestI < 0) return false;
-    const a = piece.points[bestI];
-    const b = piece.points[(bestI + 1) % n];
-    // Pull handles toward click (Figma bend on segment)
-    a.handleOut = { x: (a.anchor.x + p.x) / 2, y: (a.anchor.y + p.y) / 2 };
-    b.handleIn = { x: (b.anchor.x + p.x) / 2, y: (b.anchor.y + p.y) / 2 };
-    this.selectOnly(a.id, piece.id);
-    return true;
-  }
-
   private onPointerMove(e: PointerEvent): void {
     // Sew tool: hover highlight edges even when not dragging
-    if (this.tool === 'sew' && !this.drag) {
+    if ((this.tool === 'sew' || this.tool === 'join' || this.tool === 'bridge') && !this.drag) {
       const p = this.svgPoint(e);
       const hit = this.findNearestEdgeAcrossPieces(p);
       const next: HoverEdge | null = hit
-        ? this.refForHalf(hit.piece.id, hit.fromPointId, hit.toPointId, hit.t)
+        ? this.tool !== 'sew'
+          ? {
+              pieceId: hit.piece.id,
+              fromPointId: hit.fromPointId,
+              toPointId: hit.toPointId,
+              t0: 0,
+              t1: 1,
+            }
+          : this.refForHalf(hit.piece.id, hit.fromPointId, hit.toPointId, hit.t)
         : null;
       // Crossing the midpoint changes the direction the stroke previews, so it
       // has to redraw even though the edge itself is unchanged.
@@ -5770,6 +8066,54 @@ export class PatternEditor {
             seamReadsFromSecondHalf(next) !== seamReadsFromSecondHalf(this.hoverEdge)));
       if (changed) {
         this.hoverEdge = next;
+        this.redraw();
+      }
+      return;
+    }
+
+    // Loop knife: the cut is worked out from where the pointer is on the
+    // outline, so every move redraws it.
+    if (this.isLoopKnife() && !this.drag) {
+      const next = this.loopCutAtPointer(this.svgPoint(e));
+      const changed =
+        !!next !== !!this.knifeLoop ||
+        (!!next &&
+          !!this.knifeLoop &&
+          (next.edgeIndex !== this.knifeLoop.edgeIndex ||
+            next.pieceId !== this.knifeLoop.pieceId ||
+            Math.abs(next.t - this.knifeLoop.t) > 1e-4));
+      if (changed) {
+        this.knifeLoop = next;
+        this.redraw();
+      }
+      return;
+    }
+
+    // Curve knife: the rubber band follows the pointer, so the next click's
+    // segment can be aimed.
+    if (this.tool === 'knife' && this.knifeMode === 'curve' && !this.drag) {
+      const p = this.svgPoint(e);
+      const last = this.knifeChainHover;
+      if (!last || dist(last, p) > 1e-4) {
+        this.knifeChainHover = this.knifeChain.length > 0 ? p : null;
+        this.redraw();
+      }
+      return;
+    }
+
+    // Extrude tool: light up the edge a click would duplicate, so it is clear
+    // which outline is about to grow a tab.
+    if (this.tool === 'extrude' && !this.drag) {
+      const next = this.extrudeEdgeAt(this.svgPoint(e));
+      const changed =
+        !!next !== !!this.extrudeHover ||
+        (!!next &&
+          !!this.extrudeHover &&
+          (next.pieceId !== this.extrudeHover.pieceId ||
+            next.fromPointId !== this.extrudeHover.fromPointId ||
+            next.toPointId !== this.extrudeHover.toPointId));
+      if (changed) {
+        this.extrudeHover = next;
         this.redraw();
       }
       return;
@@ -5883,6 +8227,10 @@ export class PatternEditor {
 
     if (this.drag.type === 'marquee') {
       this.drag.current = p;
+      // Shift and Cmd can be pressed or let go mid-drag; the rectangle follows
+      // them, Cmd winning when both are held.
+      this.drag.panels = e.metaKey || e.ctrlKey;
+      this.drag.additive = !this.drag.panels && e.shiftKey;
       this.redraw();
       return;
     }
@@ -5890,6 +8238,16 @@ export class PatternEditor {
     if (this.drag.type === 'drawShape') {
       this.drag.current = p;
       this.drag.lockAspect = e.shiftKey;
+      this.redraw();
+      return;
+    }
+
+    if (this.drag.type === 'extrudeEdge') {
+      const lock = axisLockFromDelta(p.x - this.drag.start.x, p.y - this.drag.start.y, e.shiftKey);
+      this.drag.current = {
+        x: lock === 'y' ? this.drag.start.x : p.x,
+        y: lock === 'x' ? this.drag.start.y : p.y,
+      };
       this.redraw();
       return;
     }
@@ -5919,22 +8277,6 @@ export class PatternEditor {
       return;
     }
 
-    if (this.drag.type === 'knifeCurveHandles') {
-      const mid = lerp(this.drag.a, this.drag.b, 0.5);
-      const ox = (p.x - mid.x) * 1.25;
-      const oy = (p.y - mid.y) * 1.25;
-      this.drag.c0 = {
-        x: this.drag.a.x + (this.drag.b.x - this.drag.a.x) / 3 + ox,
-        y: this.drag.a.y + (this.drag.b.y - this.drag.a.y) / 3 + oy,
-      };
-      this.drag.c1 = {
-        x: this.drag.a.x + ((this.drag.b.x - this.drag.a.x) * 2) / 3 + ox,
-        y: this.drag.a.y + ((this.drag.b.y - this.drag.a.y) * 2) / 3 + oy,
-      };
-      this.redraw();
-      return;
-    }
-
     if (this.drag.type === 'moveSelection') {
       const d = this.drag;
       const rawDx = p.x - d.start.x;
@@ -5943,9 +8285,18 @@ export class PatternEditor {
       // piece up and letting go without dragging it is a selection, and it
       // should not leave an empty step on the undo stack.
       if (rawDx !== 0 || rawDy !== 0) this.markBeforeChange();
+      // Shift locks the drag to the axis it is already moving along, so a point
+      // can be moved purely horizontally or vertically.
+      const constrainAxis = axisLockFromDelta(rawDx, rawDy, e.shiftKey);
       // Figma: Ctrl temporarily disables Snap to geometry
       const snapOn = this.softSnap && !e.ctrlKey;
-      const { dx, dy, guides } = this.softSnapTranslate(d.snapshots, rawDx, rawDy, snapOn);
+      const { dx, dy, guides } = this.softSnapTranslate(
+        d.snapshots,
+        rawDx,
+        rawDy,
+        snapOn,
+        constrainAxis
+      );
       this.snapGuides = guides;
       this.applySnapshotsTranslated(d.snapshots, dx, dy);
       this.redraw();
@@ -6048,17 +8399,23 @@ export class PatternEditor {
     if (finished.type === 'marquee') {
       const moved = dist(finished.start, finished.current);
       if (moved < this.hitRadius() * 0.35) {
-        // Click empty → clear (unless Shift)
-        if (!finished.additive) this.clearSelection();
-      } else {
+        // Drawn no further than a click. Cmd/Ctrl on a piece means that one
+        // piece joins or leaves the selection; Shift means points, and on bare
+        // canvas alone keeps the selection as it stands.
+        const toggled = finished.togglePieceId
+          ? this.pattern.pieces.find((entry) => entry.id === finished.togglePieceId)
+          : null;
+        if (toggled) this.toggleEntirePiece(toggled);
+        else if (!finished.additive) this.clearSelection();
+      } else if (finished.panels) {
+        this.addPiecesInRect(finished.start, finished.current);
+      } else if (finished.additive) {
         const hit = this.pointsInRect(finished.start, finished.current);
-        if (finished.additive) {
-          const merged = new Set(this.selectedIds);
-          for (const id of hit) merged.add(id);
-          this.setSelection([...merged]);
-        } else {
-          this.setSelection(hit);
-        }
+        const merged = new Set(this.selectedIds);
+        for (const id of hit) merged.add(id);
+        this.setSelection([...merged]);
+      } else {
+        this.setSelection(this.pointsInRect(finished.start, finished.current));
       }
       this.endHistoryGesture();
       this.redraw();
@@ -6071,6 +8428,12 @@ export class PatternEditor {
       return;
     }
 
+    if (finished.type === 'extrudeEdge') {
+      this.finishExtrudeEdge(finished);
+      this.redraw();
+      return;
+    }
+
     if (finished.type === 'rulerCreate') {
       this.commitRulerCreate(finished);
       this.endHistoryGesture();
@@ -6078,11 +8441,7 @@ export class PatternEditor {
       return;
     }
 
-    if (
-      finished.type === 'knifeLine' ||
-      finished.type === 'knifeCircle' ||
-      finished.type === 'knifeCurveHandles'
-    ) {
+    if (finished.type === 'knifeLine' || finished.type === 'knifeCircle') {
       const cutter = this.knifeCutterFromDrag(finished);
       if (cutter) this.commitKnife(cutter);
       this.redraw();
@@ -6094,6 +8453,22 @@ export class PatternEditor {
   }
 
   private onKnifeDown(e: PointerEvent, p: Vec2): void {
+    if (this.isLoopKnife()) {
+      // Hover already decided the cut; a click commits it. An invalid cut (one
+      // that would leave the piece, or a sliver) simply does not commit.
+      const hover = this.knifeLoop ?? this.loopCutAtPointer(p);
+      if (hover?.cut.valid) {
+        const cut = loopCutCutter(hover.cut);
+        const piece =
+          this.pattern.pieces.find((entry) => entry.id === hover.pieceId) ??
+          this.pieceForKnife(cut);
+        this.commitKnife(cut, false, piece);
+      }
+      this.knifeLoop = null;
+      this.redraw();
+      return;
+    }
+
     if (this.knifeMode === 'linear') {
       this.drag = {
         type: 'knifeLine',
@@ -6120,31 +8495,12 @@ export class PatternEditor {
       return;
     }
 
-    // Curve: click A, click B, then drag handles
-    if (!this.knifeCurveA) {
-      this.knifeCurveA = { ...p };
-      this.knifeCurveB = null;
-      this.syncKnifeToolbar();
-      this.redraw();
-      return;
-    }
-    if (!this.knifeCurveB) {
-      this.knifeCurveB = { ...p };
-      this.syncKnifeToolbar();
-      this.redraw();
-      return;
-    }
-    const a = this.knifeCurveA;
-    const b = this.knifeCurveB;
-    this.drag = {
-      type: 'knifeCurveHandles',
-      a,
-      b,
-      c0: lerp(a, b, 1 / 3),
-      c1: lerp(a, b, 2 / 3),
-    };
-    this.svg.setPointerCapture(e.pointerId);
-    e.preventDefault();
+    // Curve: click points down, like the pen. The chain is the cut; the bar
+    // commits or cancels it.
+    this.knifeChain.push(this.snapKnifePoint(p));
+    this.knifeChainHover = null;
+    this.knifeChainRefusal = null;
+    this.syncKnifeBar();
     this.redraw();
   }
 

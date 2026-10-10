@@ -87,6 +87,15 @@ export interface ClothSimulator extends ClothRenderExtras {
     indexFormat: GPUIndexFormat;
     indexCount: number;
   } | null;
+  /**
+   * Line-list edge indices for the wireframe shading mode, paired with the
+   * simulator's own position/normal buffers. Static for the life of the mesh.
+   */
+  getWireframeEdges?(): {
+    indexBuffer: GPUBuffer;
+    indexFormat: GPUIndexFormat;
+    indexCount: number;
+  } | null;
 
   /** Per-vertex RGB for strain visualization (same count as particles). */
   getColorBuffer?(): GPUBuffer | null;

@@ -3,6 +3,7 @@ import {
   CORNER_HANDLES,
   angleAbout,
   boxContains,
+  boxesOverlap,
   cornerGrips,
   handleCentre,
   rotatePoint,
@@ -32,6 +33,15 @@ describe('selection handle geometry', () => {
     expect(boxContains(box, { x: 100, y: 60 })).toBe(true);
     expect(boxContains(box, { x: 101, y: 30 })).toBe(false);
     expect(boxContains(box, { x: 50, y: -1 })).toBe(false);
+  });
+
+  it('overlaps a box that shares any area, touching edges included', () => {
+    expect(boxesOverlap(box, { minX: 20, minY: 20, maxX: 30, maxY: 30 })).toBe(true);
+    expect(boxesOverlap(box, { minX: 100, minY: 60, maxX: 120, maxY: 80 })).toBe(true);
+    expect(boxesOverlap(box, { minX: -40, minY: -40, maxX: 0, maxY: 0 })).toBe(true);
+    expect(boxesOverlap(box, { minX: 101, minY: 0, maxX: 200, maxY: 60 })).toBe(false);
+    expect(boxesOverlap(box, { minX: 0, minY: 61, maxX: 100, maxY: 90 })).toBe(false);
+    expect(boxesOverlap(box, { minX: 50, minY: 70, maxX: 60, maxY: 80 })).toBe(false);
   });
 
   it('gives the rotate zones to the corners only', () => {

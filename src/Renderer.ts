@@ -1,4 +1,4 @@
-import { mat4 } from 'gl-matrix';
+import { mat4, vec3 } from 'gl-matrix';
 import { mat4ToArray } from './utils/math';
 import { Cloth } from './Cloth';
 import { SimpleCloth } from './SimpleCloth';
@@ -10,8 +10,19 @@ import floorFragmentShaderCode from './shaders/floor.frag.wgsl?raw';
 import gridVertexShaderCode from './shaders/grid.vert.wgsl?raw';
 import gridFragmentShaderCode from './shaders/grid.frag.wgsl?raw';
 import { inchesToOrbitWorld } from './sim/cameraDefaults';
+import pbrVertexShaderCode from './shaders/pbr.vert.wgsl?raw';
+import pbrFragmentShaderCode from './shaders/pbr.frag.wgsl?raw';
+import toneMappingShaderCode from './shaders/tonemapping.wgsl?raw';
+import { tonemapIndex } from './render/tonemapping';
+import { Environment, shadingModeLabel, type ShadingMode } from './render/environment';
+import { cylinderGeometry } from './render/cylinder';
+import { MaterialLibrary, PEDESTAL_DARKENING, type MaterialParams } from './render/materials';
+import type { ClothFloor } from './sim/ClothSimulator';
 
 export type RenderableCloth = Cloth | SimpleCloth | ClothSimulator;
+
+/** The PBR floor pedestal is 12 inches tall. */
+const CYLINDER_HEIGHT_WORLD = inchesToOrbitWorld(12);
 
 /**
  * Flat alpha-blended quad overlay (the quadrant snap grid). Vertices are
@@ -53,6 +64,8 @@ export class Renderer {
     private floorUniformBuffer: GPUBuffer | null = null;
     /** Seam / wireframe overlay model matrix. */
     private overlayUniformBuffer: GPUBuffer | null = null;
+    private wireframeUniformBuffer: GPUBuffer | null = null;
+    private wireframeLightingBuffer: GPUBuffer | null = null;
     /** Cloth lighting — written once per frame. */
     private lightingBuffer: GPUBuffer | null = null;
     /** Sphere collider lighting. */
@@ -67,6 +80,32 @@ export class Renderer {
     
     private wireframeMode: boolean = false;
     private wireframeColor: [number, number, number] = [0.0, 1.0, 1.0]; // Bright cyan wireframe
+
+    /** Wireframe / simple / PBR — cycled by the viewport's shading control. */
+    private shading: ShadingMode = 'simple';
+    private pbrPipeline: GPURenderPipeline | null = null;
+    private pbrClothPipeline: GPURenderPipeline | null = null;
+    /** HDRI background + light probe, shared by every viewport. */
+    private environment: Environment | null = null;
+    private environmentUnsubscribe: (() => void) | null = null;
+    /** Rebuilt whenever the environment replaces its textures. */
+    private pbrEnvBindGroups = new WeakMap<GPURenderPipeline, GPUBindGroup>();
+    private backgroundBindGroupCache: GPUBindGroup | null = null;
+    /** inverseViewProj (64 bytes) + eye + blur level + exposure + tonemap mode. */
+    private backgroundUniformBuffer: GPUBuffer | null = null;
+    /** Cloth surface roughness in PBR mode (used until a library is attached). */
+    private surfaceRoughness = 0.65;
+    private exposure = 1.0;
+    /** Shared scene materials; without one the demo's own colours are used. */
+    private materials: MaterialLibrary | null = null;
+    /** Floor pedestal drawn in PBR mode, in place of the flat floor. */
+    private cylinder: {
+        radius: number;
+        positionBuffer: GPUBuffer;
+        normalBuffer: GPUBuffer;
+        indexBuffer: GPUBuffer;
+        indexCount: number;
+    } | null = null;
 
     // inital lighting and color parameters
     private light1Color: [number, number, number] = [0.96, 0.98, 1.0];
@@ -137,6 +176,17 @@ export class Renderer {
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
         this.overlayLightingBuffer = this.device.createBuffer({
+            size: 256,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        // The wireframe overlay shares this pass with the seam overlay; every
+        // queue.writeBuffer lands before the whole command buffer, so the two
+        // need separate uniforms to keep their own colours.
+        this.wireframeUniformBuffer = this.device.createBuffer({
+            size: 128,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.wireframeLightingBuffer = this.device.createBuffer({
             size: 256,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
@@ -289,6 +339,76 @@ export class Renderer {
                 depthCompare: 'less', // Render wireframe when closer or equal (ensures it's visible)
                 format: 'depth24plus',
             },
+        });
+
+        // PBR twins of the two cloth pipelines: same vertex layouts, same group 0,
+        // plus the environment's textures in group 1.
+        const pbrVertexShader = this.device.createShaderModule({ code: pbrVertexShaderCode });
+        // The tone mapping operators are shared with the background shader, so
+        // they are prepended rather than duplicated in the .wgsl file.
+        const pbrFragmentShader = this.device.createShaderModule({
+            code: `${toneMappingShaderCode}\n${pbrFragmentShaderCode}`,
+        });
+        const pbrVertexBuffers: GPUVertexBufferLayout[] = [
+            {
+                arrayStride: 12,
+                attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }],
+            },
+            {
+                arrayStride: 12,
+                attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x3' }],
+            },
+        ];
+        this.pbrPipeline = this.device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: pbrVertexShader,
+                entryPoint: 'main',
+                buffers: pbrVertexBuffers,
+            },
+            fragment: {
+                module: pbrFragmentShader,
+                entryPoint: 'main',
+                targets: [{ format: this.format }],
+            },
+            primitive: { topology: 'triangle-list', cullMode: 'none' },
+            depthStencil: {
+                depthWriteEnabled: true,
+                depthCompare: 'less-equal',
+                format: 'depth24plus',
+            },
+        });
+        this.pbrClothPipeline = this.device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: pbrVertexShader,
+                entryPoint: 'mainColored',
+                buffers: [
+                    ...pbrVertexBuffers,
+                    {
+                        arrayStride: 12,
+                        attributes: [{ shaderLocation: 2, offset: 0, format: 'float32x3' }],
+                    },
+                ],
+            },
+            fragment: {
+                module: pbrFragmentShader,
+                entryPoint: 'mainColored',
+                targets: [{ format: this.format }],
+            },
+            primitive: { topology: 'triangle-list', cullMode: 'none' },
+            depthStencil: {
+                depthWriteEnabled: true,
+                depthCompare: 'less-equal',
+                format: 'depth24plus',
+            },
+        });
+
+        this.backgroundUniformBuffer = this.device.createBuffer({
+            // inverseViewProj (64) + eye (12) + blur level (4) + exposure (4)
+            // + tonemap mode (4), padded to the 16-byte uniform rule.
+            size: 96,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
         // Line-list pipeline for sewing bond overlays in the drape sim
@@ -488,6 +608,239 @@ export class Renderer {
         return this.wireframeMode;
     }
 
+    /** Wireframe / simple / PBR. */
+    setShadingMode(mode: ShadingMode): void {
+        if (mode === this.shading) return;
+        this.shading = mode;
+        // The bind groups do not change with the mode, but a mode change does
+        // change which of them are used; dropping the cache keeps it honest.
+        this.backgroundBindGroupCache = null;
+    }
+
+    getShadingMode(): ShadingMode {
+        return this.shading;
+    }
+
+    shadingLabel(): string {
+        return shadingModeLabel(this.shading);
+    }
+
+    /**
+     * Share the app's environment (the HDRI maps). A viewport without one simply
+     * has no background and no light probe.
+     */
+    attachEnvironment(environment: Environment): void {
+        if (this.environment === environment) return;
+        this.environmentUnsubscribe?.();
+        this.environment = environment;
+        this.environmentUnsubscribe = environment.onChange(() => {
+            // The environment rebuilt its textures: every bind group that
+            // referenced them is stale.
+            this.pbrEnvBindGroups = new WeakMap();
+            this.backgroundBindGroupCache = null;
+        });
+    }
+
+    /** Cloth surface roughness in PBR mode (0.05 mirror-ish .. 1 fully diffuse). */
+    setSurfaceRoughness(roughness: number): void {
+        this.surfaceRoughness = Math.min(1, Math.max(0.05, roughness));
+    }
+
+    /**
+     * Share the studio's material library. Materials only change uniform values,
+     * which are rewritten every frame, so there is nothing cached to drop.
+     */
+    attachMaterials(materials: MaterialLibrary): void {
+        this.materials = materials;
+    }
+
+    /** The material a surface is shaded with, falling back to the demo's colours. */
+    private clothMaterial(): MaterialParams {
+        return (
+            this.materials?.forPiece() ?? {
+                color: [...this.clothColor] as [number, number, number],
+                roughness: this.surfaceRoughness,
+                metallic: 0,
+            }
+        );
+    }
+
+    private referenceMaterial(): MaterialParams {
+        return (
+            this.materials?.get('reference') ?? {
+                color: [...this.groundColor] as [number, number, number],
+                roughness: this.surfaceRoughness,
+                metallic: 0,
+            }
+        );
+    }
+
+    /** The pedestal is always the reference colour, 25% darker. */
+    private pedestalMaterial(): MaterialParams {
+        const reference = this.referenceMaterial();
+        const own = this.materials?.pedestal();
+        return {
+            color: own?.color ?? reference.color.map((c) => c * PEDESTAL_DARKENING) as [number, number, number],
+            roughness: own?.roughness ?? reference.roughness,
+            metallic: own?.metallic ?? reference.metallic,
+        };
+    }
+
+    /** Write a surface's albedo / roughness / metallic into a lighting buffer. */
+    private writeMaterial(target: Float32Array, material: MaterialParams): void {
+        target[20] = material.color[0];
+        target[21] = material.color[1];
+        target[22] = material.color[2];
+        target[27] = material.roughness;
+        target[29] = material.metallic;
+    }
+
+    setExposure(exposure: number): void {
+        this.exposure = Math.max(0.05, Math.min(8, exposure));
+    }
+
+    private wantsBackground(): boolean {
+        // Only PBR shows the environment: `simple` keeps the flat studio look it
+        // has always had, and wires read better against nothing.
+        return (
+            this.shading === 'pbr' &&
+            !!this.environment?.drawBackground &&
+            this.backgroundUniformBuffer !== null
+        );
+    }
+
+    private pbrEnvBindGroup(pipeline: GPURenderPipeline): GPUBindGroup | null {
+        const cached = this.pbrEnvBindGroups.get(pipeline);
+        if (cached) return cached;
+        if (!this.environment) return null;
+        const group = this.environment.textureBindGroup(pipeline.getBindGroupLayout(1));
+        if (!group) return null;
+        this.pbrEnvBindGroups.set(pipeline, group);
+        return group;
+    }
+
+    /**
+     * PBR floor: a white cylinder of the floor's own radius, 12 inches tall, with
+     * its top cap at the floor plane so the avatar still stands on it.
+     */
+    private drawFloorCylinder(
+        pass: GPURenderPassEncoder,
+        floor: ClothFloor,
+        viewProj: mat4,
+        lightingData: Float32Array
+    ): void {
+        const radius = floor.getGradientHalfExtent?.() ?? 0;
+        if (!(radius > 0)) return;
+        this.ensureCylinder(radius);
+
+        const cylinder = this.cylinder;
+        const pipeline = this.pbrPipeline;
+        if (!cylinder || !pipeline || !this.floorUniformBuffer || !this.floorLightingBuffer) {
+            return;
+        }
+        const envBindGroup = this.pbrEnvBindGroup(pipeline);
+        if (!envBindGroup) return;
+
+        // The floor plane is built centred on the origin, so its matrix — a plain
+        // translate to the floor height — is also the pedestal's matrix.
+        const uniformData = new Float32Array(32);
+        uniformData.set(mat4ToArray(viewProj), 0);
+        uniformData.set(mat4ToArray(floor.getModelMatrix()), 16);
+        this.device.queue.writeBuffer(this.floorUniformBuffer, 0, uniformData);
+
+        // The pedestal is the reference material, 25% darker.
+        const lighting = Float32Array.from(lightingData);
+        this.writeMaterial(lighting, this.pedestalMaterial());
+        this.device.queue.writeBuffer(this.floorLightingBuffer, 0, lighting);
+
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(
+            0,
+            this.createBindGroup(pipeline, this.floorUniformBuffer, this.floorLightingBuffer)
+        );
+        pass.setBindGroup(1, envBindGroup);
+        pass.setVertexBuffer(0, cylinder.positionBuffer);
+        pass.setVertexBuffer(1, cylinder.normalBuffer);
+        pass.setIndexBuffer(cylinder.indexBuffer, 'uint32');
+        pass.drawIndexed(cylinder.indexCount);
+    }
+
+    /** Build (or rebuild) the pedestal for a floor radius; it never deforms. */
+    private ensureCylinder(radius: number): void {
+        if (this.cylinder && Math.abs(this.cylinder.radius - radius) < 1e-4) return;
+        this.cylinder?.positionBuffer.destroy();
+        this.cylinder?.normalBuffer.destroy();
+        this.cylinder?.indexBuffer.destroy();
+
+        const geometry = cylinderGeometry(radius, CYLINDER_HEIGHT_WORLD);
+        const device = this.device;
+        const positionBuffer = device.createBuffer({
+            size: geometry.positions.byteLength,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            mappedAtCreation: true,
+            label: 'floor-cylinder-positions',
+        });
+        new Float32Array(positionBuffer.getMappedRange()).set(geometry.positions);
+        positionBuffer.unmap();
+        const normalBuffer = device.createBuffer({
+            size: geometry.normals.byteLength,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            mappedAtCreation: true,
+            label: 'floor-cylinder-normals',
+        });
+        new Float32Array(normalBuffer.getMappedRange()).set(geometry.normals);
+        normalBuffer.unmap();
+        const indexBuffer = device.createBuffer({
+            size: geometry.indices.byteLength,
+            usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+            mappedAtCreation: true,
+            label: 'floor-cylinder-indices',
+        });
+        new Uint32Array(indexBuffer.getMappedRange()).set(geometry.indices);
+        indexBuffer.unmap();
+
+        this.cylinder = {
+            radius,
+            positionBuffer,
+            normalBuffer,
+            indexBuffer,
+            indexCount: geometry.indices.length,
+        };
+    }
+
+    /** The HDRI, drawn first: each pixel unprojects to a direction and samples it. */
+    private drawBackground(pass: GPURenderPassEncoder, viewProj: mat4, eye: vec3): void {
+        const environment = this.environment;
+        if (!environment || !this.backgroundUniformBuffer) return;
+        const pipeline = environment.backgroundPipeline;
+
+        const inverse = mat4.create();
+        mat4.invert(inverse, viewProj);
+        const uniforms = new Float32Array(24);
+        uniforms.set(mat4ToArray(inverse), 0);
+        // The ray runs from the eye to the unprojected far point.
+        uniforms[16] = eye[0];
+        uniforms[17] = eye[1];
+        uniforms[18] = eye[2];
+        uniforms[19] = environment.backgroundBlurLevel;
+        uniforms[20] = environment.exposure;
+        // A float slot holding a small integer: exact, and one array to write.
+        uniforms[21] = tonemapIndex(environment.tonemap);
+        this.device.queue.writeBuffer(this.backgroundUniformBuffer, 0, uniforms);
+
+        if (!this.backgroundBindGroupCache) {
+            this.backgroundBindGroupCache = environment.backgroundBindGroup(
+                pipeline.getBindGroupLayout(0),
+                this.backgroundUniformBuffer
+            );
+        }
+        if (!this.backgroundBindGroupCache) return;
+
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, this.backgroundBindGroupCache);
+        pass.draw(3);
+    }
+
     render(cloth: RenderableCloth, camera: Camera): void {
         const viewProj = camera.getViewProjectMtx();
         const model = cloth.getModelMatrix();
@@ -546,10 +899,11 @@ export class Renderer {
         lightingData[17] = this.light2Color[1];
         lightingData[18] = this.light2Color[2];
         lightingData[19] = 0.0; // padding
-        // Diffuse color (cloth color); [23] = useVertexColor for strain map
-        lightingData[20] = this.clothColor[0];
-        lightingData[21] = this.clothColor[1];
-        lightingData[22] = this.clothColor[2];
+        // Diffuse color (cloth material); [23] = useVertexColor for strain map
+        const clothMaterial = this.clothMaterial();
+        lightingData[20] = clothMaterial.color[0];
+        lightingData[21] = clothMaterial.color[1];
+        lightingData[22] = clothMaterial.color[2];
         const colorBuffer =
             'getColorBuffer' in cloth && typeof (cloth as ClothSimulator).getColorBuffer === 'function'
                 ? (cloth as ClothSimulator).getColorBuffer?.() ?? null
@@ -560,6 +914,18 @@ export class Renderer {
             typeof (cloth as ClothSimulator).isStrainMapEnabled === 'function' &&
             !!(cloth as ClothSimulator).isStrainMapEnabled?.();
         lightingData[23] = useVertexColor ? 1.0 : 0.0;
+        // PBR-only tail of the same buffer: view vector, roughness, exposure,
+        // metallic, tone mapping operator.
+        const eye = camera.getEyePosition();
+        lightingData[24] = eye[0];
+        lightingData[25] = eye[1];
+        lightingData[26] = eye[2];
+        lightingData[27] = clothMaterial.roughness;
+        // The shared exposure control wins while an environment is attached, so
+        // the fabric and the HDRI behind it stay on the same stop.
+        lightingData[28] = this.environment?.exposure ?? this.exposure;
+        lightingData[29] = clothMaterial.metallic;
+        lightingData[30] = tonemapIndex(this.environment?.tonemap);
 
         // Write the buffer - WebGPU queue operations are automatically ordered
         // However, to ensure the write completes before rendering, we'll write it and then
@@ -576,8 +942,21 @@ export class Renderer {
         
         // IMPORTANT: Create bind group AFTER buffer write to ensure it references updated buffer
         // Note: Bind groups just reference the buffer, they don't cache data
-        const clothPipeline =
-            colorBuffer && this.clothPipeline ? this.clothPipeline : this.renderPipeline!;
+        const pbrPipeline =
+            colorBuffer && this.pbrClothPipeline ? this.pbrClothPipeline : this.pbrPipeline;
+        // PBR needs the environment's textures bound: while the HDRI is still
+        // building (or absent) the frame keeps the simple shader.
+        const clothEnvBindGroup =
+            this.shading === 'pbr' && pbrPipeline && this.environment?.ready
+                ? this.pbrEnvBindGroup(pbrPipeline)
+                : null;
+        /** PBR is on and the environment is built: scene objects light with it. */
+        const pbrAvailable = clothEnvBindGroup !== null;
+        const clothPipeline = clothEnvBindGroup
+            ? pbrPipeline!
+            : colorBuffer && this.clothPipeline
+              ? this.clothPipeline
+              : this.renderPipeline!;
         const clothBindGroup = this.createBindGroup(
             clothPipeline,
             this.uniformBuffer!,
@@ -601,6 +980,12 @@ export class Renderer {
             },
         });
 
+        // The HDRI goes down first: it needs no depth against anything, and the
+        // scene then draws over it normally.
+        if (this.wantsBackground()) {
+            this.drawBackground(pass, viewProj, eye);
+        }
+
         // Render cloth - check if buffers are valid
         const positionBuffer = cloth.getPositionBuffer();
         const normalBuffer = cloth.getNormalBuffer();
@@ -613,23 +998,36 @@ export class Renderer {
             return;
         }
 
-        // Always render filled triangles first
-        // (Cloth uses normal lighting regardless of wireframe mode)
-        // Bind group was created AFTER buffer write to ensure it uses updated data
-        pass.setPipeline(clothPipeline);
-        pass.setBindGroup(0, clothBindGroup);
-        pass.setVertexBuffer(0, positionBuffer);
-        pass.setVertexBuffer(1, normalBuffer);
-        if (colorBuffer && clothPipeline === this.clothPipeline) {
-            pass.setVertexBuffer(2, colorBuffer);
+        // Wireframe mode draws the mesh edges only: seeing through the fabric is
+        // the whole point of the mode.
+        const drawFill = this.shading !== 'wireframe';
+        if (drawFill) {
+            if (clothEnvBindGroup) pass.setBindGroup(1, clothEnvBindGroup);
+            pass.setPipeline(clothPipeline);
+            pass.setBindGroup(0, clothBindGroup);
+            pass.setVertexBuffer(0, positionBuffer);
+            pass.setVertexBuffer(1, normalBuffer);
+            if (
+                colorBuffer &&
+                (clothPipeline === this.clothPipeline || clothPipeline === this.pbrClothPipeline)
+            ) {
+                pass.setVertexBuffer(2, colorBuffer);
+            }
+            pass.setIndexBuffer(indexBuffer, cloth.getIndexFormat());
+            pass.drawIndexed(cloth.getIndexCount());
         }
-        pass.setIndexBuffer(indexBuffer, cloth.getIndexFormat());
-        pass.drawIndexed(cloth.getIndexCount());
 
-        // If wireframe mode is enabled, overlay wireframe quads on top
-        if (this.wireframeMode && this.wireframePipeline) {
+        // The wireframe overlay: either the debug overlay the demo page asks for,
+        // or the whole point of the wireframe shading mode.
+        if ((this.wireframeMode || this.shading === 'wireframe') && this.wireframePipeline) {
             const wireframeBuffers = cloth.getWireframeBuffers();
-            if (wireframeBuffers && wireframeBuffers.indexCount > 0) {
+            const wireframeEdges = wireframeBuffers
+                ? null
+                : (cloth as ClothSimulator).getWireframeEdges?.() ?? null;
+            if (
+                (wireframeBuffers && wireframeBuffers.indexCount > 0) ||
+                (wireframeEdges && wireframeEdges.indexCount > 0)
+            ) {
                 // Create wireframe lighting data with bright cyan color
                 const wireframeLightingData = new Float32Array(64);
                 wireframeLightingData.set(lightingData);
@@ -648,24 +1046,43 @@ export class Renderer {
                 wireframeLightingData[16] = 0.0;
                 wireframeLightingData[17] = 0.0;
                 wireframeLightingData[18] = 0.0;
-                // Use overlay buffers so cloth lighting stays intact
-                this.device.queue.writeBuffer(this.overlayUniformBuffer!, 0, uniformData);
-                this.device.queue.writeBuffer(this.overlayLightingBuffer!, 0, wireframeLightingData);
-                
-                // Render wireframe quads (triangles) on top
-                pass.setPipeline(this.wireframePipeline);
-                pass.setBindGroup(
-                    0,
-                    this.createBindGroup(
-                        this.wireframePipeline,
-                        this.overlayUniformBuffer!,
-                        this.overlayLightingBuffer!
-                    )
-                );
-                pass.setVertexBuffer(0, wireframeBuffers.positionBuffer);
-                pass.setVertexBuffer(1, wireframeBuffers.normalBuffer);
-                pass.setIndexBuffer(wireframeBuffers.indexBuffer, wireframeBuffers.indexFormat);
-                pass.drawIndexed(wireframeBuffers.indexCount);
+                // Dedicated buffers: the seam overlay writes its own lighting
+                // later in this same pass, and both land before the submit.
+                this.device.queue.writeBuffer(this.wireframeUniformBuffer!, 0, uniformData);
+                this.device.queue.writeBuffer(this.wireframeLightingBuffer!, 0, wireframeLightingData);
+
+                if (wireframeBuffers && wireframeBuffers.indexCount > 0) {
+                    // Render wireframe quads (triangles) on top
+                    pass.setPipeline(this.wireframePipeline);
+                    pass.setBindGroup(
+                        0,
+                        this.createBindGroup(
+                            this.wireframePipeline,
+                            this.wireframeUniformBuffer!,
+                            this.wireframeLightingBuffer!
+                        )
+                    );
+                    pass.setVertexBuffer(0, wireframeBuffers.positionBuffer);
+                    pass.setVertexBuffer(1, wireframeBuffers.normalBuffer);
+                    pass.setIndexBuffer(wireframeBuffers.indexBuffer, wireframeBuffers.indexFormat);
+                    pass.drawIndexed(wireframeBuffers.indexCount);
+                } else if (wireframeEdges && this.linePipeline) {
+                    // Drape engines have no ribbon geometry: draw the mesh edges
+                    // straight from their vertex buffers as a line list.
+                    pass.setPipeline(this.linePipeline);
+                    pass.setBindGroup(
+                        0,
+                        this.createBindGroup(
+                            this.linePipeline,
+                            this.wireframeUniformBuffer!,
+                            this.wireframeLightingBuffer!
+                        )
+                    );
+                    pass.setVertexBuffer(0, positionBuffer);
+                    pass.setVertexBuffer(1, normalBuffer);
+                    pass.setIndexBuffer(wireframeEdges.indexBuffer, wireframeEdges.indexFormat);
+                    pass.drawIndexed(wireframeEdges.indexCount);
+                }
             } else {
                 // Fallback: disable wireframe if buffers not available
                 console.warn('Wireframe buffers not available, disabling wireframe mode');
@@ -675,40 +1092,54 @@ export class Renderer {
             }
         }
 
+        // Wireframe mode shows the mesh against empty space: a lit sphere and a
+        // floor under the wires only compete with them. The overlays further down
+        // (seam lines, quadrant grid) still draw, so the tools keep working.
+        const showScene = this.shading !== 'wireframe';
+
         // Render ground (sphere) — dedicated object buffers so cloth stays correctly lit
-        const ground = cloth.getGround();
-        const groundModel = ground.getModelMatrix();
-        const groundUniformData = new Float32Array(32);
-        groundUniformData.set(mat4ToArray(viewProj), 0);
-        groundUniformData.set(mat4ToArray(groundModel), 16);
-        this.device.queue.writeBuffer(this.objectUniformBuffer!, 0, groundUniformData);
+        const ground = showScene ? cloth.getGround() : null;
+        if (ground) {
+            const groundModel = ground.getModelMatrix();
+            const groundUniformData = new Float32Array(32);
+            groundUniformData.set(mat4ToArray(viewProj), 0);
+            groundUniformData.set(mat4ToArray(groundModel), 16);
+            this.device.queue.writeBuffer(this.objectUniformBuffer!, 0, groundUniformData);
 
-        const groundLightingData = new Float32Array(64);
-        groundLightingData.set(lightingData);
-        groundLightingData[20] = this.groundColor[0];
-        groundLightingData[21] = this.groundColor[1];
-        groundLightingData[22] = this.groundColor[2];
-        this.device.queue.writeBuffer(this.objectLightingBuffer!, 0, groundLightingData);
+            const groundLightingData = new Float32Array(64);
+            groundLightingData.set(lightingData);
+            this.writeMaterial(groundLightingData, this.referenceMaterial());
+            this.device.queue.writeBuffer(this.objectLightingBuffer!, 0, groundLightingData);
 
-        const objectBindGroup = this.createBindGroup(
-            this.renderPipeline!,
-            this.objectUniformBuffer!,
-            this.objectLightingBuffer!
-        );
-        pass.setPipeline(this.renderPipeline!);
-        pass.setBindGroup(0, objectBindGroup);
-        pass.setVertexBuffer(0, ground.getPositionBuffer());
-        pass.setVertexBuffer(1, ground.getNormalBuffer());
-        pass.setIndexBuffer(ground.getIndexBuffer(), 'uint32');
-        pass.drawIndexed(ground.getIndexCount());
+            // The collision reference (sphere collider or avatar) is part of the
+            // scene, so PBR mode lights it with the same environment.
+            const objectEnv = pbrAvailable ? this.pbrEnvBindGroup(this.pbrPipeline!) : null;
+            const objectPipeline = objectEnv ? this.pbrPipeline! : this.renderPipeline!;
+            const objectBindGroup = this.createBindGroup(
+                objectPipeline,
+                this.objectUniformBuffer!,
+                this.objectLightingBuffer!
+            );
+            pass.setPipeline(objectPipeline);
+            pass.setBindGroup(0, objectBindGroup);
+            if (objectEnv) pass.setBindGroup(1, objectEnv);
+            pass.setVertexBuffer(0, ground.getPositionBuffer());
+            pass.setVertexBuffer(1, ground.getNormalBuffer());
+            pass.setIndexBuffer(ground.getIndexBuffer(), 'uint32');
+            pass.drawIndexed(ground.getIndexCount());
+        }
 
         // Optional flat floor under the avatar
         const floor =
-          'getFloor' in cloth && typeof cloth.getFloor === 'function' ? cloth.getFloor?.() : null;
+          showScene && 'getFloor' in cloth && typeof cloth.getFloor === 'function'
+            ? cloth.getFloor?.()
+            : null;
         if (floor) {
           const floorModel = floor.getModelMatrix();
 
-          if (floor.usesRadialGradient?.() && this.floorPipeline) {
+          if (pbrAvailable) {
+            this.drawFloorCylinder(pass, floor, viewProj, lightingData);
+          } else if (floor.usesRadialGradient?.() && this.floorPipeline) {
             const floorUniformData = new Float32Array(36);
             floorUniformData.set(mat4ToArray(viewProj), 0);
             floorUniformData.set(mat4ToArray(floorModel), 16);
@@ -729,9 +1160,12 @@ export class Renderer {
 
             const floorLightingData = new Float32Array(64);
             floorLightingData.set(lightingData);
-            floorLightingData[20] = this.groundColor[0] * 0.75;
-            floorLightingData[21] = this.groundColor[1] * 0.78;
-            floorLightingData[22] = this.groundColor[2] * 0.85;
+            // The flat floor is the same material as the pedestal that replaces
+            // it in PBR mode, just drawn as a plane.
+            const flatFloor = this.pedestalMaterial();
+            floorLightingData[20] = flatFloor.color[0];
+            floorLightingData[21] = flatFloor.color[1];
+            floorLightingData[22] = flatFloor.color[2];
             this.device.queue.writeBuffer(this.floorLightingBuffer!, 0, floorLightingData);
 
             pass.setPipeline(this.renderPipeline!);

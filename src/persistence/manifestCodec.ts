@@ -31,6 +31,14 @@ export type ExternalizeOptions = {
   revision: number;
   /** Existing asset IDs keyed by data URL src to avoid re-upload. */
   existingAssetsBySrc?: Map<string, string>;
+  /**
+   * asset ID → the src whose bytes are actually in storage, owned by the store so
+   * it survives between saves. An image is only skipped when its current src is
+   * byte-for-byte the one recorded here; everything else is uploaded, which both
+   * writes new images and repairs one whose blob never reached storage. The codec
+   * records what it stores, so the map stays current.
+   */
+  storedAssetSrc?: Map<string, string>;
 };
 
 function isDataUrl(src: string): boolean {
@@ -70,25 +78,29 @@ export async function documentToSavePayload(
   const assetMap = new Map<string, string>(opts.existingAssetsBySrc);
   const assets: AssetRecord[] = [];
   const now = Date.now();
+  // One write per asset, however many nodes share it.
+  const stored = new Set<string>();
 
   for (const node of project.canvas.nodes) {
     if (node.type !== 'image') continue;
     const img = node as ImageNode & { assetId?: string };
+    // Only an in-memory data URL still needs writing. A blob URL means the node
+    // is already pointing at what an earlier save put in storage.
     if (!img.src || !isDataUrl(img.src)) continue;
-    let assetId = img.assetId ?? assetMap.get(img.src);
-    if (!assetId) {
-      assetId = uid('asset');
-      assetMap.set(img.src, assetId);
-      const { blob, mime } = await dataUrlToBlob(img.src);
-      assets.push({
-        id: assetId,
-        projectId: opts.projectId,
-        mime,
-        byteLength: blob.size,
-        blob,
-        createdAt: now,
-      });
-    }
+    const assetId = img.assetId ?? assetMap.get(img.src) ?? uid('asset');
+    assetMap.set(img.src, assetId);
+    if (stored.has(assetId) || opts.storedAssetSrc?.get(assetId) === img.src) continue;
+    const { blob, mime } = await dataUrlToBlob(img.src);
+    assets.push({
+      id: assetId,
+      projectId: opts.projectId,
+      mime,
+      byteLength: blob.size,
+      blob,
+      createdAt: now,
+    });
+    stored.add(assetId);
+    opts.storedAssetSrc?.set(assetId, img.src);
   }
 
   const poses: PoseRecord[] = [];

@@ -191,6 +191,16 @@ export function seamReadsFromSecondHalf(ref: { t0: number; t1: number }): boolea
   return ref.t0 > ref.t1;
 }
 
+/**
+ * Which axis a Shift-held drag is locked to: the one it has moved along most.
+ * Returns null when Shift is not held, so movement stays free in 2D. A tie
+ * (including no movement yet) locks to x.
+ */
+export function axisLockFromDelta(dx: number, dy: number, shift: boolean): 'x' | 'y' | null {
+  if (!shift) return null;
+  return Math.abs(dx) >= Math.abs(dy) ? 'x' : 'y';
+}
+
 export function sameSeamSpan(a: SeamEdgeRef, b: SeamEdgeRef): boolean {
   return (
     sameSeamEdgeTopology(a, b) &&

@@ -26,7 +26,10 @@ import { migrateLegacySimCamera } from './cameraDefaults';
 import { createViewportRenderer } from './SimViewportRuntime';
 import { SelectionOverlay } from './SelectionOverlay';
 import { ClothSewTool } from './ClothSewTool';
-import { keepPieceTransforms } from './pieceTransforms';
+import { arrangementBelongsTo, keepPieceTransforms } from './pieceTransforms';
+import { ViewportShadingControl } from './ViewportShadingControl';
+import type { Environment } from '../render/environment';
+import type { MaterialLibrary } from '../render/materials';
 import {
   buildQuadrantLayout,
   pickQuadrant,
@@ -102,7 +105,8 @@ export type Transform3dRuntimeOptions = {
   onPoseChange?: (transform: Transform3dInstance) => void;
   /** Fired once before a placement gesture so the host can snapshot undo history. */
   onBeforePoseChange?: () => void;
-  onSelectionChange?: (pieceId: string | null) => void;
+  /** Selected pieces changed: ids (primary first) plus the primary id. */
+  onSelectionChange?: (pieceIds: string[], primary: string | null) => void;
   /**
    * Two cloth edges were clicked together with the sew tool. The host owns the
    * pattern, the undo snapshot and the rebuild.
@@ -112,6 +116,10 @@ export type Transform3dRuntimeOptions = {
   onReverseSeam?: (seamId: string) => void;
   /** Right-clicked a sewn edge and chose "Delete seam": drop it and rebuild. */
   onDeleteSeam?: (seamId: string) => void;
+  /** Shared HDRI environment; without it there is no background or PBR probe. */
+  environment?: Environment | null;
+  /** Shared scene materials; without one the demo's own colours are used. */
+  materials?: MaterialLibrary | null;
 };
 
 export class Transform3dRuntime {
@@ -123,7 +131,11 @@ export class Transform3dRuntime {
   cloth: ClothSimulator | null = null;
   private avatarBody: AvatarBody | null = null;
   private device: GPUDevice;
+  private options: Transform3dRuntimeOptions;
   private viewGnomon: ViewportGnomon | null = null;
+  private shadingControl: ViewportShadingControl | null = null;
+  private environmentUnsubscribe: (() => void) | null = null;
+  private materialsUnsubscribe: (() => void) | null = null;
   private moveGizmo: MoveGizmo | null = null;
   private selectionOverlay: SelectionOverlay | null = null;
   private transformToggle: HTMLButtonElement | null = null;
@@ -162,11 +174,18 @@ export class Transform3dRuntime {
   private defaultCamera: SimCameraState;
   private onPoseChange?: (transform: Transform3dInstance) => void;
   private onBeforePoseChange?: () => void;
-  private onSelectionChange?: (pieceId: string | null) => void;
+  private onSelectionChange?: (pieceIds: string[], primary: string | null) => void;
   private onSewEdges?: (a: SeamEdgeRef, b: SeamEdgeRef) => void;
   private onReverseSeam?: (seamId: string) => void;
   private onDeleteSeam?: (seamId: string) => void;
   private poseHistoryArmed = false;
+  /**
+   * This viewport is static, so it renders only when something changed. Drawing
+   * every mounted transform every frame competed with plain hover / select on
+   * slower compositors.
+   */
+  private needsRender = true;
+  private resizeObserver: ResizeObserver | null = null;
 
   constructor(
     transformId: string,
@@ -186,6 +205,8 @@ export class Transform3dRuntime {
     this.onSewEdges = options.onSewEdges;
     this.onReverseSeam = options.onReverseSeam;
     this.onDeleteSeam = options.onDeleteSeam;
+    // Kept whole as well: the shading control reads the environment from here.
+    this.options = options;
     this.canvas = canvas;
     this.host = host;
     this.device = device;
@@ -203,11 +224,19 @@ export class Transform3dRuntime {
    * second set of controls on top.
    */
   dispose(): void {
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
     this.cloth?.destroy();
     this.cloth = null;
     this.renderer = null;
     this.viewGnomon?.destroy();
     this.viewGnomon = null;
+    this.shadingControl?.destroy();
+    this.shadingControl = null;
+    this.environmentUnsubscribe?.();
+    this.environmentUnsubscribe = null;
+    this.materialsUnsubscribe?.();
+    this.materialsUnsubscribe = null;
     this.moveGizmo?.destroy();
     this.moveGizmo = null;
     this.selectionOverlay?.destroy();
@@ -250,6 +279,7 @@ export class Transform3dRuntime {
 
   syncFromDocument(transform: Transform3dInstance): void {
     this.transform = transform;
+    this.invalidate();
   }
 
   applyCamera(transform: Transform3dInstance): void {
@@ -260,6 +290,7 @@ export class Transform3dRuntime {
     this.camera.setPanX(transform.camera.target[0]);
     this.camera.setPanY(transform.camera.target[1]);
     this.camera.setPanZ(transform.camera.target[2]);
+    this.invalidate();
   }
 
   captureCamera(transform: Transform3dInstance): void {
@@ -281,6 +312,7 @@ export class Transform3dRuntime {
     this.camera.setPanY(camera.target[1]);
     this.camera.setPanZ(camera.target[2]);
     this.syncMoveGizmo();
+    this.invalidate();
   }
 
   private markBeforePoseChange(): void {
@@ -433,7 +465,22 @@ export class Transform3dRuntime {
     this.avatarBody = await loadAvatarBody(this.device);
     migrateLegacySimCamera(this.transform.camera, this.defaultCamera);
     this.applyCamera(this.transform);
+    const materials = this.options.materials ?? null;
+    if (materials) {
+      renderer.attachMaterials(materials);
+      this.materialsUnsubscribe?.();
+      this.materialsUnsubscribe = materials.onChange(() => this.invalidate());
+    }
+    const environment = this.options.environment ?? null;
+    if (environment) {
+      renderer.attachEnvironment(environment);
+      renderer.setShadingMode(environment.currentSettings.shading);
+      // The environment is shared: a new HDRI has to reach every viewport.
+      this.environmentUnsubscribe?.();
+      this.environmentUnsubscribe = environment.onChange(() => this.invalidate());
+    }
     this.mountViewGnomon();
+    this.mountShadingControl();
     this.selectionOverlay = new SelectionOverlay(this.host);
     this.sewTool = new ClothSewTool({
       host: this.host,
@@ -451,6 +498,13 @@ export class Transform3dRuntime {
     this.mountSewToggle();
     this.bindPointer();
     this.bindKeyboard();
+    if (typeof ResizeObserver !== 'undefined') {
+      this.resizeObserver = new ResizeObserver(() => {
+        this.resize();
+        this.invalidate();
+      });
+      this.resizeObserver.observe(this.canvas);
+    }
   }
 
   /**
@@ -485,6 +539,7 @@ export class Transform3dRuntime {
     this.sewTool?.setEnabled(enabled);
     this.syncSewToggle();
     this.syncCursor();
+    this.invalidate();
   }
 
   isSewEnabled(): boolean {
@@ -540,6 +595,7 @@ export class Transform3dRuntime {
     if (enabled) this.setSewEnabled(false);
     this.syncSnapToggle();
     this.pushQuadrantOverlay();
+    this.invalidate();
     this.syncCursor();
   }
 
@@ -695,11 +751,24 @@ export class Transform3dRuntime {
     this.viewGnomon.syncFromCamera(this.camera);
   }
 
+  /** The wireframe / simple / PBR toggle, sitting left of the gnomon. */
+  private mountShadingControl(): void {
+    this.shadingControl?.destroy();
+    if (!this.renderer) return;
+    this.shadingControl = new ViewportShadingControl(this.host, {
+      renderer: this.renderer,
+      environment: this.options.environment ?? null,
+      materials: this.options.materials ?? null,
+      onInvalidate: () => this.invalidate(),
+    });
+  }
+
   private mountMoveGizmo(): void {
     this.moveGizmo?.destroy();
     this.moveGizmo = new MoveGizmo(this.host, {
       onDragStart: (axis, clientX, clientY) => {
         if (!this.cloth || this.selectedPieceIds.size === 0) return;
+        this.invalidate();
         this.markBeforePoseChange();
         this.nav = 'gizmo';
         this.gizmoAxis = axis;
@@ -731,6 +800,7 @@ export class Transform3dRuntime {
       },
       onDrag: (_axis, _dx, _dy, clientX, clientY) => {
         if (!this.cloth || !this.gizmoAxis || this.selectedPieceIds.size === 0) return;
+        this.invalidate();
         if (this.transformMode === 'rotate') {
           const axis = this.rotationAxis(this.gizmoAxis);
           const angle = (_dx - _dy) * 0.012;
@@ -768,6 +838,7 @@ export class Transform3dRuntime {
         this.gizmoAxis = null;
         this.lastPlaneHit = null;
         this.persistArrangement();
+        this.invalidate();
       },
     });
   }
@@ -808,7 +879,13 @@ export class Transform3dRuntime {
     this.selectedPieceId = primary;
     this.syncMoveGizmo();
     this.syncCursor();
-    this.onSelectionChange?.(primary);
+    this.invalidate();
+    this.onSelectionChange?.([...this.selectedPieceIds], primary);
+  }
+
+  /** Select whole pieces by id — the split view's 2D → 3D sync. */
+  setSelectedPieces(pieceIds: readonly string[], primary?: string | null): void {
+    this.setPieceSelection([...pieceIds], primary ?? pieceIds[0] ?? null);
   }
 
   /** Mean of the selected pieces' centroids — the shared transform pivot. */
@@ -886,7 +963,12 @@ export class Transform3dRuntime {
     }
     this.moveGizmo.setVisible(true);
     this.moveGizmo.setScreenPosition(pivotPx.x, pivotPx.y);
-    this.moveGizmo.updateAxisLayout(this.camera);
+    this.moveGizmo.updateAxisLayout({
+      camera: this.camera,
+      origin: pivot,
+      width: this.canvas.clientWidth,
+      height: this.canvas.clientHeight,
+    });
   }
 
   private rotationAxis(axis: MoveAxis): vec3 {
@@ -913,6 +995,7 @@ export class Transform3dRuntime {
       this.canvas.height = h;
       this.renderer?.resize(w, h);
       this.camera.setAspect(w / h);
+      this.needsRender = true;
     }
   }
 
@@ -957,8 +1040,14 @@ export class Transform3dRuntime {
     );
     this.transform.pieceTransforms = kept;
 
+    // The pose has to be one of *these* pieces, not merely the same length: the
+    // arrangement below is stored per piece and can be carried onto another
+    // pattern piece for piece, but a vertex pose from that pattern cannot.
     const poseMatchesTopology =
-      !!pose && pose.positions.length === geom.vertices.length * 3 && pose.positions.length >= 12;
+      arrangementBelongsTo(pieceTransforms, liveIds) &&
+      !!pose &&
+      pose.positions.length === geom.vertices.length * 3 &&
+      pose.positions.length >= 12;
 
     if (poseMatchesTopology) {
       this.cloth.applyPose(pose);
@@ -972,11 +1061,13 @@ export class Transform3dRuntime {
       this.applyDefaultArrangement();
     }
     this.setPieceSelected(null);
+    this.invalidate();
   }
 
   setAvatarBody(body: AvatarBody): void {
     this.avatarBody = body;
     this.cloth?.setAvatar(body);
+    this.invalidate();
   }
 
   private bindPointer(): void {
@@ -1055,6 +1146,7 @@ export class Transform3dRuntime {
                     : 'grab'
                 : 'grabbing';
       this.canvas.setPointerCapture(e.pointerId);
+      this.invalidate();
       e.preventDefault();
       e.stopPropagation();
     });
@@ -1078,7 +1170,12 @@ export class Transform3dRuntime {
       if (this.isSewEnabled() && this.nav === 'none') {
         this.sewTool?.refreshHover(e.clientX, e.clientY);
       }
-      if (this.nav === 'none' || this.nav === 'gizmo') return;
+      if (this.nav === 'none' || this.nav === 'gizmo') {
+        // Bare hover only redraws when an overlay follows the pointer.
+        if (this.snapToQuadrantEnabled || this.isSewEnabled()) this.invalidate();
+        return;
+      }
+      this.invalidate();
       const dx = e.clientX - this.lastX;
       const dy = e.clientY - this.lastY;
       if (Math.abs(dx) + Math.abs(dy) > 3) this.pointerMoved = true;
@@ -1188,6 +1285,7 @@ export class Transform3dRuntime {
         this.sewTool?.refreshHover(e.clientX, e.clientY);
       }
       this.syncCursor();
+      this.invalidate();
     };
     this.canvas.addEventListener('pointerup', endDrag);
     this.canvas.addEventListener('pointercancel', endDrag);
@@ -1200,6 +1298,7 @@ export class Transform3dRuntime {
         this.camera.setDistance(Math.max(1.5, Math.min(80, this.camera.getDistance() * factor)));
         this.viewGnomon?.syncFromCamera(this.camera);
         this.syncMoveGizmo();
+        this.invalidate();
       },
       { passive: false }
     );
@@ -1249,9 +1348,16 @@ export class Transform3dRuntime {
    * One frame. Nothing here changes with time — the arrangement is static — so a
    * covered viewport simply does not draw until it is uncovered.
    */
+  /** Mark the viewport dirty so the next frame redraws it. */
+  invalidate(): void {
+    this.needsRender = true;
+  }
+
   frame(visible = true): void {
     if (!visible) return;
     if (!this.renderer || !this.cloth) return;
+    if (!this.needsRender) return;
+    this.needsRender = false;
     this.resize();
     this.cloth.update(false);
     this.camera.update();

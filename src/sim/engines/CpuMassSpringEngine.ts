@@ -171,4 +171,8 @@ export class CpuMassSpringEngine implements ClothSimulator {
   getWireframeBuffers(): null {
     return this.cloth.getWireframeBuffers();
   }
+
+  getWireframeEdges(): { indexBuffer: GPUBuffer; indexFormat: GPUIndexFormat; indexCount: number } | null {
+    return this.cloth.getWireframeEdges();
+  }
 }

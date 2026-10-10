@@ -6,6 +6,7 @@ import { identity } from '../../../utils/math';
 import type { MeshGeometry, PatternDocument, SimParams, SimPose } from '../../../project/types';
 import type { ClothCollider, ClothFloor, ClothSimulator } from '../../ClothSimulator';
 import { buildClothTopology, FALLBACK_PIECE_ID, type ClothTopology } from '../../meshTopology';
+import { buildWireframeEdgeIndices } from '../../wireframeEdges';
 import { colorConstraints, colorStretchConstraints } from '../../graphColoring';
 import { fillStrainColors, type StrainEdge } from '../../strainMap';
 import {
@@ -186,6 +187,8 @@ export class XpbdGpuEngine implements ClothSimulator {
   private stretchEdges: StrainEdge[] = [];
   private strainMapEnabled = false;
   private indexBuffer!: GPUBuffer;
+  private wireframeEdgeBuffer: GPUBuffer | null = null;
+  private wireframeEdgeCount = 0;
   private seamLinePosBuf: GPUBuffer | null = null;
   private seamLineNrmBuf: GPUBuffer | null = null;
   private seamLineVertexCount = 0;
@@ -443,6 +446,17 @@ export class XpbdGpuEngine implements ClothSimulator {
       'xpbd-index'
     );
     this.writeBuf(this.indexBuffer, this.indices);
+
+    const edgeIndices = buildWireframeEdgeIndices(this.indices);
+    this.wireframeEdgeCount = edgeIndices.length;
+    if (this.wireframeEdgeCount > 0) {
+      this.wireframeEdgeBuffer = this.createBuf(
+        edgeIndices.byteLength,
+        GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+        'xpbd-wireframe-edges'
+      );
+      this.writeBuf(this.wireframeEdgeBuffer, edgeIndices);
+    }
 
     this.stagingBuf = this.createBuf(
       n * 16,
@@ -1585,6 +1599,15 @@ export class XpbdGpuEngine implements ClothSimulator {
     return null;
   }
 
+  getWireframeEdges(): { indexBuffer: GPUBuffer; indexFormat: GPUIndexFormat; indexCount: number } | null {
+    if (!this.wireframeEdgeBuffer || this.wireframeEdgeCount === 0) return null;
+    return {
+      indexBuffer: this.wireframeEdgeBuffer,
+      indexFormat: 'uint32',
+      indexCount: this.wireframeEdgeCount,
+    };
+  }
+
   destroy(): void {
     const bufs: Array<GPUBuffer | null | undefined> = [
       this.positionsBuf,
@@ -1612,6 +1635,7 @@ export class XpbdGpuEngine implements ClothSimulator {
       this.renderNrmBuf,
       this.colorBuffer,
       this.indexBuffer,
+      this.wireframeEdgeBuffer,
       this.stagingBuf,
       this.stagingBufB,
       this.stagingVelBuf,

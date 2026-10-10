@@ -34,22 +34,6 @@ export type SaveResult = {
   error?: string;
 };
 
-export type DirtyState = {
-  manifest: boolean;
-  assetIds: Set<string>;
-  poseIds: Set<string>;
-  meshCacheIds: Set<string>;
-};
-
-export function createDirtyState(all = true): DirtyState {
-  return {
-    manifest: all,
-    assetIds: new Set(),
-    poseIds: new Set(),
-    meshCacheIds: new Set(),
-  };
-}
-
 export class ProjectStore {
   readonly assets = new AssetUrlResolver();
   private initialized = false;
@@ -58,6 +42,11 @@ export class ProjectStore {
   private revisionByProject = new Map<string, number>();
   /** src data URL → assetId for deduping within a session. */
   private assetIdsBySrc = new Map<string, string>();
+  /**
+   * assetId → the src whose bytes are in storage. The save path compares against
+   * this to decide what actually needs writing.
+   */
+  private storedAssetSrc = new Map<string, string>();
 
   async initialize(): Promise<void> {
     if (this.initialized) return;
@@ -97,7 +86,7 @@ export class ProjectStore {
         if (lib.version === 1 && Array.isArray(lib.projects)) {
           for (const record of lib.projects) {
             const project = normalizeProject(record.data);
-            await this.saveProject(project, { revision: 0, forceFull: true, duringInit: true });
+            await this.saveProject(project, { revision: 0, duringInit: true });
             migratedCount += 1;
           }
           if (lib.activeId) {
@@ -108,7 +97,7 @@ export class ProjectStore {
         const rawSingle = localStorage.getItem(LEGACY_SINGLE_KEY);
         if (rawSingle) {
           const project = normalizeProject(parseProject(rawSingle));
-          await this.saveProject(project, { revision: 0, forceFull: true });
+          await this.saveProject(project, { revision: 0 });
           await setMeta('activeProjectId', project.id);
           migratedCount += 1;
         }
@@ -183,6 +172,15 @@ export class ProjectStore {
       (assetId, blob) => this.assets.resolve(assetId, blob)
     );
 
+    // What came back with bytes is what storage holds; an image node left with no
+    // src is one whose blob is gone, and the document says so by itself.
+    this.storedAssetSrc.clear();
+    for (const node of doc.canvas.nodes) {
+      if (node.type !== 'image' || !node.src) continue;
+      const assetId = (node as { assetId?: string }).assetId;
+      if (assetId) this.storedAssetSrc.set(assetId, node.src);
+    }
+
     this.revisionByProject.set(id, meta.revision);
     return doc;
   }
@@ -191,8 +189,6 @@ export class ProjectStore {
     project: ProjectDocument,
     opts: {
       revision?: number;
-      dirty?: DirtyState;
-      forceFull?: boolean;
       /** Used while migrating legacy localStorage during initialize(). */
       duringInit?: boolean;
     } = {}
@@ -207,7 +203,7 @@ export class ProjectStore {
 
   private async doSave(
     project: ProjectDocument,
-    opts: { revision?: number; dirty?: DirtyState; forceFull?: boolean }
+    opts: { revision?: number }
   ): Promise<SaveResult> {
     const prevRevision = this.revisionByProject.get(project.id) ?? opts.revision ?? 0;
     const nextRevision = prevRevision + 1;
@@ -226,6 +222,7 @@ export class ProjectStore {
         projectId: project.id,
         revision: nextRevision,
         existingAssetsBySrc,
+        storedAssetSrc: this.storedAssetSrc,
       });
 
       for (const asset of payload.assets) {
@@ -244,7 +241,6 @@ export class ProjectStore {
         }
       }
 
-      const dirty = opts.dirty;
       const meta: ProjectMetaRecord = {
         id: project.id,
         name: project.name,
@@ -253,23 +249,12 @@ export class ProjectStore {
         manifest: payload.manifest,
       };
 
-      let assets = payload.assets;
-      let poses = payload.poses;
-      let meshCaches = payload.meshCaches;
-
-      if (dirty && !opts.forceFull) {
-        if (!dirty.manifest) {
-          /* manifest always written with meta */
-        }
-        if (dirty.assetIds.size === 0) assets = [];
-        else assets = assets.filter((a) => dirty.assetIds.has(a.id));
-        if (dirty.poseIds.size === 0) poses = [];
-        else poses = poses.filter((p) => dirty.poseIds.has(p.id));
-        if (dirty.meshCacheIds.size === 0) meshCaches = [];
-        else meshCaches = meshCaches.filter((m) => dirty.meshCacheIds.has(m.id));
-      }
-
-      await saveProjectBundle(meta, assets, poses, meshCaches, prevRevision);
+      // Everything the payload produced is written. A "patch" used to filter
+      // these blobs by a `DirtyState`, but nothing ever populated its id sets, so
+      // an ordinary save quietly dropped every newly imported image blob — and
+      // every pose and mesh cache with it — while the manifest went on pointing at
+      // them. That is what came back as images showing nothing after a restart.
+      await saveProjectBundle(meta, payload.assets, payload.poses, payload.meshCaches, prevRevision);
 
       const referencedAssets = new Set<string>();
       for (const node of payload.manifest.canvas.nodes) {
@@ -312,6 +297,7 @@ export class ProjectStore {
     this.saveChain = Promise.resolve({ ok: true, revision: 0 });
     this.revisionByProject.clear();
     this.assetIdsBySrc.clear();
+    this.storedAssetSrc.clear();
     this.assets.revokeAll();
   }
 

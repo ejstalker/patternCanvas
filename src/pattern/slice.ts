@@ -1,4 +1,4 @@
-import type { BezierPoint, PatternPiece, Vec2 } from '../project/types';
+import type { BezierPoint, PatternPiece, SeamEdgeRef, Vec2 } from '../project/types';
 import {
   dist,
   edgeHandles,
@@ -12,10 +12,23 @@ const EPS = 1e-6;
 const T_EPS = 1e-4;
 const MERGE_CM = 0.08;
 
+/** One anchor of an open cutter chain; the handles shape its segments. */
+export type CutterChainPoint = {
+  anchor: Vec2;
+  handleIn: Vec2 | null;
+  handleOut: Vec2 | null;
+};
+
 export type CutterPath =
   | { kind: 'line'; a: Vec2; b: Vec2 }
   | { kind: 'circle'; center: Vec2; radius: number }
-  | { kind: 'cubic'; a: Vec2; c0: Vec2; c1: Vec2; b: Vec2 };
+  | { kind: 'cubic'; a: Vec2; c0: Vec2; c1: Vec2; b: Vec2 }
+  /**
+   * An open Bézier chain. The loop knife builds one of these, so a cut that
+   * follows the piece's contours arrives as a few smooth segments instead of
+   * the noisy polyline it was sampled from.
+   */
+  | { kind: 'path'; points: CutterChainPoint[] };
 
 export type BoundaryHit = {
   edgeIndex: number;
@@ -26,12 +39,21 @@ export type BoundaryHit = {
   pointId?: string;
 };
 
+/** How a click-drawn knife chain is joined up between its points. */
+export type CutterChainFit = 'straight' | 'smooth';
+
 export type SliceResult =
   | {
       ok: true;
       pieces: [PatternPiece, PatternPiece];
       /** Original/inserted working point ID → fresh point ID on each child. */
       pointIdMaps: [Map<string, string>, Map<string, string>];
+      /**
+       * The cut's own edges on each child, in matched pairs: `a` on the first
+       * child against `b` on the second, both reading the same way along the cut,
+       * so sewing them welds the split back together instead of twisting it.
+       */
+      cutEdges: Array<{ a: SeamEdgeRef; b: SeamEdgeRef }>;
     }
   | { ok: false; reason: string };
 
@@ -149,6 +171,130 @@ export function insertPointOnEdgePreserving(
     right.c1.x === b.anchor.x && right.c1.y === b.anchor.y ? null : { ...right.c1 };
   points.splice(edgeIndex + 1, 0, point);
   return point;
+}
+
+/** Samples per segment when a chain is flattened for intersection tests. */
+const CHAIN_STEPS = 24;
+
+type ChainSegment = {
+  a: Vec2;
+  c0: Vec2;
+  c1: Vec2;
+  b: Vec2;
+  /** Arc length from the start of the chain to this segment's start. */
+  startArc: number;
+  length: number;
+};
+
+function chainHandles(points: CutterChainPoint[], i: number): { c0: Vec2; c1: Vec2 } {
+  const a = points[i]!;
+  const b = points[i + 1]!;
+  return {
+    c0: a.handleOut ? { ...a.handleOut } : { ...a.anchor },
+    c1: b.handleIn ? { ...b.handleIn } : { ...b.anchor },
+  };
+}
+
+/** Flatten a chain into cubic segments with their arc lengths. */
+function chainSegments(points: CutterChainPoint[]): ChainSegment[] {
+  const segments: ChainSegment[] = [];
+  let arc = 0;
+  for (let i = 0; i + 1 < points.length; i++) {
+    const { c0, c1 } = chainHandles(points, i);
+    const a = points[i]!.anchor;
+    const b = points[i + 1]!.anchor;
+    const samples = sampleCubic(a, c0, c1, b, CHAIN_STEPS);
+    let length = 0;
+    for (let k = 1; k < samples.length; k++) {
+      length += dist(samples[k - 1]!, samples[k]!);
+    }
+    segments.push({ a: { ...a }, c0, c1, b: { ...b }, startArc: arc, length });
+    arc += length;
+  }
+  return segments;
+}
+
+function chainArcLength(segments: ChainSegment[]): number {
+  const last = segments[segments.length - 1];
+  return last ? last.startArc + last.length : 0;
+}
+
+/** Segment index and parameter at an arc length along the chain. */
+function chainAtArc(
+  segments: ChainSegment[],
+  arc: number
+): { index: number; t: number } {
+  if (segments.length === 0) return { index: 0, t: 0 };
+  const total = chainArcLength(segments);
+  const want = Math.max(0, Math.min(total, arc));
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i]!;
+    if (i < segments.length - 1 && want > seg.startArc + seg.length) continue;
+    if (seg.length < EPS) return { index: i, t: 0 };
+    // Walk the segment's samples to invert arc length without assuming a
+    // uniform speed along the cubic.
+    const samples = sampleCubic(seg.a, seg.c0, seg.c1, seg.b, CHAIN_STEPS);
+    const target = Math.max(0, Math.min(seg.length, want - seg.startArc));
+    let walked = 0;
+    for (let k = 1; k < samples.length; k++) {
+      const step = dist(samples[k - 1]!, samples[k]!);
+      if (walked + step >= target || k === samples.length - 1) {
+        const within = step < EPS ? 0 : (target - walked) / step;
+        return { index: i, t: (k - 1 + Math.max(0, Math.min(1, within))) / CHAIN_STEPS };
+      }
+      walked += step;
+    }
+  }
+  return { index: segments.length - 1, t: 1 };
+}
+
+/** The chain between two arc lengths, trimmed with exact Bézier handles. */
+function trimChain(
+  points: CutterChainPoint[],
+  fromArc: number,
+  toArc: number
+): CutterChainPoint[] {
+  const segments = chainSegments(points);
+  if (segments.length === 0) return [];
+  const lo = Math.min(fromArc, toArc);
+  const hi = Math.max(fromArc, toArc);
+  const start = chainAtArc(segments, lo);
+  const end = chainAtArc(segments, hi);
+
+  const startSeg = segments[start.index]!;
+  const endSeg = segments[end.index]!;
+  const startSplit = splitCubicAtT(
+    startSeg.a,
+    startSeg.c0,
+    startSeg.c1,
+    startSeg.b,
+    start.t
+  );
+  const endSplit = splitCubicAtT(endSeg.a, endSeg.c0, endSeg.c1, endSeg.b, end.t);
+
+  const out: CutterChainPoint[] = [
+    {
+      anchor: { ...startSplit.point },
+      handleIn: null,
+      handleOut: { ...startSplit.right.c0 },
+    },
+  ];
+  // Anchors strictly between the two cuts keep the handles they were built with.
+  const firstMiddle = startSplit.right.p0 === endSplit.left.p0 ? start.index : start.index + 1;
+  for (let i = firstMiddle; i <= end.index; i++) {
+    const original = points[i]!;
+    out.push({
+      anchor: { ...original.anchor },
+      handleIn: original.handleIn ? { ...original.handleIn } : null,
+      handleOut: original.handleOut ? { ...original.handleOut } : null,
+    });
+  }
+  out.push({
+    anchor: { ...endSplit.point },
+    handleIn: { ...endSplit.left.c1 },
+    handleOut: null,
+  });
+  return out;
 }
 
 function cross(ax: number, ay: number, bx: number, by: number): number {
@@ -470,11 +616,28 @@ export function findBoundaryHits(piece: PatternPiece, cutter: CutterPath): Bound
     else if (cutter.kind === 'circle') {
       if (cutter.radius < MERGE_CM) continue;
       local = edgeCircleIntersections(a, b, cutter.center, cutter.radius);
+    } else if (cutter.kind === 'path') {
+      // Each flattened segment is an infinite line test, kept only where the
+      // hit lands inside that segment's own span. Arc length accumulates across
+      // segments so hits still sort along the whole cut.
+      local = [];
+      for (const seg of chainSegments(cutter.points)) {
+        for (const h of edgeLineIntersections(a, b, seg.a, seg.b)) {
+          if (h.along < -T_EPS || h.along > 1 + T_EPS) continue;
+          const within = Math.max(0, Math.min(1, h.along));
+          local.push({ t: h.t, point: h.point, along: seg.startArc + within * seg.length });
+        }
+      }
+      const deduped: typeof local = [];
+      for (const h of local) {
+        if (!deduped.some((o) => dist(o.point, h.point) < MERGE_CM)) deduped.push(h);
+      }
+      local = deduped;
     } else {
       local = edgeCubicIntersections(a, b, cutter.a, cutter.c0, cutter.c1, cutter.b);
     }
     for (const h of local) {
-      if (cutter.kind === 'line' && (h.t <= T_EPS || h.t >= 1 - T_EPS)) {
+      if ((cutter.kind === 'line' || cutter.kind === 'path') && (h.t <= T_EPS || h.t >= 1 - T_EPS)) {
         const vertexIndex = h.t <= T_EPS ? i : (i + 1) % n;
         const vertex = piece.points[vertexIndex]!;
         hits.push({
@@ -501,9 +664,84 @@ export function findBoundaryHits(piece: PatternPiece, cutter: CutterPath): Bound
   return merged;
 }
 
+/**
+ * A cutter that follows the points a knife click left behind.
+ *
+ * `smooth` bends through the clicks — each point carries one tangent, read from
+ * the neighbours either side — so the cut arrives as a drawn curve; `straight`
+ * joins them with plain edges. Two points are a line either way.
+ */
+export function cutterPathThrough(
+  anchors: readonly Vec2[],
+  fit: CutterChainFit = 'smooth'
+): CutterPath | null {
+  if (anchors.length < 2) return null;
+  const points: CutterChainPoint[] = anchors.map((anchor) => ({
+    anchor: { ...anchor },
+    handleIn: null,
+    handleOut: null,
+  }));
+  if (fit !== 'smooth' || anchors.length < 3) return { kind: 'path', points };
+
+  const last = anchors.length - 1;
+  for (let i = 0; i <= last; i++) {
+    const anchor = anchors[i]!;
+    // The ends have one neighbour, so their tangent is one-sided: the curve
+    // leaves the first click along the line it was started on and arrives at the
+    // last the same way.
+    const prev = anchors[Math.max(0, i - 1)]!;
+    const next = anchors[Math.min(last, i + 1)]!;
+    const dx = next.x - prev.x;
+    const dy = next.y - prev.y;
+    const length = Math.hypot(dx, dy);
+    if (length < EPS) continue;
+    const point = points[i]!;
+    const gapIn = dist(prev, anchor);
+    const gapOut = dist(anchor, next);
+    point.handleIn = {
+      x: anchor.x - (dx / length) * (gapIn / 3),
+      y: anchor.y - (dy / length) * (gapIn / 3),
+    };
+    point.handleOut = {
+      x: anchor.x + (dx / length) * (gapOut / 3),
+      y: anchor.y + (dy / length) * (gapOut / 3),
+    };
+  }
+  return { kind: 'path', points };
+}
+
+/**
+ * The piece a chain cut is for: the one the chain is drawn through.
+ *
+ * Measured by how much of the *drawn* chain lies inside each piece, not by what
+ * the chain's carried-on ends touch. A panel the ends run into — past the end of
+ * the cut, or before its beginning — is not the one being cut, and the knife must
+ * not take it. Null when the chain runs through nothing.
+ */
+export function pieceUnderChain(
+  pieces: readonly PatternPiece[],
+  anchors: readonly Vec2[],
+  fit: CutterChainFit = 'smooth'
+): PatternPiece | null {
+  const cutter = cutterPathThrough(anchors, fit);
+  if (!cutter) return null;
+  const samples = sampleCutterPath(cutter, 96);
+  let best: { piece: PatternPiece; inside: number } | null = null;
+  for (const piece of pieces) {
+    if (!piece.closed || piece.points.length < 3) continue;
+    const poly = pieceToPolyline(piece.points, true);
+    let inside = 0;
+    for (const sample of samples) {
+      if (pointInPolygon(sample, poly)) inside++;
+    }
+    if (inside === 0) continue;
+    if (!best || inside > best.inside) best = { piece, inside };
+  }
+  return best?.piece ?? null;
+}
+
 /** Snap a direction to the nearest multiple of `stepDeg` degrees. */
-export function snapAngleDegrees(dx: number, dy: number, stepDeg = 30): Vec2 {
-  const len = Math.hypot(dx, dy);
+export function snapAngleDegrees(dx: number, dy: number, stepDeg = 30): Vec2 {  const len = Math.hypot(dx, dy);
   if (len < EPS) return { x: 0, y: 0 };
   const step = (stepDeg * Math.PI) / 180;
   const ang = Math.atan2(dy, dx);
@@ -564,7 +802,9 @@ function buildCutBridge(
   from: Vec2,
   to: Vec2,
   makeId: () => string,
-  piecePoly: Vec2[]
+  piecePoly: Vec2[],
+  /** Where the two ends sit along the cutter, for chains. */
+  span?: { fromArc: number; toArc: number }
 ): BezierPoint[] {
   if (cutter.kind === 'line') {
     return [
@@ -614,6 +854,31 @@ function buildCutBridge(
       });
     }
     return pts;
+  }
+
+  if (cutter.kind === 'path') {
+    const segs = chainSegments(cutter.points);
+    const total = chainArcLength(segs);
+    // The two ends are the boundary hits; without their arc positions (or on a
+    // chain too short to matter) fall back to the whole chain.
+    const fromArc = span ? span.fromArc : 0;
+    const toArc = span ? span.toArc : total;
+    const trimmed = trimChain(cutter.points, fromArc, toArc);
+    if (trimmed.length < 2) return [];
+    const runsForward = fromArc <= toArc;
+    const ordered = runsForward ? trimmed : trimmed.slice().reverse();
+    return ordered.map((pt) => ({
+      id: makeId(),
+      anchor: { ...pt.anchor },
+      handleIn: runsForward ? (pt.handleIn ? { ...pt.handleIn } : null) : pt.handleOut ? { ...pt.handleOut } : null,
+      handleOut: runsForward ? (pt.handleOut ? { ...pt.handleOut } : null) : pt.handleIn ? { ...pt.handleIn } : null,
+      handlesParallel: false,
+    })).map((pt, index, all) => {
+      // The anchors themselves are the hits, exactly where the boundary points sit.
+      if (index === 0) return { ...pt, anchor: { ...from } };
+      if (index === all.length - 1) return { ...pt, anchor: { ...to } };
+      return pt;
+    });
   }
 
   return [
@@ -782,12 +1047,18 @@ export function slicePiece(
   }
 
   const piecePoly = pieceToPolyline(working, true);
+  // A chain cutter has to know which part of itself lies between the two hits.
+  const arcFor = (p: Vec2): number =>
+    dist(p, h0.point) <= dist(p, h1.point) ? h0.along : h1.along;
   const bridgeAB = buildCutBridge(
     cutter,
     working[iA]!.anchor,
     working[iB]!.anchor,
     makeId,
-    piecePoly
+    piecePoly,
+    cutter.kind === 'path'
+      ? { fromArc: arcFor(working[iA]!.anchor), toArc: arcFor(working[iB]!.anchor) }
+      : undefined
   );
   const bridgeBA = reverseBridge(bridgeAB, makeId);
   const fresh1 = withFreshIds(buildRing(arcAB, bridgeBA), makeId);
@@ -824,11 +1095,67 @@ export function slicePiece(
     ok: true,
     pieces: [child1, child2],
     pointIdMaps: [fresh1.pointIdMap, fresh2.pointIdMap],
+    cutEdges: pairCutEdges(child1, child2, fresh1.pointIdMap, fresh2.pointIdMap, {
+      a: { end: working[iB]!.id, start: working[iA]!.id, bridge: bridgeBA },
+      b: { end: working[iA]!.id, start: working[iB]!.id, bridge: bridgeAB },
+    }),
   };
+}
+
+/**
+ * The cut's own edges on each child, matched up across the split.
+ *
+ * Each child's bridge runs the cut in the opposite direction to the other's —
+ * that is what makes the two rings wind the same way — so the edges are paired
+ * from opposite ends, and the second child's reference is read backwards so both
+ * sides read along the cut in the same direction. Sewing them then welds the
+ * split rather than twisting it.
+ */
+function pairCutEdges(
+  child1: PatternPiece,
+  child2: PatternPiece,
+  map1: Map<string, string>,
+  map2: Map<string, string>,
+  sides: {
+    a: { end: string; start: string; bridge: BezierPoint[] };
+    b: { end: string; start: string; bridge: BezierPoint[] };
+  }
+): Array<{ a: SeamEdgeRef; b: SeamEdgeRef }> {
+  const chain = (map: Map<string, string>, side: { end: string; start: string; bridge: BezierPoint[] }) => {
+    const ids = [map.get(side.end), ...side.bridge.slice(1, -1).map((pt) => map.get(pt.id)), map.get(side.start)];
+    return ids.filter((id): id is string => !!id);
+  };
+  const chainA = chain(map1, sides.a);
+  const chainB = chain(map2, sides.b);
+  const segments = Math.min(chainA.length, chainB.length) - 1;
+  const edges: Array<{ a: SeamEdgeRef; b: SeamEdgeRef }> = [];
+  for (let j = 0; j < segments; j++) {
+    const bFrom = chainB[chainB.length - 2 - j];
+    const bTo = chainB[chainB.length - 1 - j];
+    if (!bFrom || !bTo) continue;
+    edges.push({
+      a: { pieceId: child1.id, fromPointId: chainA[j]!, toPointId: chainA[j + 1]!, t0: 0, t1: 1 },
+      b: { pieceId: child2.id, fromPointId: bFrom, toPointId: bTo, t0: 1, t1: 0 },
+    });
+  }
+  return edges;
 }
 
 export function sampleCutterPath(cutter: CutterPath, steps = 48): Vec2[] {
   if (cutter.kind === 'line') return [cutter.a, cutter.b];
+  if (cutter.kind === 'path') {
+    const segments = chainSegments(cutter.points);
+    const total = chainArcLength(segments);
+    if (total < EPS) return [];
+    const out: Vec2[] = [];
+    for (let i = 0; i <= steps; i++) {
+      const arc = (i / steps) * total;
+      const at = chainAtArc(segments, arc);
+      const seg = segments[at.index]!;
+      out.push(evalCubic(seg.a, seg.c0, seg.c1, seg.b, at.t));
+    }
+    return out;
+  }
   if (cutter.kind === 'circle') {
     const out: Vec2[] = [];
     for (let i = 0; i <= steps; i++) {
